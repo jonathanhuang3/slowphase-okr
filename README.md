@@ -54,7 +54,7 @@ python -m slowphase_okr
 
 ## Data format
 
-### USH2A / Unity (default)
+### Unity (default)
 
 - `rotatedGaze.txt` — lines like `(x, y, z)`
 - `gazeTime.txt` — one float per line (seconds)
