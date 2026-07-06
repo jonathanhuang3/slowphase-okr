@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
@@ -11,26 +12,59 @@ import matplotlib
 
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.patches import Rectangle
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from slowphase_okr import __version__
+from slowphase_okr.autosave import (
+    autosave_matches_trial,
+    autosave_path,
+    load_autosave,
+    save_autosave,
+    segments_from_autosave,
+)
 from slowphase_okr.export import export_to_excel
 from slowphase_okr.fit import SegmentFit, fit_segment, snap_index, trial_summary_median_gain
 from slowphase_okr.gaze import GazeTrial, analysis_window_mask, load_ush2a_trial
 
 
+HELP_TEXT = """Keyboard shortcuts
+────────────────────────────────────────
+Marking
+  Click × 2        Mark slow-phase start, then end (snaps to nearest sample)
+  A                Accept pending segment
+  Esc              Clear pending segment (start over)
+
+Navigation
+  Scroll wheel     Zoom time axis (cursor-centered)
+  ← / →            Pan view by 1 s
+  View buttons     5 s, 10 s, Full trial, Reset (first 5 s)
+
+Segments (select one in the list first)
+  Del              Delete selected segment
+  U                Undo last accepted segment
+  [  ]             Nudge start earlier / later (one sample)
+  ,  .             Nudge end earlier / later (one sample)
+
+Other
+  Enter            Apply stimulus velocity (in velocity field)
+  ?                Show this help
+
+Notes
+  • Analysis window spans the full trial (first to last timestamp).
+  • R² is logged and exported but segments are not auto-rejected.
+  • Annotations autosave to JSON in the trial folder; restore on reload.
+"""
+
+
 class AnnotatorApp:
-    ANALYSIS_DURATION = 40.0  # seconds (0 to 40 s from trial start)
-    DEFAULT_VIEW_DURATION = 5.0  # visible time window at 90 Hz (~450 samples)
+    DEFAULT_VIEW_DURATION = 5.0
     MIN_VIEW_DURATION = 0.5
-    MAX_VIEW_DURATION = ANALYSIS_DURATION
     PAN_STEP_SEC = 1.0
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"slowphase-okr v{__version__}")
-        self.root.minsize(960, 640)
+        self.root.minsize(1100, 680)
 
         self.gaze_path: Path | None = None
         self.time_path: Path | None = None
@@ -41,20 +75,26 @@ class AnnotatorApp:
         self.pending_start_idx: int | None = None
         self.pending_end_idx: int | None = None
         self.pending_fit: SegmentFit | None = None
+        self.selected_segment_id: int | None = None
 
-        self._shade_patches: list[Rectangle] = []
         self._preview_line = None
         self._click_markers: list = []
 
         self.analysis_t0: float = 0.0
-        self.analysis_t1: float = 40.0
+        self.analysis_t1: float = 0.0
         self.view_xmin: float | None = None
         self.view_xmax: float | None = None
 
         self._build_controls()
+        self._build_main_area()
         self._build_plot()
         self._bind_keys()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._set_status("Load gaze and time files to begin.")
+
+    @property
+    def analysis_duration(self) -> float:
+        return max(self.analysis_t1 - self.analysis_t0, self.MIN_VIEW_DURATION)
 
     def _build_controls(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -76,18 +116,39 @@ class AnnotatorApp:
             row=1, column=1, columnspan=2, sticky=tk.W, padx=4
         )
 
-        ttk.Label(top, text="Stimulus velocity (deg/s):").grid(
-            row=1, column=3, sticky=tk.E, padx=4
-        )
+        vel_frame = ttk.Frame(top)
+        vel_frame.grid(row=1, column=3, columnspan=2, sticky=tk.W, padx=4)
+        ttk.Label(vel_frame, text="Stimulus velocity (deg/s):").pack(side=tk.LEFT)
         self.stim_vel_var = tk.StringVar(value="31")
-        ttk.Entry(top, textvariable=self.stim_vel_var, width=8).grid(
-            row=1, column=4, sticky=tk.W, padx=4
-        )
+        self.stim_vel_entry = ttk.Entry(vel_frame, textvariable=self.stim_vel_var, width=8)
+        self.stim_vel_entry.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(vel_frame, text="(Enter to apply)").pack(side=tk.LEFT, padx=(4, 0))
+        self.stim_vel_entry.bind("<Return>", self._apply_stimulus_velocity)
+        self.stim_vel_entry.bind("<FocusOut>", self._apply_stimulus_velocity)
 
         self.gaze_label = ttk.Label(top, text="Gaze: (none)", wraplength=420)
         self.gaze_label.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=4)
         self.time_label = ttk.Label(top, text="Time: (none)", wraplength=420)
         self.time_label.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=4)
+
+        view_row = ttk.Frame(top)
+        view_row.grid(row=2, column=3, columnspan=2, rowspan=2, sticky=tk.W, padx=4, pady=2)
+        ttk.Label(view_row, text="View:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(view_row, text="5 s", width=5, command=lambda: self._set_view_duration(5.0)).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(view_row, text="10 s", width=5, command=lambda: self._set_view_duration(10.0)).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(view_row, text="Full", width=5, command=self._view_full).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(view_row, text="Reset", width=6, command=self._reset_view).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(view_row, text="?", width=3, command=self._show_help).pack(
+            side=tk.LEFT, padx=(8, 2)
+        )
 
         action = ttk.Frame(self.root, padding=8)
         action.pack(side=tk.BOTTOM, fill=tk.X)
@@ -112,40 +173,154 @@ class AnnotatorApp:
 
         help_text = (
             "Click start then end of each upward slow phase (snaps to nearest sample). "
-            "Scroll to zoom time axis; Left/Right arrows to pan. "
-            f"Default view: {self.DEFAULT_VIEW_DURATION:.0f} s. Analysis: 0–40 s. "
-            "R² is logged, not filtered."
+            "Scroll to zoom; Left/Right arrows to pan. Press ? for shortcuts."
         )
         ttk.Label(self.root, text=help_text, padding=(8, 0)).pack(side=tk.BOTTOM, fill=tk.X)
 
-    def _build_plot(self) -> None:
-        plot_frame = ttk.Frame(self.root)
-        plot_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=4)
+    def _build_main_area(self) -> None:
+        self.main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.main_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=4)
 
+        self.plot_frame = ttk.Frame(self.main_pane)
+        self.main_pane.add(self.plot_frame, weight=3)
+
+        seg_panel = ttk.LabelFrame(self.main_pane, text="Segments", padding=6)
+        self.main_pane.add(seg_panel, weight=1)
+
+        tree_frame = ttk.Frame(seg_panel)
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        columns = ("id", "start", "end", "gain", "r2", "up")
+        self.seg_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings", height=14, selectmode="browse"
+        )
+        self.seg_tree.heading("id", text="#")
+        self.seg_tree.heading("start", text="Start (s)")
+        self.seg_tree.heading("end", text="End (s)")
+        self.seg_tree.heading("gain", text="Gain")
+        self.seg_tree.heading("r2", text="R²")
+        self.seg_tree.heading("up", text="Up")
+        self.seg_tree.column("id", width=28, anchor=tk.CENTER)
+        self.seg_tree.column("start", width=62, anchor=tk.E)
+        self.seg_tree.column("end", width=62, anchor=tk.E)
+        self.seg_tree.column("gain", width=52, anchor=tk.E)
+        self.seg_tree.column("r2", width=44, anchor=tk.E)
+        self.seg_tree.column("up", width=32, anchor=tk.CENTER)
+        seg_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.seg_tree.yview)
+        self.seg_tree.configure(yscrollcommand=seg_scroll.set)
+        self.seg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        seg_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.seg_tree.bind("<<TreeviewSelect>>", self._on_segment_select)
+
+        seg_actions = ttk.Frame(seg_panel)
+        seg_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        ttk.Button(
+            seg_actions, text="Delete selected (Del)", command=self._delete_selected_segment
+        ).pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(
+            seg_actions,
+            text="Selected: [ ] nudge start, , . nudge end",
+            wraplength=180,
+        ).pack(side=tk.TOP, pady=(4, 0))
+
+    def _build_plot(self) -> None:
         self.fig, self.ax = plt.subplots(figsize=(10, 4))
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Elevation (deg)")
         self.ax.set_title("Elevation — mark slow-phase start and end")
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        toolbar = NavigationToolbar2Tk(self.canvas, plot_frame)
-        toolbar.update()
-        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.hover_var = tk.StringVar(value="")
+        ttk.Label(self.plot_frame, textvariable=self.hover_var, padding=(0, 4)).pack(
+            side=tk.BOTTOM, fill=tk.X
+        )
 
         self.canvas.mpl_connect("button_press_event", self._on_click)
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+
+    def _show_help(self) -> None:
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Keyboard shortcuts")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        text = tk.Text(
+            frame,
+            wrap=tk.NONE,
+            width=52,
+            height=24,
+            font=("Courier", 11),
+            relief=tk.FLAT,
+            borderwidth=0,
+        )
+        text.insert("1.0", HELP_TEXT)
+        text.config(state=tk.DISABLED)
+        text.pack(side=tk.TOP)
+
+        ttk.Button(frame, text="Close", command=dlg.destroy).pack(pady=(8, 0))
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.geometry(f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 40}")
 
     def _bind_keys(self) -> None:
-        self.root.bind("a", lambda _e: self._accept_segment())
-        self.root.bind("A", lambda _e: self._accept_segment())
-        self.root.bind("u", lambda _e: self._undo_segment())
-        self.root.bind("U", lambda _e: self._undo_segment())
-        self.root.bind("<Escape>", lambda _e: self._clear_pending())
-        self.root.bind("<Left>", lambda _e: self._pan_view(-self.PAN_STEP_SEC))
-        self.root.bind("<Right>", lambda _e: self._pan_view(self.PAN_STEP_SEC))
+        self.root.bind_all("<KeyPress>", self._on_key, add="+")
+
+    def _on_key(self, event) -> str | None:
+        widget = event.widget
+        if isinstance(widget, (tk.Entry, ttk.Entry, tk.Text)):
+            return None
+
+        keysym = event.keysym
+        char = event.char
+
+        if keysym in ("question",) or char == "?":
+            self._show_help()
+        elif keysym in ("a", "A"):
+            self._accept_segment()
+        elif keysym in ("u", "U"):
+            self._undo_segment()
+        elif keysym == "Escape":
+            self._clear_pending()
+        elif keysym == "Left":
+            self._pan_view(-self.PAN_STEP_SEC)
+        elif keysym == "Right":
+            self._pan_view(self.PAN_STEP_SEC)
+        elif keysym in ("Delete", "BackSpace"):
+            self._delete_selected_segment()
+        elif keysym in ("bracketleft",) or char == "[":
+            self._nudge_segment_boundary("start", -1)
+        elif keysym in ("bracketright",) or char == "]":
+            self._nudge_segment_boundary("start", 1)
+        elif keysym in ("comma",) or char == ",":
+            self._nudge_segment_boundary("end", -1)
+        elif keysym in ("period",) or char == ".":
+            self._nudge_segment_boundary("end", 1)
+        return None
+
+    def _on_motion(self, event) -> None:
+        if event.inaxes != self.ax or self.trial is None:
+            self.hover_var.set("")
+            return
+        if event.xdata is None:
+            self.hover_var.set("")
+            return
+        try:
+            mask = self._valid_click_mask()
+            if not np.any(mask):
+                self.hover_var.set("")
+                return
+            idx = snap_index(self.trial.times, float(event.xdata), mask)
+            t = float(self.trial.times[idx])
+            elev = float(self.trial.elevation_deg[idx])
+            self.hover_var.set(f"t = {t:.3f} s,  elevation = {elev:.2f}°")
+        except ValueError:
+            self.hover_var.set("")
 
     def _browse_gaze(self) -> None:
         path = filedialog.askopenfilename(
@@ -179,9 +354,134 @@ class AnnotatorApp:
         except ValueError as exc:
             raise ValueError("Stimulus velocity must be a number.") from exc
 
+    def _has_unsaved_work(self) -> bool:
+        return bool(self.segments) or self.pending_fit is not None
+
+    def _confirm_discard_work(self, action: str) -> bool:
+        if not self._has_unsaved_work():
+            return True
+        n = len(self.segments)
+        extra = f" and a pending segment" if self.pending_fit else ""
+        return messagebox.askyesno(
+            "Discard annotations?",
+            f"You have {n} accepted segment(s){extra}.\n\n{action}?",
+            icon="warning",
+        )
+
+    def _autosave_file(self) -> Path | None:
+        if not self.gaze_path:
+            return None
+        trial_id = self.trial_id_var.get().strip() or self.gaze_path.parent.name
+        return autosave_path(self.gaze_path.parent, trial_id)
+
+    def _write_autosave(self) -> None:
+        if not self.gaze_path or not self.time_path or not self.trial:
+            return
+        path = self._autosave_file()
+        if path is None:
+            return
+        try:
+            vel = self._stimulus_velocity()
+        except ValueError:
+            vel = 31.0
+        save_autosave(
+            path,
+            trial_id=self.trial.trial_id,
+            gaze_source=str(self.gaze_path.resolve()),
+            time_source=str(self.time_path.resolve()),
+            stimulus_velocity=vel,
+            segments=self.segments,
+            software_version=__version__,
+        )
+
+    def _try_restore_autosave(self, trial_id: str) -> None:
+        if not self.gaze_path or not self.time_path:
+            return
+        path = autosave_path(self.gaze_path.parent, trial_id)
+        data = load_autosave(path)
+        if data is None:
+            return
+        if not autosave_matches_trial(
+            data,
+            str(self.gaze_path.resolve()),
+            str(self.time_path.resolve()),
+        ):
+            return
+        restored = segments_from_autosave(data)
+        if not restored:
+            return
+        n = len(restored)
+        if not messagebox.askyesno(
+            "Restore autosave",
+            f"Found autosave with {n} segment(s) for this trial.\nRestore?",
+        ):
+            return
+        self.segments = restored
+        vel = data.get("stimulus_velocity")
+        if vel is not None:
+            self.stim_vel_var.set(str(vel))
+        self.selected_segment_id = None
+        self._clear_pending(redraw=False)
+        self._refresh_segment_list()
+        self._redraw()
+        med = trial_summary_median_gain(self.segments)
+        self._set_status(
+            f"Restored {n} segment(s) from autosave. Trial median gain={med:.3f}"
+        )
+
+    def _apply_stimulus_velocity(self, _event=None) -> None:
+        if not self.segments and self.pending_fit is None:
+            return
+
+        try:
+            vel = self._stimulus_velocity()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid velocity", str(exc))
+            return
+
+        if vel == 0:
+            messagebox.showwarning(
+                "Invalid velocity", "Stimulus velocity cannot be zero."
+            )
+            return
+
+        self.segments = [
+            replace(seg, gain=seg.slope_deg_s / vel, stimulus_velocity=vel)
+            for seg in self.segments
+        ]
+
+        if (
+            self.pending_start_idx is not None
+            and self.pending_end_idx is not None
+            and self.trial is not None
+        ):
+            try:
+                self.pending_fit = fit_segment(
+                    self.trial.times,
+                    self.trial.elevation_deg,
+                    self.pending_start_idx,
+                    self.pending_end_idx,
+                    vel,
+                    segment_id=len(self.segments) + 1,
+                )
+            except ValueError:
+                pass
+
+        self._refresh_segment_list()
+        self._redraw()
+        self._write_autosave()
+        med = trial_summary_median_gain(self.segments)
+        n = len(self.segments)
+        status = f"Stimulus velocity set to {vel:.2f} deg/s."
+        if n:
+            status += f" Trial median gain={med:.3f} (n={n})"
+        self._set_status(status)
+
     def _load_trial(self) -> None:
         if not self.gaze_path or not self.time_path:
             messagebox.showwarning("Missing files", "Select both gaze and time files.")
+            return
+        if not self._confirm_discard_work("Load this trial anyway"):
             return
         try:
             trial_id = self.trial_id_var.get().strip() or self.gaze_path.parent.name
@@ -189,28 +489,58 @@ class AnnotatorApp:
                 self.gaze_path, self.time_path, trial_id=trial_id
             )
             t0 = float(self.trial.times[0])
+            t1 = float(self.trial.times[-1])
             self.analysis_t0 = t0
-            self.analysis_t1 = t0 + self.ANALYSIS_DURATION
-            self.window_mask = analysis_window_mask(
-                self.trial.times, t0, self.ANALYSIS_DURATION
-            )
-            self._reset_view()
+            self.analysis_t1 = t1
+            self.window_mask = analysis_window_mask(self.trial.times, t0, t_end=t1)
             self.segments.clear()
+            self.selected_segment_id = None
             self._clear_pending(redraw=False)
+            self._reset_view()
+            self._try_restore_autosave(trial_id)
+            self._refresh_segment_list()
             self._redraw()
+            duration = t1 - t0
             self._set_status(
                 f"Loaded {trial_id}: {len(self.trial.times)} samples, "
-                f"analysis {t0:.2f}–{t0 + self.ANALYSIS_DURATION:.1f} s"
+                f"analysis {t0:.2f}–{t1:.2f} s ({duration:.1f} s)"
             )
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
 
     def _reset_view(self) -> None:
-        """Show the first DEFAULT_VIEW_DURATION seconds of the analysis window."""
         self.view_xmin = self.analysis_t0
         self.view_xmax = min(
             self.analysis_t0 + self.DEFAULT_VIEW_DURATION, self.analysis_t1
         )
+        if self.trial is not None:
+            self._redraw()
+
+    def _set_view_duration(self, duration_sec: float) -> None:
+        if self.trial is None:
+            return
+        center = None
+        if self.view_xmin is not None and self.view_xmax is not None:
+            center = (self.view_xmin + self.view_xmax) / 2
+        else:
+            center = self.analysis_t0 + duration_sec / 2
+        half = duration_sec / 2
+        self.view_xmin = max(self.analysis_t0, center - half)
+        self.view_xmax = min(self.analysis_t1, center + half)
+        if self.view_xmax - self.view_xmin < duration_sec:
+            if self.view_xmin == self.analysis_t0:
+                self.view_xmax = min(self.analysis_t0 + duration_sec, self.analysis_t1)
+            else:
+                self.view_xmin = max(self.analysis_t1 - duration_sec, self.analysis_t0)
+        self._clamp_view()
+        self._redraw()
+
+    def _view_full(self) -> None:
+        if self.trial is None:
+            return
+        self.view_xmin = self.analysis_t0
+        self.view_xmax = self.analysis_t1
+        self._redraw()
 
     def _clamp_view(self) -> None:
         if self.view_xmin is None or self.view_xmax is None:
@@ -218,7 +548,7 @@ class AnnotatorApp:
             return
         width = self.view_xmax - self.view_xmin
         width = float(
-            np.clip(width, self.MIN_VIEW_DURATION, self.MAX_VIEW_DURATION)
+            np.clip(width, self.MIN_VIEW_DURATION, self.analysis_duration)
         )
         if self.view_xmin < self.analysis_t0:
             self.view_xmin = self.analysis_t0
@@ -249,7 +579,6 @@ class AnnotatorApp:
         if event.xdata is None or self.view_xmin is None or self.view_xmax is None:
             return
 
-        # Scroll up = zoom in (narrower window); scroll down = zoom out
         if getattr(event, "step", 0):
             zoom_in = event.step > 0
         else:
@@ -269,6 +598,9 @@ class AnnotatorApp:
             return np.array([], dtype=bool)
         return self.window_mask & ~np.isnan(self.trial.elevation_deg)
 
+    def _valid_indices(self) -> np.ndarray:
+        return np.where(self._valid_click_mask())[0]
+
     def _on_click(self, event) -> None:
         if event.inaxes != self.ax or self.trial is None:
             return
@@ -284,6 +616,10 @@ class AnnotatorApp:
             self.pending_start_idx = idx
             self.pending_end_idx = None
             self.pending_fit = None
+            t_start = self.trial.times[idx]
+            self._set_status(
+                f"Start marked at {t_start:.3f} s — click end of slow phase"
+            )
         else:
             self.pending_end_idx = idx
             try:
@@ -299,8 +635,123 @@ class AnnotatorApp:
                 messagebox.showwarning("Segment too short", str(exc))
                 self._clear_pending()
                 return
+            self._set_status(
+                f"Pending segment: gain={self.pending_fit.gain:.3f}, "
+                f"R²={self.pending_fit.r2:.3f} — press A to accept"
+            )
 
         self._redraw()
+
+    def _renumber_segments(self) -> None:
+        for i, seg in enumerate(self.segments, start=1):
+            if seg.segment_id != i:
+                self.segments[i - 1] = replace(seg, segment_id=i)
+
+    def _selected_segment(self) -> SegmentFit | None:
+        if self.selected_segment_id is None:
+            return None
+        for seg in self.segments:
+            if seg.segment_id == self.selected_segment_id:
+                return seg
+        return None
+
+    def _on_segment_select(self, _event=None) -> None:
+        selection = self.seg_tree.selection()
+        if not selection:
+            self.selected_segment_id = None
+        else:
+            values = self.seg_tree.item(selection[0], "values")
+            self.selected_segment_id = int(values[0])
+        self._redraw()
+
+    def _refresh_segment_list(self) -> None:
+        for item in self.seg_tree.get_children():
+            self.seg_tree.delete(item)
+        for seg in self.segments:
+            up = "✓" if seg.direction_upward else "!"
+            r2 = f"{seg.r2:.2f}" if seg.r2 == seg.r2 else "—"
+            iid = self.seg_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    seg.segment_id,
+                    f"{seg.t_start:.2f}",
+                    f"{seg.t_end:.2f}",
+                    f"{seg.gain:.3f}",
+                    r2,
+                    up,
+                ),
+            )
+            if seg.segment_id == self.selected_segment_id:
+                self.seg_tree.selection_set(iid)
+                self.seg_tree.see(iid)
+
+    def _nudge_segment_boundary(self, which: str, direction: int) -> None:
+        seg = self._selected_segment()
+        if seg is None or self.trial is None:
+            return
+        valid = self._valid_indices()
+        if len(valid) == 0:
+            return
+
+        if which == "start":
+            pos = int(np.searchsorted(valid, seg.idx_start))
+            pos = int(np.clip(pos + direction, 0, len(valid) - 1))
+            new_start = int(valid[pos])
+            new_end = seg.idx_end
+            if new_start == new_end:
+                return
+        else:
+            pos = int(np.searchsorted(valid, seg.idx_end))
+            pos = int(np.clip(pos + direction, 0, len(valid) - 1))
+            new_end = int(valid[pos])
+            new_start = seg.idx_start
+            if new_start == new_end:
+                return
+
+        try:
+            updated = fit_segment(
+                self.trial.times,
+                self.trial.elevation_deg,
+                new_start,
+                new_end,
+                self._stimulus_velocity(),
+                segment_id=seg.segment_id,
+            )
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+
+        for i, existing in enumerate(self.segments):
+            if existing.segment_id == seg.segment_id:
+                self.segments[i] = updated
+                break
+
+        self._refresh_segment_list()
+        self._redraw()
+        self._write_autosave()
+        self._set_status(
+            f"Segment #{updated.segment_id} adjusted: "
+            f"gain={updated.gain:.3f}, R²={updated.r2:.3f}"
+        )
+
+    def _delete_selected_segment(self) -> None:
+        seg = self._selected_segment()
+        if seg is None:
+            self._set_status("Select a segment in the list to delete.")
+            return
+        self.segments = [s for s in self.segments if s.segment_id != seg.segment_id]
+        self._renumber_segments()
+        self.selected_segment_id = None
+        self._refresh_segment_list()
+        self._redraw()
+        self._write_autosave()
+        med = trial_summary_median_gain(self.segments)
+        n = len(self.segments)
+        status = f"Deleted segment. {n} remaining."
+        if n:
+            status += f" Trial median gain={med:.3f}"
+        self._set_status(status)
 
     def _accept_segment(self) -> None:
         if self.pending_fit is None:
@@ -308,7 +759,9 @@ class AnnotatorApp:
             return
         self.segments.append(self.pending_fit)
         self._clear_pending(redraw=False)
+        self._refresh_segment_list()
         self._redraw()
+        self._write_autosave()
         med = trial_summary_median_gain(self.segments)
         self._set_status(
             f"Accepted segment {len(self.segments)}: "
@@ -318,8 +771,13 @@ class AnnotatorApp:
 
     def _undo_segment(self) -> None:
         if self.segments:
-            self.segments.pop()
+            removed = self.segments.pop()
+            if self.selected_segment_id == removed.segment_id:
+                self.selected_segment_id = None
+            self._renumber_segments()
+            self._refresh_segment_list()
             self._redraw()
+            self._write_autosave()
             med = trial_summary_median_gain(self.segments)
             self._set_status(
                 f"Removed last segment. Trial median gain={med:.3f} (n={len(self.segments)})"
@@ -336,7 +794,6 @@ class AnnotatorApp:
 
     def _redraw(self) -> None:
         self.ax.clear()
-        self._shade_patches.clear()
         self._click_markers.clear()
 
         if self.trial is None:
@@ -375,25 +832,54 @@ class AnnotatorApp:
         self.ax.axvline(t1, color="steelblue", linestyle="--", alpha=0.35, linewidth=0.8)
 
         for seg in self.segments:
-            self.ax.axvspan(seg.t_start, seg.t_end, color="green", alpha=0.2)
+            selected = seg.segment_id == self.selected_segment_id
+            span_color = "limegreen" if selected else "green"
+            span_alpha = 0.35 if selected else 0.2
+            line_color = "forestgreen" if selected else "darkgreen"
+            line_width = 2.5 if selected else 1.5
+            self.ax.axvspan(seg.t_start, seg.t_end, color=span_color, alpha=span_alpha)
             seg_times = np.linspace(seg.t_start, seg.t_end, 50)
             self.ax.plot(
                 seg_times,
                 seg.slope_deg_s * seg_times + seg.intercept_deg,
-                color="darkgreen",
-                linewidth=1.5,
+                color=line_color,
+                linewidth=line_width,
+            )
+            mid_t = (seg.t_start + seg.t_end) / 2
+            mid_y = seg.slope_deg_s * mid_t + seg.intercept_deg
+            self.ax.text(
+                mid_t,
+                mid_y,
+                f"#{seg.segment_id}",
+                color="white",
+                fontsize=8,
+                fontweight="bold",
+                ha="center",
+                va="center",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor=line_color, alpha=0.85),
             )
 
         if self.pending_start_idx is not None:
             t_start = times[self.pending_start_idx]
             self.ax.axvline(t_start, color="orange", linestyle=":", linewidth=1.2)
-            (marker,) = self.ax.plot(t_start, elev[self.pending_start_idx], "o", color="orange")
+            (marker,) = self.ax.plot(
+                t_start, elev[self.pending_start_idx], "o", color="orange", markersize=8
+            )
             self._click_markers.append(marker)
+            if self.pending_end_idx is None:
+                self.ax.axvspan(
+                    t_start,
+                    min(t_start + 0.15 * self.analysis_duration, t1),
+                    color="orange",
+                    alpha=0.08,
+                )
 
         if self.pending_end_idx is not None:
             t_end = times[self.pending_end_idx]
             self.ax.axvline(t_end, color="darkorange", linestyle=":", linewidth=1.2)
-            (marker,) = self.ax.plot(t_end, elev[self.pending_end_idx], "o", color="darkorange")
+            (marker,) = self.ax.plot(
+                t_end, elev[self.pending_end_idx], "o", color="darkorange", markersize=8
+            )
             self._click_markers.append(marker)
 
         if self.pending_fit is not None:
@@ -416,10 +902,16 @@ class AnnotatorApp:
                 f"Pending: slope={self.pending_fit.slope_deg_s:.2f} deg/s, "
                 f"gain={self.pending_fit.gain:.3f}, R²={self.pending_fit.r2:.3f} ({upward})"
             )
+        elif self.pending_start_idx is not None and self.pending_end_idx is None:
+            t_start = times[self.pending_start_idx]
+            self.ax.set_title(
+                f"Click end of slow phase (start at {t_start:.3f} s)"
+            )
         else:
             med = trial_summary_median_gain(self.segments)
             n = len(self.segments)
-            title = f"{self.trial.trial_id} — {n} segment(s)"
+            duration = t1 - t0
+            title = f"{self.trial.trial_id} — {n} segment(s), {duration:.1f} s trial"
             if n:
                 title += f", median gain={med:.3f}"
             self.ax.set_title(title)
@@ -442,6 +934,17 @@ class AnnotatorApp:
         if not self.segments:
             messagebox.showwarning("Nothing to export", "Accept at least one segment first.")
             return
+        try:
+            vel = self._stimulus_velocity()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid velocity", str(exc))
+            return
+        if vel == 0:
+            messagebox.showwarning(
+                "Invalid velocity", "Stimulus velocity cannot be zero."
+            )
+            return
+        self._apply_stimulus_velocity()
         trial_id = self.trial.trial_id if self.trial else self.trial_id_var.get() or "trial"
         default_name = f"{trial_id}_slowphase_okr.xlsx"
         path = filedialog.asksaveasfilename(
@@ -465,6 +968,11 @@ class AnnotatorApp:
             self._set_status(f"Exported {len(self.segments)} segment(s) to {out}")
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc))
+
+    def _on_close(self) -> None:
+        if self.segments:
+            self._write_autosave()
+        self.root.destroy()
 
     def _set_status(self, msg: str) -> None:
         self.status_var.set(msg)

@@ -46,6 +46,12 @@ def test_analysis_window_mask():
     assert list(mask) == [True, True, True, True, True, False]
 
 
+def test_analysis_window_mask_t_end():
+    times = np.array([1.0, 5.0, 12.0, 25.0, 30.0])
+    mask = analysis_window_mask(times, t0=1.0, t_end=25.0)
+    assert list(mask) == [True, True, True, True, False]
+
+
 def test_load_ush2a_trial(tmp_path: Path):
     gaze = tmp_path / "rotatedGaze.txt"
     gaze.write_text("(0.0, 0.1, 1.0)\n(0.0, 0.2, 1.0)\n(0.0, 0.3, 1.0)\n")
@@ -65,3 +71,34 @@ def test_median_gain():
         SegmentFit(2, 2, 3, 1, 2, 2, 30, 0, 30 / 31, 0.98, True, 31),
     ]
     assert trial_summary_median_gain(segs) == pytest.approx((20 / 31 + 30 / 31) / 2)
+
+
+def test_autosave_roundtrip(tmp_path: Path):
+    from slowphase_okr.autosave import (
+        autosave_matches_trial,
+        load_autosave,
+        save_autosave,
+        segments_from_autosave,
+    )
+    from slowphase_okr.fit import SegmentFit
+
+    gaze = tmp_path / "rotatedGaze.txt"
+    timef = tmp_path / "gazeTime.txt"
+    segments = [
+        SegmentFit(1, 0, 1, 0.0, 0.1, 2, 20.0, 0.0, 20.0 / 31.0, 0.99, True, 31.0),
+    ]
+    out = save_autosave(
+        tmp_path / "trial_slowphase_okr_autosave.json",
+        trial_id="trial",
+        gaze_source=str(gaze.resolve()),
+        time_source=str(timef.resolve()),
+        stimulus_velocity=31.0,
+        segments=segments,
+        software_version="0.1.1",
+    )
+    data = load_autosave(out)
+    assert data is not None
+    assert autosave_matches_trial(data, str(gaze.resolve()), str(timef.resolve()))
+    restored = segments_from_autosave(data)
+    assert len(restored) == 1
+    assert restored[0].gain == pytest.approx(20.0 / 31.0)

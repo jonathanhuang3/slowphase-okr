@@ -120,7 +120,18 @@ def load_csv_trial(
 
 
 def analysis_window_mask(
-    times: np.ndarray, t0: float, duration_sec: float = 40.0
+    times: np.ndarray,
+    t0: float,
+    duration_sec: float | None = None,
+    t_end: float | None = None,
 ) -> np.ndarray:
-    """Boolean mask for samples in [t0, t0 + duration_sec]."""
+    """Boolean mask for samples in the analysis window.
+
+    If ``t_end`` is given, the window is ``[t0, t_end]`` (inclusive).
+    Otherwise the window is ``[t0, t0 + duration_sec]`` (default 40 s).
+    """
+    if t_end is not None:
+        return (times >= t0) & (times <= t_end)
+    if duration_sec is None:
+        duration_sec = 40.0
     return (times >= t0) & (times <= t0 + duration_sec)
