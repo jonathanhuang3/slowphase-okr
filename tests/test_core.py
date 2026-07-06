@@ -60,7 +60,23 @@ def test_load_ush2a_trial(tmp_path: Path):
     trial = load_ush2a_trial(gaze, timef, trial_id="test")
     assert trial.trial_id == "test"
     assert len(trial.times) == 3
-    assert np.all(np.diff(trial.elevation_deg) > 0)
+    assert np.all(np.diff(trial.elevation_deg[~np.isnan(trial.elevation_deg)]) > 0)
+
+
+def test_load_ush2a_trial_with_nan_gaze(tmp_path: Path):
+    gaze = tmp_path / "sranipalGazeSpace.txt"
+    gaze.write_text(
+        "(NaN, NaN, NaN)\n"
+        "(NaN, NaN, NaN)\n"
+        "(0.0, 0.1, 1.0)\n"
+        "(0.0, 0.2, 1.0)\n"
+    )
+    timef = tmp_path / "sranipalGazeTime.txt"
+    timef.write_text("1.0\n2.0\n3.0\n4.0\n")
+    trial = load_ush2a_trial(gaze, timef, trial_id="nan_test")
+    assert len(trial.times) == 4
+    assert np.isnan(trial.elevation_deg[:2]).all()
+    assert np.isfinite(trial.elevation_deg[2:]).all()
 
 
 def test_median_gain():

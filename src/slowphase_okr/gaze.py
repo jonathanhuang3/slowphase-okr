@@ -33,14 +33,42 @@ def unity_gaze_direction(
     return azimuth, elevation, r
 
 
+def _parse_gaze_component(text: str) -> float:
+    text = text.strip()
+    if text.lower() == "nan":
+        return float("nan")
+    return float(text)
+
+
 def _parse_rotated_gaze(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    text = path.read_text()
-    pattern = re.compile(r"\(\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*\)")
-    matches = pattern.findall(text)
-    if not matches:
+    """Parse one (x, y, z) tuple per non-empty line, preserving line order."""
+    tuple_pattern = re.compile(
+        r"^\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*\)\s*$",
+        re.IGNORECASE,
+    )
+    xs_list: list[float] = []
+    ys_list: list[float] = []
+    zs_list: list[float] = []
+
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = tuple_pattern.match(stripped)
+        if not match:
+            raise ValueError(f"No (x, y, z) tuple found in line: {stripped!r}")
+        xs_list.append(_parse_gaze_component(match.group(1)))
+        ys_list.append(_parse_gaze_component(match.group(2)))
+        zs_list.append(_parse_gaze_component(match.group(3)))
+
+    if not xs_list:
         raise ValueError(f"No (x, y, z) tuples found in {path}")
-    arr = np.array(matches, dtype=float)
-    return arr[:, 0], arr[:, 1], arr[:, 2]
+
+    return (
+        np.array(xs_list, dtype=float),
+        np.array(ys_list, dtype=float),
+        np.array(zs_list, dtype=float),
+    )
 
 
 def _parse_gaze_times(path: Path) -> np.ndarray:
@@ -69,11 +97,13 @@ def load_ush2a_trial(
             f"Length mismatch: {len(xs)} gaze samples vs {len(times)} timestamps"
         )
 
+    invalid = np.isnan(xs) | np.isnan(ys) | np.isnan(zs)
     azimuth, elevation, _ = unity_gaze_direction(xs, ys, zs)
     elevation_deg = np.degrees(elevation)
     azimuth_deg = np.degrees(azimuth)
+    elevation_deg[invalid] = np.nan
 
-    failure = (azimuth_deg == 0) & (elevation_deg == 0)
+    failure = (~invalid) & (azimuth_deg == 0) & (elevation_deg == 0)
     padded = failure.copy()
     for offset in range(1, padding_frames + 1):
         padded[offset:] |= failure[:-offset]
