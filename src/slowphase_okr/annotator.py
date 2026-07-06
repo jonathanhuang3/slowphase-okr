@@ -35,9 +35,9 @@ Marking
   Esc              Clear pending segment (start over)
 
 Navigation
-  Scroll wheel     Zoom time axis (cursor-centered)
-  ← / →            Pan view by 1 s
-  View buttons     2 s, 5 s, 10 s, Full trial, Reset (first 5 s)
+  Scroll wheel     Pan time forward / backward (vertical scroll only)
+  ← / →            Pan view by 20% of visible window
+  View menu        1 s, 2 s, 5 s, 10 s, or Full trial window
 
 Segments (select one in the list first)
   Del              Delete selected segment
@@ -57,9 +57,16 @@ Notes
 
 
 class AnnotatorApp:
-    DEFAULT_VIEW_DURATION = 5.0
+    DEFAULT_VIEW_DURATION = 2.0
+    VIEW_PRESET_LABELS = ("1 s", "2 s", "5 s", "10 s", "Full trial")
+    VIEW_PRESET_SECONDS = {
+        "1 s": 1.0,
+        "2 s": 2.0,
+        "5 s": 5.0,
+        "10 s": 10.0,
+    }
     MIN_VIEW_DURATION = 0.5
-    PAN_STEP_SEC = 1.0
+    SCROLL_PAN_FRACTION = 0.2  # fraction of visible window per pan step
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -80,7 +87,7 @@ class AnnotatorApp:
         self._preview_line = None
         self._click_markers: list = []
         self._hover_idx: int | None = None
-        self._hover_marker = None
+        self._hover_artists: list = []
 
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
@@ -111,6 +118,10 @@ class AnnotatorApp:
         ttk.Button(top, text="Load trial", command=self._load_trial).grid(
             row=0, column=2, padx=4, pady=2, sticky=tk.W
         )
+        top.columnconfigure(4, weight=1)
+        ttk.Button(top, text="Help", command=self._show_help).grid(
+            row=0, column=4, padx=4, pady=2, sticky=tk.E
+        )
 
         ttk.Label(top, text="Trial ID:").grid(row=1, column=0, sticky=tk.E, padx=4)
         self.trial_id_var = tk.StringVar(value="")
@@ -128,31 +139,26 @@ class AnnotatorApp:
         self.stim_vel_entry.bind("<Return>", self._apply_stimulus_velocity)
         self.stim_vel_entry.bind("<FocusOut>", self._apply_stimulus_velocity)
 
-        self.gaze_label = ttk.Label(top, text="Gaze: (none)", wraplength=420)
-        self.gaze_label.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=4)
-        self.time_label = ttk.Label(top, text="Time: (none)", wraplength=420)
-        self.time_label.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=4)
+        self.gaze_file_label = ttk.Label(top, text="")
+        self.gaze_file_label.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=4)
+        self.time_file_label = ttk.Label(top, text="")
+        self.time_file_label.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=4)
 
         view_row = ttk.Frame(top)
         view_row.grid(row=2, column=3, columnspan=2, rowspan=2, sticky=tk.W, padx=4, pady=2)
-        ttk.Label(view_row, text="View:").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(view_row, text="2 s", width=5, command=lambda: self._set_view_duration(2.0)).pack(
-            side=tk.LEFT, padx=2
+        ttk.Label(view_row, text="Window:").pack(side=tk.LEFT, padx=(0, 4))
+        self.view_var = tk.StringVar(value="2 s")
+        self.view_combo = ttk.Combobox(
+            view_row,
+            textvariable=self.view_var,
+            values=self.VIEW_PRESET_LABELS,
+            state="readonly",
+            width=10,
         )
-        ttk.Button(view_row, text="5 s", width=5, command=lambda: self._set_view_duration(5.0)).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(view_row, text="10 s", width=5, command=lambda: self._set_view_duration(10.0)).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(view_row, text="Full", width=5, command=self._view_full).pack(
-            side=tk.LEFT, padx=2
-        )
+        self.view_combo.pack(side=tk.LEFT, padx=2)
+        self.view_combo.bind("<<ComboboxSelected>>", self._on_view_selected)
         ttk.Button(view_row, text="Reset", width=6, command=self._reset_view).pack(
             side=tk.LEFT, padx=2
-        )
-        ttk.Button(view_row, text="?", width=3, command=self._show_help).pack(
-            side=tk.LEFT, padx=(8, 2)
         )
 
         action = ttk.Frame(self.root, padding=8)
@@ -178,7 +184,7 @@ class AnnotatorApp:
 
         help_text = (
             "Click start then end of each upward slow phase (snaps to nearest data point). "
-            "Hover highlights the sample that will be used. Scroll to zoom, arrows to pan. Press ? for shortcuts."
+            "Hover highlights the sample that will be used (red ring). Scroll vertically to pan time. See Help top right."
         )
         ttk.Label(self.root, text=help_text, padding=(8, 0)).pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -239,9 +245,13 @@ class AnnotatorApp:
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         self.hover_var = tk.StringVar(value="")
-        ttk.Label(self.plot_frame, textvariable=self.hover_var, padding=(0, 4)).pack(
-            side=tk.BOTTOM, fill=tk.X
-        )
+        ttk.Label(
+            self.plot_frame,
+            textvariable=self.hover_var,
+            padding=(0, 4),
+            foreground="gray",
+            anchor=tk.W,
+        ).pack(side=tk.BOTTOM, fill=tk.X)
 
         self.canvas.mpl_connect("button_press_event", self._on_click)
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
@@ -251,23 +261,31 @@ class AnnotatorApp:
         dlg = tk.Toplevel(self.root)
         dlg.title("Keyboard shortcuts")
         dlg.transient(self.root)
-        dlg.resizable(False, False)
+        dlg.resizable(True, True)
+        dlg.minsize(560, 480)
 
         frame = ttk.Frame(dlg, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
 
+        text_frame = ttk.Frame(frame)
+        text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL)
         text = tk.Text(
-            frame,
+            text_frame,
             wrap=tk.NONE,
-            width=52,
-            height=24,
-            font=("Courier", 11),
+            width=72,
+            height=26,
+            font=("Courier", 12),
             relief=tk.FLAT,
             borderwidth=0,
+            yscrollcommand=scroll.set,
         )
+        scroll.config(command=text.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         text.insert("1.0", HELP_TEXT)
         text.config(state=tk.DISABLED)
-        text.pack(side=tk.TOP)
 
         ttk.Button(frame, text="Close", command=dlg.destroy).pack(pady=(8, 0))
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
@@ -293,9 +311,9 @@ class AnnotatorApp:
         elif keysym == "Escape":
             self._clear_pending()
         elif keysym == "Left":
-            self._pan_view(-self.PAN_STEP_SEC)
+            self._pan_view(-self._pan_step_sec())
         elif keysym == "Right":
-            self._pan_view(self.PAN_STEP_SEC)
+            self._pan_view(self._pan_step_sec())
         elif keysym in ("Delete", "BackSpace"):
             self._delete_selected_segment()
         elif keysym in ("bracketleft",) or char == "[":
@@ -325,47 +343,52 @@ class AnnotatorApp:
         except ValueError:
             self._set_hover(None)
 
+    def _hover_hint(self) -> str:
+        if self.trial is not None:
+            return "Hover a data point to preview where a click will snap."
+        return ""
+
     def _set_hover(self, idx: int | None) -> None:
         if idx is None:
             self._hover_idx = None
-            self.hover_var.set("")
-            self._remove_hover_marker()
+            self.hover_var.set(self._hover_hint())
+            self._clear_hover_artists()
             return
-        if idx == self._hover_idx and self._hover_marker is not None:
-            return
-        self._hover_idx = idx
         assert self.trial is not None
         t = float(self.trial.times[idx])
         elev = float(self.trial.elevation_deg[idx])
-        self.hover_var.set(
-            f"Nearest data point: t = {t:.3f} s, elevation = {elev:.2f}° (click snaps here)"
-        )
-        self._draw_hover_marker(idx)
+        self.hover_var.set(f"t = {t:.3f} s,  elevation = {elev:.2f}°")
+        if idx == self._hover_idx and self._hover_artists:
+            return
+        self._hover_idx = idx
+        self._draw_hover_highlight(idx)
 
-    def _remove_hover_marker(self) -> None:
-        if self._hover_marker is not None:
+    def _clear_hover_artists(self) -> None:
+        for artist in self._hover_artists:
             try:
-                self._hover_marker.remove()
+                artist.remove()
             except ValueError:
                 pass
-            self._hover_marker = None
+        self._hover_artists.clear()
 
-    def _draw_hover_marker(self, idx: int) -> None:
+    def _draw_hover_highlight(self, idx: int) -> None:
         if self.trial is None:
             return
-        self._remove_hover_marker()
-        t = self.trial.times[idx]
-        elev = self.trial.elevation_deg[idx]
-        (self._hover_marker,) = self.ax.plot(
+        self._clear_hover_artists()
+        t = float(self.trial.times[idx])
+        elev = float(self.trial.elevation_deg[idx])
+        (ring,) = self.ax.plot(
             t,
             elev,
             "o",
-            markersize=11,
-            markerfacecolor="white",
-            markeredgecolor="dodgerblue",
-            markeredgewidth=2.0,
+            markersize=6,
+            markerfacecolor="none",
+            markeredgecolor="red",
+            markeredgewidth=1.2,
             zorder=10,
+            clip_on=True,
         )
+        self._hover_artists.append(ring)
         self.canvas.draw_idle()
 
     def _position_in_valid(self, idx: int, valid: np.ndarray) -> int:
@@ -374,6 +397,19 @@ class AnnotatorApp:
         if len(matches):
             return int(matches[0])
         return int(np.clip(np.searchsorted(valid, idx), 0, len(valid) - 1))
+
+    def _update_files_label(self) -> None:
+        self.gaze_file_label.config(
+            text="Gaze file uploaded" if self.gaze_path else ""
+        )
+        self.time_file_label.config(
+            text="Time file uploaded" if self.time_path else ""
+        )
+
+    def _pan_step_sec(self) -> float:
+        if self.view_xmin is None or self.view_xmax is None:
+            return self.DEFAULT_VIEW_DURATION * self.SCROLL_PAN_FRACTION
+        return (self.view_xmax - self.view_xmin) * self.SCROLL_PAN_FRACTION
 
     def _browse_gaze(self) -> None:
         path = filedialog.askopenfilename(
@@ -385,7 +421,7 @@ class AnnotatorApp:
         )
         if path:
             self.gaze_path = Path(path)
-            self.gaze_label.config(text=f"Gaze: {self.gaze_path}")
+            self._update_files_label()
             if not self.trial_id_var.get().strip():
                 self.trial_id_var.set(self.gaze_path.parent.name)
 
@@ -399,7 +435,7 @@ class AnnotatorApp:
         )
         if path:
             self.time_path = Path(path)
-            self.time_label.config(text=f"Time: {self.time_path}")
+            self._update_files_label()
 
     def _stimulus_velocity(self) -> float:
         try:
@@ -549,6 +585,7 @@ class AnnotatorApp:
             self.segments.clear()
             self.selected_segment_id = None
             self._clear_pending(redraw=False)
+            self.view_var.set("2 s")
             self._reset_view()
             self._try_restore_autosave(trial_id)
             self._refresh_segment_list()
@@ -558,14 +595,25 @@ class AnnotatorApp:
                 f"Loaded {trial_id}: {len(self.trial.times)} samples, "
                 f"analysis {t0:.2f}–{t1:.2f} s ({duration:.1f} s)"
             )
+            self.hover_var.set(self._hover_hint())
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
 
+    def _preset_duration_sec(self, label: str | None = None) -> float:
+        label = label if label is not None else self.view_var.get()
+        return self.VIEW_PRESET_SECONDS.get(label, self.DEFAULT_VIEW_DURATION)
+
+    def _on_view_selected(self, _event=None) -> None:
+        choice = self.view_var.get()
+        if choice == "Full trial":
+            self._view_full()
+        else:
+            self._set_view_duration(self._preset_duration_sec(choice))
+
     def _reset_view(self) -> None:
+        duration = self._preset_duration_sec()
         self.view_xmin = self.analysis_t0
-        self.view_xmax = min(
-            self.analysis_t0 + self.DEFAULT_VIEW_DURATION, self.analysis_t1
-        )
+        self.view_xmax = min(self.analysis_t0 + duration, self.analysis_t1)
         if self.trial is not None:
             self._redraw()
 
@@ -626,25 +674,41 @@ class AnnotatorApp:
             self.view_xmin = self.view_xmax - width
         self._redraw()
 
+    def _is_vertical_scroll(self, event) -> bool:
+        """Ignore horizontal trackpad / mouse-wheel gestures."""
+        if getattr(event, "key", None) == "shift":
+            return False
+        gui = getattr(event, "guiEvent", None)
+        if gui is None:
+            return True
+        num = getattr(gui, "num", None)
+        if num in (6, 7):
+            return False
+        delta_x = getattr(gui, "deltaX", None)
+        delta_y = getattr(gui, "deltaY", None)
+        if delta_x is not None and delta_y is not None:
+            ax = abs(int(delta_x))
+            ay = abs(int(delta_y))
+            if ax > ay:
+                return False
+        state = getattr(gui, "state", 0) or 0
+        if state & 0x0001:
+            return False
+        return True
+
     def _on_scroll(self, event) -> None:
         if event.inaxes != self.ax or self.trial is None:
             return
-        if event.xdata is None or self.view_xmin is None or self.view_xmax is None:
+        if self.view_xmin is None or self.view_xmax is None:
+            return
+        if not self._is_vertical_scroll(event):
             return
 
-        if getattr(event, "step", 0):
-            zoom_in = event.step > 0
-        else:
-            zoom_in = event.button == "up"
-
-        scale = 0.8 if zoom_in else 1.25
-        xdata = float(event.xdata)
-        left = xdata - (xdata - self.view_xmin) * scale
-        right = xdata + (self.view_xmax - xdata) * scale
-        self.view_xmin = left
-        self.view_xmax = right
-        self._clamp_view()
-        self._redraw()
+        scroll_forward = event.step > 0 if getattr(event, "step", 0) else event.button == "up"
+        delta = self._pan_step_sec()
+        if not scroll_forward:
+            delta = -delta
+        self._pan_view(delta)
 
     def _valid_click_mask(self) -> np.ndarray:
         if self.trial is None or self.window_mask is None:
@@ -853,7 +917,7 @@ class AnnotatorApp:
     def _redraw(self) -> None:
         self.ax.clear()
         self._click_markers.clear()
-        self._hover_marker = None
+        self._hover_artists.clear()
 
         if self.trial is None:
             self.ax.set_title("Load a trial to begin")
@@ -891,6 +955,8 @@ class AnnotatorApp:
         self.ax.axvline(t1, color="steelblue", linestyle="--", alpha=0.35, linewidth=0.8)
 
         for seg in self.segments:
+            if seg.t_end < vx0 or seg.t_start > vx1:
+                continue
             selected = seg.segment_id == self.selected_segment_id
             span_color = "limegreen" if selected else "green"
             span_alpha = 0.35 if selected else 0.2
@@ -903,20 +969,27 @@ class AnnotatorApp:
                 seg.slope_deg_s * seg_times + seg.intercept_deg,
                 color=line_color,
                 linewidth=line_width,
+                clip_on=True,
             )
             mid_t = (seg.t_start + seg.t_end) / 2
-            mid_y = seg.slope_deg_s * mid_t + seg.intercept_deg
-            self.ax.text(
-                mid_t,
-                mid_y,
-                f"#{seg.segment_id}",
-                color="white",
-                fontsize=8,
-                fontweight="bold",
-                ha="center",
-                va="center",
-                bbox=dict(boxstyle="round,pad=0.2", facecolor=line_color, alpha=0.85),
-            )
+            if vx0 <= mid_t <= vx1:
+                mid_y = seg.slope_deg_s * mid_t + seg.intercept_deg
+                self.ax.text(
+                    mid_t,
+                    mid_y,
+                    f"#{seg.segment_id}",
+                    color="white",
+                    fontsize=8,
+                    fontweight="bold",
+                    ha="center",
+                    va="center",
+                    clip_on=True,
+                    bbox=dict(
+                        boxstyle="round,pad=0.2",
+                        facecolor=line_color,
+                        alpha=0.85,
+                    ),
+                )
 
         if self.pending_start_idx is not None:
             t_start = times[self.pending_start_idx]
@@ -988,9 +1061,10 @@ class AnnotatorApp:
                 self.ax.set_ylim(ymin, ymax)
 
         if self._hover_idx is not None:
-            self._draw_hover_marker(self._hover_idx)
+            self._draw_hover_highlight(self._hover_idx)
         else:
             self.canvas.draw_idle()
+            self.hover_var.set(self._hover_hint())
 
     def _export(self) -> None:
         if not self.segments:
