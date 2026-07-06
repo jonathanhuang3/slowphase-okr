@@ -121,11 +121,87 @@ pip install -e .
 
 If `py` is not found, use `python` instead in the commands above.
 
-**What is the virtual environment?** It keeps this app’s packages separate from the rest of your system. You only need to activate it (the `source` or `Activate` step) each time you open a new terminal window before running the app.
+**What is the virtual environment?** It keeps this app’s packages separate from the rest of your system. You only run `pip install -e .` **once** (or again after pulling code updates). Closing the terminal does **not** remove the venv or your installed packages — you only need to activate it again before running the app.
+
+### Step 3b — Auto-activate the virtual environment (optional)
+
+If you do not want to run `source .venv/bin/activate` every time you open a new terminal, you can set up automatic activation.
+
+**Important:** You do **not** need to run `pip install -e .` again when you open a new terminal. That step is one-time. Auto-activation only runs the activate step for you.
+
+#### macOS / Linux (zsh — default on modern macOS)
+
+Add this to `~/.zshrc` (open the file in a text editor, paste at the bottom, save):
+
+```bash
+# Auto-activate .venv when entering a project folder
+_auto_venv() {
+  if [[ -f .venv/bin/activate ]]; then
+    if [[ "$VIRTUAL_ENV" != "$PWD/.venv" ]]; then
+      source .venv/bin/activate
+    fi
+  elif [[ -n "$VIRTUAL_ENV" && "$VIRTUAL_ENV" != "$PWD/.venv" ]]; then
+    deactivate 2>/dev/null
+  fi
+}
+chpwd_functions+=(_auto_venv)
+_auto_venv
+```
+
+Then reload your shell:
+
+```bash
+source ~/.zshrc
+```
+
+From now on, whenever you `cd` into `slowphase-okr` (or any folder that contains a `.venv`), the environment activates automatically and you should see `(.venv)` in your prompt.
+
+#### macOS / Linux (bash)
+
+Add the same block to `~/.bashrc` instead of `~/.zshrc`, but replace the last two lines with:
+
+```bash
+cd() {
+  builtin cd "$@" || return
+  if [[ -f .venv/bin/activate ]]; then
+    source .venv/bin/activate
+  fi
+}
+```
+
+#### Windows (PowerShell)
+
+Add this to your PowerShell profile (run `notepad $PROFILE` — create the file if prompted):
+
+```powershell
+function Enter-VenvIfPresent {
+    if (Test-Path .venv\Scripts\Activate.ps1) {
+        . .venv\Scripts\Activate.ps1
+    }
+}
+function cd {
+    param([string]$Path)
+    if ($Path) { Set-Location $Path } else { Set-Location $HOME }
+    Enter-VenvIfPresent
+}
+Enter-VenvIfPresent
+```
+
+Open a new PowerShell window after saving.
+
+#### Alternative: direnv
+
+If you use [direnv](https://direnv.net/), create a file named `.envrc` in the project root:
+
+```bash
+source .venv/bin/activate
+```
+
+Then run `direnv allow` once in that folder. direnv will activate the venv whenever you enter the directory.
 
 ### Step 4 — Run the app
 
-With the virtual environment still active:
+With the virtual environment active:
 
 ```bash
 slowphase-okr
@@ -151,6 +227,8 @@ A window should open. If nothing happens or you see an error, see [Troubleshooti
 | `No module named '_tkinter'` (Linux) | Run `sudo apt install python3-tk` (Ubuntu) or install the tk package for your distro |
 | App opens then closes immediately | Run `python -m slowphase_okr` from the terminal to see the error message |
 | `slowphase-okr` command not found | Make sure the virtual environment is activated (`(.venv)` in your prompt), then try `python -m slowphase_okr` |
+| Have to activate venv every new terminal | See [Step 3b](#step-3b--auto-activate-the-virtual-environment-optional) for auto-activation |
+| Re-running `pip install` after closing terminal | Not needed — `pip install -e .` is one-time. Only activate the venv again (or set up auto-activation) |
 
 ## Install (quick reference)
 
@@ -176,6 +254,8 @@ pip install -e .
 
 **Requirements:** Python 3.9+ and tkinter (included with the python.org installers on macOS and Windows).
 
+`pip install -e .` is a one-time step. To skip manual activation in new terminals, see [Step 3b](#step-3b--auto-activate-the-virtual-environment-optional).
+
 ## Run (quick reference)
 
 With the virtual environment activated:
@@ -196,14 +276,15 @@ On Windows, `python` is usually correct inside the venv. On macOS/Linux, `python
 
 1. **Browse gaze file** — your gaze direction file (see [Data format](#data-format))
 2. **Browse time file** — your timestamp file (one time per gaze sample)
-3. Enter **Trial ID** and **stimulus velocity** (default 31 deg/s, press Enter to apply after editing)
-4. Click **Load trial**
-5. **Click twice** on the elevation trace: start and end of each upward slow phase (snaps to nearest sample)
-6. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
-7. Press **Accept segment** (`A`) to keep the fit
-8. **Export Excel** when done
+3. **Browse OKR log** *(optional)* — stimulus event log with block and fixation timing (see [OKR log](#okr-log-optional))
+4. Enter **Trial ID** and **stimulus velocity** (default 31 deg/s, press Enter to apply after editing)
+5. Click **Load trial**
+6. **Click twice** on the elevation trace: start and end of each upward slow phase (snaps to nearest sample)
+7. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
+8. Press **Accept segment** (`A`) to keep the fit
+9. **Export Excel** when done
 
-Hover over the plot to see time and elevation at the nearest sample. Press **`?`** (or the **?** button) for the full shortcut list.
+Hover over the plot to see time and elevation at the nearest sample. Press **`?`** (or the **Help** button) for the full shortcut list.
 
 ## Features
 
@@ -216,6 +297,8 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Stimulus velocity** | Editable anytime. Enter recalculates gains for all segments. |
 | **JSON autosave** | Saves to `{trial_id}_slowphase_okr_autosave.json` in the trial folder. Offers restore on reload. |
 | **Reload guard** | Confirms before discarding accepted or pending segments |
+| **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray) on the plot |
+| **Invalid gaze samples** | `(NaN, NaN, NaN)` lines are kept for alignment but skipped for clicking and fitting |
 
 **R²** is displayed and written to Excel but segments are **not** auto-rejected.
 
@@ -250,16 +333,38 @@ This is the format the app loads.
 | **Gaze file** | One 3D gaze direction per line, as `(x, y, z)` tuples |
 | **Time file** | One timestamp per line, in seconds, aligned sample-for-sample with the gaze file |
 
-**Example filenames** (from our Vive Pro Eye / Tobii + Unity setup): `rotatedGaze.txt` and `gazeTime.txt`. Your lab may use different names — that is fine as long as the content matches.
+**Example filenames** (from our Vive Pro Eye / Tobii + Unity setup): `rotatedGaze.txt` and `gazeTime.txt`, or raw SRanipal exports like `sranipalGazeSpace.txt` and `sranipalGazeTime.txt`. Your lab may use different names — that is fine as long as the content matches.
 
 This tool was developed for our lab to support gaze data recorded with a **HTC Vive Pro Eye** headset (Tobii eye tracking). The gaze file holds direction vectors in the experiment’s rotated coordinate frame. The app converts `(x, y, z)` to elevation (`azimuth = atan2(x,z)`, `elevation = asin(y/r)`).
 
 **Requirements**
 
-- The same number of lines in both files
+- The same number of lines in both files (one timestamp per gaze line, including invalid samples)
 - Timestamps in seconds
-- Gaze lines parseable as `(x, y, z)` floats (see `examples/` for sample files)
+- Gaze lines as `(x, y, z)` tuples. Use `(NaN, NaN, NaN)` for missing tracking — these rows stay aligned with timestamps but are treated as invalid (no elevation, not clickable)
 
+### OKR log (optional)
+
+Older stimulus versions did not write this file. If your session includes an OKR condition log, you can upload it to show stimulus timing on the plot.
+
+| File | What it contains |
+|------|------------------|
+| **OKR log** | Tab-separated event table from Unity (e.g. `OKR_Log_Patient_Testing.txt`) |
+
+**Typical columns:** `eventIndex`, `eventType`, `contrastBlockIndex`, `startTime`, `endTime`, and others. Comment lines start with `#`.
+
+**Time base:** `startTime` / `endTime` use Unity `Time.time` (seconds since Play), which should match your gaze timestamp file.
+
+**How events are classified:**
+
+| Event name contains | Plot marker |
+|---------------------|-------------|
+| `fixation` (case-insensitive) | Gray dotted line — fixation cross / ITI start (`F`) |
+| Anything else | Purple dashed line — contrast block start (label e.g. `B2↓`) |
+
+Block labels use `contrastBlockIndex` and direction when available. New block event names are detected automatically without updating the app.
+
+**Example filenames:** `OKR_Log_Patient_Testing.txt` or similar in the same folder as gaze/time files.
 
 ## Excel output
 
