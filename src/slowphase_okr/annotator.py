@@ -30,20 +30,20 @@ from slowphase_okr.gaze import GazeTrial, analysis_window_mask, load_ush2a_trial
 HELP_TEXT = """Keyboard shortcuts
 ────────────────────────────────────────
 Marking
-  Click × 2        Mark slow-phase start, then end (snaps to nearest sample)
+  Click × 2        Mark slow-phase start, then end (snaps to nearest data point)
   A                Accept pending segment
   Esc              Clear pending segment (start over)
 
 Navigation
   Scroll wheel     Zoom time axis (cursor-centered)
   ← / →            Pan view by 1 s
-  View buttons     5 s, 10 s, Full trial, Reset (first 5 s)
+  View buttons     2 s, 5 s, 10 s, Full trial, Reset (first 5 s)
 
 Segments (select one in the list first)
   Del              Delete selected segment
   U                Undo last accepted segment
-  [  ]             Nudge start earlier / later (one sample)
-  ,  .             Nudge end earlier / later (one sample)
+  [  ]             Nudge start to previous / next data point
+  ,  .             Nudge end to previous / next data point
 
 Other
   Enter            Apply stimulus velocity (in velocity field)
@@ -79,6 +79,8 @@ class AnnotatorApp:
 
         self._preview_line = None
         self._click_markers: list = []
+        self._hover_idx: int | None = None
+        self._hover_marker = None
 
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
@@ -134,6 +136,9 @@ class AnnotatorApp:
         view_row = ttk.Frame(top)
         view_row.grid(row=2, column=3, columnspan=2, rowspan=2, sticky=tk.W, padx=4, pady=2)
         ttk.Label(view_row, text="View:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(view_row, text="2 s", width=5, command=lambda: self._set_view_duration(2.0)).pack(
+            side=tk.LEFT, padx=2
+        )
         ttk.Button(view_row, text="5 s", width=5, command=lambda: self._set_view_duration(5.0)).pack(
             side=tk.LEFT, padx=2
         )
@@ -172,8 +177,8 @@ class AnnotatorApp:
         )
 
         help_text = (
-            "Click start then end of each upward slow phase (snaps to nearest sample). "
-            "Scroll to zoom; Left/Right arrows to pan. Press ? for shortcuts."
+            "Click start then end of each upward slow phase (snaps to nearest data point). "
+            "Hover highlights the sample that will be used. Scroll to zoom, arrows to pan. Press ? for shortcuts."
         )
         ttk.Label(self.root, text=help_text, padding=(8, 0)).pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -219,7 +224,7 @@ class AnnotatorApp:
         ).pack(side=tk.TOP, fill=tk.X)
         ttk.Label(
             seg_actions,
-            text="Selected: [ ] nudge start, , . nudge end",
+            text="Selected: [ ] nudge start, , . nudge end (one data point)",
             wraplength=180,
         ).pack(side=tk.TOP, pady=(4, 0))
 
@@ -305,22 +310,70 @@ class AnnotatorApp:
 
     def _on_motion(self, event) -> None:
         if event.inaxes != self.ax or self.trial is None:
-            self.hover_var.set("")
+            self._set_hover(None)
             return
         if event.xdata is None:
-            self.hover_var.set("")
+            self._set_hover(None)
             return
         try:
             mask = self._valid_click_mask()
             if not np.any(mask):
-                self.hover_var.set("")
+                self._set_hover(None)
                 return
             idx = snap_index(self.trial.times, float(event.xdata), mask)
-            t = float(self.trial.times[idx])
-            elev = float(self.trial.elevation_deg[idx])
-            self.hover_var.set(f"t = {t:.3f} s,  elevation = {elev:.2f}°")
+            self._set_hover(idx)
         except ValueError:
+            self._set_hover(None)
+
+    def _set_hover(self, idx: int | None) -> None:
+        if idx is None:
+            self._hover_idx = None
             self.hover_var.set("")
+            self._remove_hover_marker()
+            return
+        if idx == self._hover_idx and self._hover_marker is not None:
+            return
+        self._hover_idx = idx
+        assert self.trial is not None
+        t = float(self.trial.times[idx])
+        elev = float(self.trial.elevation_deg[idx])
+        self.hover_var.set(
+            f"Nearest data point: t = {t:.3f} s, elevation = {elev:.2f}° (click snaps here)"
+        )
+        self._draw_hover_marker(idx)
+
+    def _remove_hover_marker(self) -> None:
+        if self._hover_marker is not None:
+            try:
+                self._hover_marker.remove()
+            except ValueError:
+                pass
+            self._hover_marker = None
+
+    def _draw_hover_marker(self, idx: int) -> None:
+        if self.trial is None:
+            return
+        self._remove_hover_marker()
+        t = self.trial.times[idx]
+        elev = self.trial.elevation_deg[idx]
+        (self._hover_marker,) = self.ax.plot(
+            t,
+            elev,
+            "o",
+            markersize=11,
+            markerfacecolor="white",
+            markeredgecolor="dodgerblue",
+            markeredgewidth=2.0,
+            zorder=10,
+        )
+        self.canvas.draw_idle()
+
+    def _position_in_valid(self, idx: int, valid: np.ndarray) -> int:
+        """Index of ``idx`` within the ``valid`` index array."""
+        matches = np.where(valid == idx)[0]
+        if len(matches):
+            return int(matches[0])
+        return int(np.clip(np.searchsorted(valid, idx), 0, len(valid) - 1))
 
     def _browse_gaze(self) -> None:
         path = filedialog.askopenfilename(
@@ -691,23 +744,26 @@ class AnnotatorApp:
         if seg is None or self.trial is None:
             return
         valid = self._valid_indices()
-        if len(valid) == 0:
+        if len(valid) < 2:
             return
 
+        start_pos = self._position_in_valid(seg.idx_start, valid)
+        end_pos = self._position_in_valid(seg.idx_end, valid)
+
         if which == "start":
-            pos = int(np.searchsorted(valid, seg.idx_start))
-            pos = int(np.clip(pos + direction, 0, len(valid) - 1))
-            new_start = int(valid[pos])
+            new_pos = start_pos + direction
+            if new_pos < 0 or new_pos >= end_pos:
+                self._set_status("Start must stay before end (one data point at a time).")
+                return
+            new_start = int(valid[new_pos])
             new_end = seg.idx_end
-            if new_start == new_end:
-                return
         else:
-            pos = int(np.searchsorted(valid, seg.idx_end))
-            pos = int(np.clip(pos + direction, 0, len(valid) - 1))
-            new_end = int(valid[pos])
-            new_start = seg.idx_start
-            if new_start == new_end:
+            new_pos = end_pos + direction
+            if new_pos <= start_pos or new_pos >= len(valid):
+                self._set_status("End must stay after start (one data point at a time).")
                 return
+            new_end = int(valid[new_pos])
+            new_start = seg.idx_start
 
         try:
             updated = fit_segment(
@@ -730,9 +786,11 @@ class AnnotatorApp:
         self._refresh_segment_list()
         self._redraw()
         self._write_autosave()
+        boundary = "start" if which == "start" else "end"
+        t = updated.t_start if which == "start" else updated.t_end
         self._set_status(
-            f"Segment #{updated.segment_id} adjusted: "
-            f"gain={updated.gain:.3f}, R²={updated.r2:.3f}"
+            f"Segment #{updated.segment_id} {boundary} → {t:.3f} s "
+            f"(gain={updated.gain:.3f}, R²={updated.r2:.3f})"
         )
 
     def _delete_selected_segment(self) -> None:
@@ -795,6 +853,7 @@ class AnnotatorApp:
     def _redraw(self) -> None:
         self.ax.clear()
         self._click_markers.clear()
+        self._hover_marker = None
 
         if self.trial is None:
             self.ax.set_title("Load a trial to begin")
@@ -928,7 +987,10 @@ class AnnotatorApp:
             if ymin < ymax:
                 self.ax.set_ylim(ymin, ymax)
 
-        self.canvas.draw_idle()
+        if self._hover_idx is not None:
+            self._draw_hover_marker(self._hover_idx)
+        else:
+            self.canvas.draw_idle()
 
     def _export(self) -> None:
         if not self.segments:

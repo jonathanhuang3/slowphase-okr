@@ -199,7 +199,7 @@ On Windows, `python` is usually correct inside the venv. On macOS/Linux, `python
 3. Enter **Trial ID** and **stimulus velocity** (default 31 deg/s, press Enter to apply after editing)
 4. Click **Load trial**
 5. **Click twice** on the elevation trace: start and end of each upward slow phase (snaps to nearest sample)
-6. **Scroll** to zoom the time axis, **←/→** to pan, and use **5 s / 10 s / Full / Reset** view buttons
+6. **Scroll** to zoom the time axis, **←/→** to pan, and use **2 s / 5 s / 10 s / Full / Reset** view buttons
 7. Press **Accept segment** (`A`) to keep the fit
 8. **Export Excel** when done
 
