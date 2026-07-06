@@ -270,62 +270,6 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 | Have to activate venv every new terminal | See [Step 3b](#step-3b--auto-activate-the-virtual-environment-optional) for auto-activation |
 | Re-running `pip install` after closing terminal | Not needed — `pip install -e .` is one-time. Only activate the venv again (or set up auto-activation) |
 
-## Install (quick reference)
-
-If Python is already set up and you have the repo:
-
-**macOS / Linux**
-
-```bash
-cd slowphase-okr
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-**Windows**
-
-```powershell
-cd slowphase-okr
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -e .
-```
-
-**Requirements:** Python 3.9+ and tkinter (included with the python.org installers on macOS and Windows).
-
-`pip install -e .` is a one-time step. To skip manual activation in new terminals, see [Step 3b](#step-3b--auto-activate-the-virtual-environment-optional).
-
-## Run (quick reference)
-
-**Every time** you open a new terminal (after the one-time install in Step 3):
-
-**macOS / Linux**
-
-```bash
-cd ~/Desktop/slowphase-okr          # 1. go to the project folder
-source .venv/bin/activate           # 2. activate (look for (.venv) in your prompt)
-slowphase-okr                       # 3. start the app
-```
-
-**Windows (PowerShell)**
-
-```powershell
-cd $env:USERPROFILE\Desktop\slowphase-okr
-.venv\Scripts\Activate.ps1
-slowphase-okr
-```
-
-Do **not** run `pip install -e .` again unless you updated the code or dependencies.
-
-Alternative start command (if `slowphase-okr` is not found):
-
-```bash
-python -m slowphase_okr
-```
-
-On Windows, `python` is usually correct inside the venv. On macOS/Linux, `python3 -m slowphase_okr` also works.
-
 ## Workflow
 
 1. **Browse gaze file** — your gaze direction file (see [Data format](#data-format))
