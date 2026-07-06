@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.transforms import blended_transform_factory
 
 from slowphase_okr import __version__
 from slowphase_okr.autosave import (
@@ -25,6 +26,7 @@ from slowphase_okr.autosave import (
 from slowphase_okr.export import export_to_excel
 from slowphase_okr.fit import SegmentFit, fit_segment, snap_index, trial_summary_median_gain
 from slowphase_okr.gaze import GazeTrial, analysis_window_mask, load_ush2a_trial
+from slowphase_okr.okr_log import OkrLog, load_okr_log
 
 
 HELP_TEXT = """Keyboard shortcuts
@@ -53,6 +55,7 @@ Notes
   • Analysis window spans the full trial (first to last timestamp).
   • R² is logged and exported but segments are not auto-rejected.
   • Annotations autosave to JSON in the trial folder; restore on reload.
+  • Optional OKR log marks contrast-block and fixation-cross start times on the plot.
 """
 
 
@@ -75,6 +78,8 @@ class AnnotatorApp:
 
         self.gaze_path: Path | None = None
         self.time_path: Path | None = None
+        self.okr_log_path: Path | None = None
+        self.okr_log: OkrLog | None = None
         self.trial: GazeTrial | None = None
         self.window_mask: np.ndarray | None = None  # type: ignore[name-defined]
 
@@ -118,9 +123,12 @@ class AnnotatorApp:
         ttk.Button(top, text="Load trial", command=self._load_trial).grid(
             row=0, column=2, padx=4, pady=2, sticky=tk.W
         )
-        top.columnconfigure(4, weight=1)
+        ttk.Button(top, text="Browse OKR log…", command=self._browse_okr_log).grid(
+            row=0, column=3, padx=4, pady=2, sticky=tk.W
+        )
+        top.columnconfigure(5, weight=1)
         ttk.Button(top, text="Help", command=self._show_help).grid(
-            row=0, column=4, padx=4, pady=2, sticky=tk.E
+            row=0, column=5, padx=4, pady=2, sticky=tk.E
         )
 
         ttk.Label(top, text="Trial ID:").grid(row=1, column=0, sticky=tk.E, padx=4)
@@ -143,6 +151,8 @@ class AnnotatorApp:
         self.gaze_file_label.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=4)
         self.time_file_label = ttk.Label(top, text="")
         self.time_file_label.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=4)
+        self.okr_log_file_label = ttk.Label(top, text="")
+        self.okr_log_file_label.grid(row=4, column=0, columnspan=3, sticky=tk.W, padx=4)
 
         view_row = ttk.Frame(top)
         view_row.grid(row=2, column=3, columnspan=2, rowspan=2, sticky=tk.W, padx=4, pady=2)
@@ -405,6 +415,19 @@ class AnnotatorApp:
         self.time_file_label.config(
             text="Time file uploaded" if self.time_path else ""
         )
+        if self.okr_log_path and self.okr_log is not None:
+            n_blocks = len(self.okr_log.block_markers)
+            n_fix = len(self.okr_log.fixation_markers)
+            self.okr_log_file_label.config(
+                text=(
+                    f"OKR log uploaded ({n_blocks} block start(s), "
+                    f"{n_fix} fixation start(s))"
+                )
+            )
+        elif self.okr_log_path:
+            self.okr_log_file_label.config(text="OKR log selected (not loaded)")
+        else:
+            self.okr_log_file_label.config(text="")
 
     def _pan_step_sec(self) -> float:
         if self.view_xmin is None or self.view_xmax is None:
@@ -436,6 +459,37 @@ class AnnotatorApp:
         if path:
             self.time_path = Path(path)
             self._update_files_label()
+
+    def _browse_okr_log(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select OKR log file (optional)",
+            filetypes=[
+                ("OKR log files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self.okr_log_path = Path(path)
+        if not self._parse_okr_log(show_error=True):
+            self.okr_log_path = None
+            self.okr_log = None
+        self._update_files_label()
+        if self.trial is not None:
+            self._redraw()
+
+    def _parse_okr_log(self, show_error: bool = False) -> bool:
+        if not self.okr_log_path:
+            self.okr_log = None
+            return True
+        try:
+            self.okr_log = load_okr_log(self.okr_log_path)
+            return True
+        except Exception as exc:
+            self.okr_log = None
+            if show_error:
+                messagebox.showerror("OKR log failed", str(exc))
+            return False
 
     def _stimulus_velocity(self) -> float:
         try:
@@ -589,12 +643,21 @@ class AnnotatorApp:
             self._reset_view()
             self._try_restore_autosave(trial_id)
             self._refresh_segment_list()
+            if self.okr_log_path and not self._parse_okr_log(show_error=True):
+                self.okr_log_path = None
+            self._update_files_label()
             self._redraw()
             duration = t1 - t0
-            self._set_status(
+            status = (
                 f"Loaded {trial_id}: {len(self.trial.times)} samples, "
                 f"analysis {t0:.2f}–{t1:.2f} s ({duration:.1f} s)"
             )
+            if self.okr_log is not None:
+                status += (
+                    f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
+                    f"{len(self.okr_log.fixation_markers)} fixations"
+                )
+            self._set_status(status)
             self.hover_var.set(self._hover_hint())
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
@@ -954,6 +1017,8 @@ class AnnotatorApp:
         self.ax.axvline(t0, color="steelblue", linestyle="--", alpha=0.35, linewidth=0.8)
         self.ax.axvline(t1, color="steelblue", linestyle="--", alpha=0.35, linewidth=0.8)
 
+        self._draw_okr_log_markers(vx0, vx1)
+
         for seg in self.segments:
             if seg.t_end < vx0 or seg.t_start > vx1:
                 continue
@@ -1065,6 +1130,63 @@ class AnnotatorApp:
         else:
             self.canvas.draw_idle()
             self.hover_var.set(self._hover_hint())
+
+    def _draw_okr_log_markers(self, vx0: float, vx1: float) -> None:
+        if self.okr_log is None:
+            return
+
+        label_trans = blended_transform_factory(self.ax.transData, self.ax.transAxes)
+
+        for marker in self.okr_log.fixation_markers:
+            t = marker.start_time
+            if t < vx0 or t > vx1:
+                continue
+            self.ax.axvline(
+                t,
+                color="#5c6b73",
+                linestyle=(0, (1, 2)),
+                linewidth=1.0,
+                alpha=0.75,
+                zorder=1,
+            )
+            label = "F"
+            self.ax.text(
+                t,
+                0.97,
+                label,
+                transform=label_trans,
+                color="#5c6b73",
+                fontsize=7,
+                ha="center",
+                va="top",
+                clip_on=True,
+            )
+
+        for marker in self.okr_log.block_markers:
+            t = marker.start_time
+            if t < vx0 or t > vx1:
+                continue
+            self.ax.axvline(
+                t,
+                color="#7b2cbf",
+                linestyle=(0, (4, 2)),
+                linewidth=1.1,
+                alpha=0.85,
+                zorder=1,
+            )
+            self.ax.text(
+                t,
+                0.88,
+                marker.label,
+                transform=label_trans,
+                color="#7b2cbf",
+                fontsize=7,
+                fontweight="bold",
+                ha="center",
+                va="top",
+                rotation=90,
+                clip_on=True,
+            )
 
     def _export(self) -> None:
         if not self.segments:

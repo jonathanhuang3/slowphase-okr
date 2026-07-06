@@ -11,6 +11,7 @@ from slowphase_okr.gaze import (
     load_ush2a_trial,
     unity_gaze_direction,
 )
+from slowphase_okr.okr_log import load_okr_log
 
 
 def test_unity_gaze_direction_forward():
@@ -87,6 +88,31 @@ def test_median_gain():
         SegmentFit(2, 2, 3, 1, 2, 2, 30, 0, 30 / 31, 0.98, True, 31),
     ]
     assert trial_summary_median_gain(segs) == pytest.approx((20 / 31 + 30 / 31) / 2)
+
+
+def test_load_okr_log(tmp_path: Path):
+    log = tmp_path / "OKR_Log_test.txt"
+    log.write_text(
+        "# OKR Condition Log\n"
+        "eventIndex\teventType\teyePatch\tcontrastBlockIndex\tdotColor\t"
+        "direction\tcontrastLevel\tdotStartSize\temissionRate\tusePersistentDots\t"
+        "sessionContrastThreshold\tthresholdMultiplier\tisAnchor100\tstartTime\tendTime\n"
+        "1\tInitialFixation\tLeft\tNA\tNA\tNA\tNA\tNA\tNA\t0\t0\t0\t0\t66.4\t70.4\n"
+        "2\tAnchor100PersistentBlock\tLeft\t0\tWhite\tUp\t1.0\t0.7\t3000\t1\t0.076\tNA\t1\t70.42\t85.4\n"
+        "3\tFixationITI\tLeft\t0\tNA\tNA\tNA\tNA\tNA\t0\t0\t0\t0\t85.41\t89.4\n"
+        "6\tContrastBlock\tLeft\t2\tWhite\tDown\t0.1525\t0.7\t20000\t0\t0.076\t2\t0\t108.44\t123.4\n"
+        "7\tCustomStimulusBlock\tLeft\t3\tWhite\tUp\t0.3\t0.7\t20000\t0\t0.076\t4\t0\t130.0\t145.0\n"
+    )
+    okr = load_okr_log(log)
+    assert len(okr.block_markers) == 3
+    assert len(okr.fixation_markers) == 2
+    assert okr.block_markers[0].start_time == pytest.approx(70.42)
+    assert okr.block_markers[0].label == "B0↑"
+    assert okr.block_markers[1].label == "B2↓"
+    assert okr.block_markers[2].event_type == "CustomStimulusBlock"
+    assert okr.block_markers[2].label == "B3↑"
+    assert okr.fixation_markers[0].event_type == "InitialFixation"
+    assert okr.fixation_markers[1].start_time == pytest.approx(85.41)
 
 
 def test_autosave_roundtrip(tmp_path: Path):
