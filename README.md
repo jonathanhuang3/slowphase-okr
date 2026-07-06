@@ -2,8 +2,6 @@
 
 Manual slow-phase annotation for **OKR gain** estimation. Mark upward slow phases on an elevation trace with two clicks. The tool fits a line through each segment and exports slopes and gain to Excel.
 
-Designed for vestibular/OKR labs using Unity gaze exports (`rotatedGaze.txt` + `gazeTime.txt`).
-
 ## Getting started
 
 You need **Python 3.9 or newer** on your computer. Everything else (matplotlib, pandas, and so on) is installed automatically in the steps below.
@@ -196,8 +194,8 @@ On Windows, `python` is usually correct inside the venv. On macOS/Linux, `python
 
 ## Workflow
 
-1. **Browse gaze file** — `rotatedGaze.txt` (or compatible `(x, y, z)` tuple format)
-2. **Browse time file** — `gazeTime.txt` (one timestamp per line, seconds)
+1. **Browse gaze file** — your gaze direction file (see [Data format](#data-format))
+2. **Browse time file** — your timestamp file (one time per gaze sample)
 3. Enter **Trial ID** and **stimulus velocity** (default 31 deg/s, press Enter to apply after editing)
 4. Click **Load trial**
 5. **Click twice** on the elevation trace: start and end of each upward slow phase (snaps to nearest sample)
@@ -241,16 +239,27 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 
 ## Data format
 
-### USH2A / Unity (GUI)
+The GUI expects **two text files per trial**: one with gaze direction and one with timestamps. Filenames do not matter — use whatever your pipeline exports.
 
-- `rotatedGaze.txt` — lines like `(x, y, z)`
-- `gazeTime.txt` — one float per line (seconds)
+### Gaze + timestamp files (GUI)
 
-Elevation uses the same spherical convention as the USH2A MATLAB helper `unityGazeDirection` (`azimuth = atan2(x,z)`, `elevation = asin(y/r)`).
+This is the format the app loads.
 
-### CSV (programmatic only)
+| File | What it contains |
+|------|------------------|
+| **Gaze file** | One 3D gaze direction per line, as `(x, y, z)` tuples |
+| **Time file** | One timestamp per line, in seconds, aligned sample-for-sample with the gaze file |
 
-A CSV with `time` and `elevation` columns can be loaded via `load_csv_trial()` in code. The GUI uses the USH2A pair format.
+**Example filenames** (from our Vive Pro Eye / Tobii + Unity setup): `rotatedGaze.txt` and `gazeTime.txt`. Your lab may use different names — that is fine as long as the content matches.
+
+This tool was developed for our lab to support gaze data recorded with a **HTC Vive Pro Eye** headset (Tobii eye tracking). The gaze file holds direction vectors in the experiment’s rotated coordinate frame. The app converts `(x, y, z)` to elevation (`azimuth = atan2(x,z)`, `elevation = asin(y/r)`).
+
+**Requirements**
+
+- The same number of lines in both files
+- Timestamps in seconds
+- Gaze lines parseable as `(x, y, z)` floats (see `examples/` for sample files)
+
 
 ## Excel output
 

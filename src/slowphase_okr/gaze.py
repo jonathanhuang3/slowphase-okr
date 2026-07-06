@@ -1,4 +1,4 @@
-"""Load gaze traces from USH2A tuple format or generic CSV."""
+"""Load gaze traces from gaze direction + timestamp text files."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 
 @dataclass
@@ -91,31 +90,6 @@ def load_ush2a_trial(
         trial_id=trial_id,
         source_gaze=str(gaze_path.resolve()),
         source_time=str(time_path.resolve()),
-    )
-
-
-def load_csv_trial(
-    csv_path: str | Path,
-    time_col: str = "time",
-    elevation_col: str = "elevation",
-    trial_id: str = "",
-) -> GazeTrial:
-    """Load a CSV with time (s) and elevation (deg) columns."""
-    csv_path = Path(csv_path)
-    df = pd.read_csv(csv_path)
-    if time_col not in df.columns or elevation_col not in df.columns:
-        raise ValueError(
-            f"CSV must contain '{time_col}' and '{elevation_col}' columns. "
-            f"Found: {list(df.columns)}"
-        )
-    if not trial_id:
-        trial_id = csv_path.stem
-    return GazeTrial(
-        times=df[time_col].to_numpy(dtype=float),
-        elevation_deg=df[elevation_col].to_numpy(dtype=float),
-        trial_id=trial_id,
-        source_gaze=str(csv_path.resolve()),
-        source_time=str(csv_path.resolve()),
     )
 
 
