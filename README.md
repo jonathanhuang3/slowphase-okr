@@ -1,21 +1,48 @@
 # slowphase-okr
 
-Manual slow-phase annotation for **OKR gain** estimation. Mark upward slow phases on an elevation trace with two clicks; the tool fits a line through each segment and exports slopes and gain to Excel.
+Manual slow-phase annotation for **OKR gain** estimation. Mark upward slow phases on an elevation trace with two clicks. The tool fits a line through each segment and exports slopes and gain to Excel.
 
 Designed for vestibular/OKR labs using Unity gaze exports (`rotatedGaze.txt` + `gazeTime.txt`).
 
 ## Install
 
+Clone this repository, then follow the steps for your system.
+
+### macOS
+
 ```bash
 cd slowphase-okr
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -e .
 ```
 
-**Requirements:** Python 3.9+, tkinter (included with most Python installers; on Linux you may need `python3-tk`).
+### Windows
+
+In **PowerShell** or **Command Prompt**:
+
+```powershell
+cd slowphase-okr
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+If `py` is not found, try `python` instead. In **Command Prompt** you can activate with:
+
+```cmd
+.venv\Scripts\activate.bat
+```
+
+### Linux
+
+Same as macOS. If tkinter is missing, install it with your package manager (for example `sudo apt install python3-tk` on Ubuntu).
+
+**Requirements:** Python 3.9+ and tkinter (included with most Python installers on macOS and Windows).
 
 ## Run
+
+With the virtual environment activated:
 
 ```bash
 slowphase-okr
@@ -27,14 +54,16 @@ or
 python -m slowphase_okr
 ```
 
+On Windows, `python` is usually correct inside the venv. On macOS/Linux, `python3 -m slowphase_okr` also works.
+
 ## Workflow
 
 1. **Browse gaze file** — `rotatedGaze.txt` (or compatible `(x, y, z)` tuple format)
 2. **Browse time file** — `gazeTime.txt` (one timestamp per line, seconds)
-3. Enter **Trial ID** and **stimulus velocity** (default 31 deg/s; press Enter to apply after editing)
+3. Enter **Trial ID** and **stimulus velocity** (default 31 deg/s, press Enter to apply after editing)
 4. Click **Load trial**
 5. **Click twice** on the elevation trace: start and end of each upward slow phase (snaps to nearest sample)
-6. **Scroll** to zoom the time axis; **←/→** to pan; use **5 s / 10 s / Full / Reset** view buttons
+6. **Scroll** to zoom the time axis, **←/→** to pan, and use **5 s / 10 s / Full / Reset** view buttons
 7. Press **Accept segment** (`A`) to keep the fit
 8. **Export Excel** when done
 
@@ -45,11 +74,11 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | Feature | Description |
 |---------|-------------|
 | **Analysis window** | Full trial — first timestamp to last timestamp |
-| **Segment list** | Panel showing #, times, gain, R², upward flag; click to select |
+| **Segment list** | Panel showing #, times, gain, R², upward flag. Click to select. |
 | **Segment labels** | `#N` badges on accepted segments in the plot |
 | **Edit segments** | Delete selected (`Del`), undo last (`U`), nudge boundaries (`[ ]` start, `, .` end) |
-| **Stimulus velocity** | Editable anytime; Enter recalculates gains for all segments |
-| **JSON autosave** | Saves to `{trial_id}_slowphase_okr_autosave.json` in the trial folder; offers restore on reload |
+| **Stimulus velocity** | Editable anytime. Enter recalculates gains for all segments. |
+| **JSON autosave** | Saves to `{trial_id}_slowphase_okr_autosave.json` in the trial folder. Offers restore on reload. |
 | **Reload guard** | Confirms before discarding accepted or pending segments |
 
 **R²** is displayed and written to Excel but segments are **not** auto-rejected.
@@ -83,7 +112,7 @@ Elevation uses the same spherical convention as the USH2A MATLAB helper `unityGa
 
 ### CSV (programmatic only)
 
-A CSV with `time` and `elevation` columns can be loaded via `load_csv_trial()` in code; the GUI uses the USH2A pair format.
+A CSV with `time` and `elevation` columns can be loaded via `load_csv_trial()` in code. The GUI uses the USH2A pair format.
 
 ## Excel output
 
