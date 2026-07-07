@@ -96,6 +96,7 @@ class AnnotatorApp:
 
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
+        self.elev_ylim: tuple[float, float] | None = None
         self.view_xmin: float | None = None
         self.view_xmax: float | None = None
 
@@ -636,6 +637,7 @@ class AnnotatorApp:
             self.analysis_t0 = t0
             self.analysis_t1 = t1
             self.window_mask = analysis_window_mask(self.trial.times, t0, t_end=t1)
+            self._update_elev_ylim()
             self.segments.clear()
             self.selected_segment_id = None
             self._clear_pending(redraw=False)
@@ -777,6 +779,24 @@ class AnnotatorApp:
         if self.trial is None or self.window_mask is None:
             return np.array([], dtype=bool)
         return self.window_mask & ~np.isnan(self.trial.elevation_deg)
+
+    def _update_elev_ylim(self) -> None:
+        """Fix y-axis to full-trial elevation range so panning time does not rescale."""
+        if self.trial is None:
+            self.elev_ylim = None
+            return
+        valid = self._valid_click_mask()
+        if not np.any(valid):
+            self.elev_ylim = None
+            return
+        elev = self.trial.elevation_deg
+        pad = 0.5
+        ymin = float(np.nanmin(elev[valid])) - pad
+        ymax = float(np.nanmax(elev[valid])) + pad
+        if ymin < ymax:
+            self.elev_ylim = (ymin, ymax)
+        else:
+            self.elev_ylim = None
 
     def _valid_indices(self) -> np.ndarray:
         return np.where(self._valid_click_mask())[0]
@@ -1117,11 +1137,8 @@ class AnnotatorApp:
         self.ax.set_ylabel("Elevation (deg)")
         self.ax.set_xlim(vx0, vx1)
 
-        vis_valid = plot_mask
-        if np.any(vis_valid):
-            pad = 0.5
-            ymin = float(np.nanmin(elev[vis_valid])) - pad
-            ymax = float(np.nanmax(elev[vis_valid])) + pad
+        if self.elev_ylim is not None:
+            ymin, ymax = self.elev_ylim
             if ymin < ymax:
                 self.ax.set_ylim(ymin, ymax)
 
