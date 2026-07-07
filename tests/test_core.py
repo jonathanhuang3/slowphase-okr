@@ -80,16 +80,6 @@ def test_load_ush2a_trial_with_nan_gaze(tmp_path: Path):
     assert np.isfinite(trial.elevation_deg[2:]).all()
 
 
-def test_median_gain():
-    from slowphase_okr.fit import SegmentFit
-
-    segs = [
-        SegmentFit(1, 0, 1, 0, 1, 2, 20, 0, 20 / 31, 0.99, True, 31),
-        SegmentFit(2, 2, 3, 1, 2, 2, 30, 0, 30 / 31, 0.98, True, 31),
-    ]
-    assert trial_summary_median_gain(segs) == pytest.approx((20 / 31 + 30 / 31) / 2)
-
-
 def test_load_okr_log(tmp_path: Path):
     log = tmp_path / "OKR_Log_test.txt"
     log.write_text(
@@ -113,6 +103,130 @@ def test_load_okr_log(tmp_path: Path):
     assert okr.block_markers[2].label == "B3↑"
     assert okr.fixation_markers[0].event_type == "InitialFixation"
     assert okr.fixation_markers[1].start_time == pytest.approx(85.41)
+
+
+def test_median_gain():
+    from slowphase_okr.fit import SegmentFit
+
+    segs = [
+        SegmentFit(1, 0, 1, 0, 1, 2, 20, 0, 20 / 31, 0.99, True, 31),
+        SegmentFit(2, 2, 3, 1, 2, 2, 30, 0, 30 / 31, 0.98, True, 31),
+    ]
+    assert trial_summary_median_gain(segs) == pytest.approx((20 / 31 + 30 / 31) / 2)
+
+
+def test_detect_upward_slow_phases():
+    from slowphase_okr.detect import DetectParams, detect_slow_phases
+
+    times = np.linspace(0, 2, 400)
+    elev = np.zeros_like(times)
+    elev[50:120] = 20.0 * (times[50:120] - times[50])
+    elev[200:270] = 20.0 * (times[200:270] - times[200])
+    valid = np.ones(len(times), dtype=bool)
+
+    params = DetectParams(
+        direction="up",
+        min_duration_sec=0.05,
+        min_r2=0.9,
+        max_saccade_velocity_deg_s=200.0,
+        window_sec=0.08,
+        merge_gap_sec=0.04,
+    )
+    found = detect_slow_phases(times, elev, valid, 31.0, params)
+    assert len(found) >= 2
+    assert all(seg.direction_upward for seg in found)
+    assert found == sorted(found, key=lambda s: s.t_start)
+
+
+def test_detect_respects_exclude():
+    from slowphase_okr.detect import DetectParams, detect_slow_phases
+    from slowphase_okr.fit import SegmentFit
+
+    times = np.linspace(0, 1, 200)
+    elev = 25.0 * times
+    valid = np.ones(len(times), dtype=bool)
+    params = DetectParams(
+        direction="up",
+        min_duration_sec=0.05,
+        min_r2=0.9,
+        max_saccade_velocity_deg_s=200.0,
+        window_sec=0.05,
+    )
+    exclude = [
+        SegmentFit(1, 0, 150, times[0], times[150], 151, 25.0, 0.0, 25 / 31, 0.99, True, 31.0),
+    ]
+    found = detect_slow_phases(times, elev, valid, 31.0, params, exclude=exclude)
+    assert not any(seg.t_start <= times[150] <= seg.t_end for seg in found)
+
+
+def test_detect_rejects_saccade_inside_segment():
+    from slowphase_okr.detect import DetectParams, detect_slow_phases
+
+    times = np.linspace(0, 1, 300)
+    elev = 20.0 * times
+    elev[150] += 8.0
+    valid = np.ones(len(times), dtype=bool)
+    strict = DetectParams(
+        direction="up",
+        min_duration_sec=0.05,
+        min_r2=0.5,
+        max_saccade_velocity_deg_s=50.0,
+        window_sec=0.05,
+    )
+    loose = DetectParams(
+        direction="up",
+        min_duration_sec=0.05,
+        min_r2=0.5,
+        max_saccade_velocity_deg_s=500.0,
+        window_sec=0.05,
+    )
+    strict_found = detect_slow_phases(times, elev, valid, 31.0, strict)
+    loose_found = detect_slow_phases(times, elev, valid, 31.0, loose)
+    assert len(loose_found) >= len(strict_found)
+
+
+def test_collapse_duplicate_timestamps():
+    from slowphase_okr.detect import collapse_duplicate_timestamps
+
+    times = np.array([1.0, 1.0, 1.0, 2.0, 2.0, 3.0])
+    elev = np.array([0.0, 1.0, 2.0, 4.0, 6.0, 9.0])
+    valid = np.ones(len(times), dtype=bool)
+    collapsed = collapse_duplicate_timestamps(times, elev, valid)
+    assert len(collapsed.times) == 3
+    assert collapsed.elevation_deg[0] == pytest.approx(1.0)
+    assert collapsed.first_orig_idx[0] == 0
+    assert collapsed.last_orig_idx[0] == 2
+
+
+def test_detect_merge_gap_joins_fragments():
+    from slowphase_okr.detect import DetectParams, detect_slow_phases
+
+    times = np.linspace(0, 1, 500)
+    elev = np.zeros_like(times)
+    elev[50:120] = 20.0 * (times[50:120] - times[50])
+    elev[125:195] = elev[119] + 20.0 * (times[125:195] - times[125])
+    valid = np.ones(len(times), dtype=bool)
+    merged = DetectParams(
+        direction="up",
+        min_duration_sec=0.05,
+        min_r2=0.85,
+        max_saccade_velocity_deg_s=200.0,
+        window_sec=0.06,
+        merge_gap_sec=0.05,
+        refine_boundaries=False,
+    )
+    separate = DetectParams(
+        direction="up",
+        min_duration_sec=0.05,
+        min_r2=0.85,
+        max_saccade_velocity_deg_s=200.0,
+        window_sec=0.06,
+        merge_gap_sec=0.0,
+        refine_boundaries=False,
+    )
+    merged_found = detect_slow_phases(times, elev, valid, 31.0, merged)
+    separate_found = detect_slow_phases(times, elev, valid, 31.0, separate)
+    assert len(merged_found) <= len(separate_found)
 
 
 def test_autosave_roundtrip(tmp_path: Path):

@@ -23,6 +23,7 @@ from slowphase_okr.autosave import (
     save_autosave,
     segments_from_autosave,
 )
+from slowphase_okr.detect import DetectParams, detect_slow_phases
 from slowphase_okr.export import export_to_excel
 from slowphase_okr.fit import SegmentFit, fit_segment, snap_index, trial_summary_median_gain
 from slowphase_okr.gaze import GazeTrial, analysis_window_mask, load_ush2a_trial
@@ -56,7 +57,96 @@ Notes
   • R² is logged and exported but segments are not auto-rejected.
   • Annotations autosave to JSON in the trial folder; restore on reload.
   • Optional OKR log marks contrast-block and fixation-cross start times on the plot.
+  • Auto-detect proposes segments (blue); review, nudge, accept (A), or delete.
+
+Auto-detect review
+  Propose segments   Sliding-window detector (see panel parameters)
+  Direction Auto     Uses Up/Down from OKR log per contrast block
+  N / P              Jump to next / previous proposed segment
+  A                  Accept manual pending segment OR selected proposed segment
+  Del                Delete selected accepted or proposed segment
 """
+
+
+DETECT_TOOLTIPS = {
+    "direction": (
+        "Which way the eye should move during a slow phase.\n"
+        "Auto: read Up or Down from each contrast block in the OKR log.\n"
+        "Up/Down: force one direction for the whole search."
+    ),
+    "saccade": (
+        "Reject a candidate if eye speed spikes above this (deg/s) inside the segment.\n"
+        "Saccades are fast jumps; slow phases are slower.\n"
+        "Lower = stricter (fewer false positives). Typical range: 60–120."
+    ),
+    "duration": (
+        "Shortest segment length to keep, in milliseconds.\n"
+        "Shorter = more proposals; longer = fewer, longer segments only."
+    ),
+    "r2": (
+        "Minimum straightness of the line fit (0 to 1).\n"
+        "1.0 = perfectly linear. Higher = stricter. Try 0.6–0.8 for noisy data."
+    ),
+    "window": (
+        "Length of each sliding analysis window, in milliseconds.\n"
+        "Should be shorter than a typical slow phase but long enough to fit a line.\n"
+        "Typical range: 80–150 ms."
+    ),
+    "merge_gap": (
+        "Join nearby fragment proposals if they are separated by less than this (ms).\n"
+        "Helps when one slow phase was split into two proposals."
+    ),
+    "refine": (
+        "After detecting, expand segment start/end while the line fit stays good.\n"
+        "Usually improves boundaries; turn off to see raw detector output."
+    ),
+    "blocks": (
+        "Only search for slow phases during contrast blocks from the OKR log,\n"
+        "not during fixation crosses. Requires an OKR log file."
+    ),
+    "propose": "Run auto-detect with the settings above. Results appear as proposed (?) segments.",
+    "clear": "Remove all proposed segments without deleting accepted ones.",
+}
+
+
+class _ToolTip:
+    """Hover tooltip for a widget."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _event=None) -> None:
+        if self._tip is not None:
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            self._tip,
+            text=self.text,
+            justify=tk.LEFT,
+            relief=tk.SOLID,
+            borderwidth=1,
+            background="#ffffe0",
+            wraplength=300,
+            padx=6,
+            pady=4,
+        ).pack()
+
+    def _hide(self, _event=None) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
+def _bind_tooltip(widget: tk.Widget, text: str) -> None:
+    _ToolTip(widget, text)
 
 
 class AnnotatorApp:
@@ -84,10 +174,11 @@ class AnnotatorApp:
         self.window_mask: np.ndarray | None = None  # type: ignore[name-defined]
 
         self.segments: list[SegmentFit] = []
+        self.proposed_segments: list[SegmentFit] = []
         self.pending_start_idx: int | None = None
         self.pending_end_idx: int | None = None
         self.pending_fit: SegmentFit | None = None
-        self.selected_segment_id: int | None = None
+        self.selected_segment_key: tuple[str, int] | None = None
 
         self._preview_line = None
         self._click_markers: list = []
@@ -209,25 +300,126 @@ class AnnotatorApp:
         seg_panel = ttk.LabelFrame(self.main_pane, text="Segments", padding=6)
         self.main_pane.add(seg_panel, weight=1)
 
+        detect_panel = ttk.LabelFrame(seg_panel, text="Auto-detect", padding=4)
+        detect_panel.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+
+        dir_row = ttk.Frame(detect_panel)
+        dir_row.pack(fill=tk.X, pady=1)
+        dir_label = ttk.Label(dir_row, text="Direction:")
+        dir_label.pack(side=tk.LEFT)
+        self.detect_dir_var = tk.StringVar(value="Auto")
+        dir_combo = ttk.Combobox(
+            dir_row,
+            textvariable=self.detect_dir_var,
+            values=("Auto", "Up", "Down"),
+            state="readonly",
+            width=8,
+        )
+        dir_combo.pack(side=tk.LEFT, padx=(4, 0))
+        for w in (dir_row, dir_label, dir_combo):
+            _bind_tooltip(w, DETECT_TOOLTIPS["direction"])
+
+        vel_row = ttk.Frame(detect_panel)
+        vel_row.pack(fill=tk.X, pady=1)
+        saccade_label = ttk.Label(vel_row, text="Max saccade velocity (deg/s):")
+        saccade_label.pack(side=tk.LEFT)
+        self.detect_saccade_var = tk.StringVar(value="100")
+        saccade_entry = ttk.Entry(vel_row, textvariable=self.detect_saccade_var, width=8)
+        saccade_entry.pack(side=tk.LEFT, padx=(4, 0))
+        for w in (vel_row, saccade_label, saccade_entry):
+            _bind_tooltip(w, DETECT_TOOLTIPS["saccade"])
+
+        dur_row = ttk.Frame(detect_panel)
+        dur_row.pack(fill=tk.X, pady=1)
+        dur_label = ttk.Label(dur_row, text="Min duration (ms):")
+        dur_label.pack(side=tk.LEFT)
+        self.detect_min_dur_var = tk.StringVar(value="50")
+        dur_entry = ttk.Entry(dur_row, textvariable=self.detect_min_dur_var, width=8)
+        dur_entry.pack(side=tk.LEFT, padx=(4, 0))
+        for w in (dur_row, dur_label, dur_entry):
+            _bind_tooltip(w, DETECT_TOOLTIPS["duration"])
+
+        r2_row = ttk.Frame(detect_panel)
+        r2_row.pack(fill=tk.X, pady=1)
+        r2_label = ttk.Label(r2_row, text="Min R²:")
+        r2_label.pack(side=tk.LEFT)
+        self.detect_min_r2_var = tk.StringVar(value="0.75")
+        r2_entry = ttk.Entry(r2_row, textvariable=self.detect_min_r2_var, width=8)
+        r2_entry.pack(side=tk.LEFT, padx=(4, 0))
+        for w in (r2_row, r2_label, r2_entry):
+            _bind_tooltip(w, DETECT_TOOLTIPS["r2"])
+
+        win_row = ttk.Frame(detect_panel)
+        win_row.pack(fill=tk.X, pady=1)
+        win_label = ttk.Label(win_row, text="Window (ms):")
+        win_label.pack(side=tk.LEFT)
+        self.detect_window_var = tk.StringVar(value="100")
+        win_entry = ttk.Entry(win_row, textvariable=self.detect_window_var, width=8)
+        win_entry.pack(side=tk.LEFT, padx=(4, 0))
+        for w in (win_row, win_label, win_entry):
+            _bind_tooltip(w, DETECT_TOOLTIPS["window"])
+
+        gap_row = ttk.Frame(detect_panel)
+        gap_row.pack(fill=tk.X, pady=1)
+        gap_label = ttk.Label(gap_row, text="Merge gap (ms):")
+        gap_label.pack(side=tk.LEFT)
+        self.detect_merge_gap_var = tk.StringVar(value="40")
+        gap_entry = ttk.Entry(gap_row, textvariable=self.detect_merge_gap_var, width=8)
+        gap_entry.pack(side=tk.LEFT, padx=(4, 0))
+        for w in (gap_row, gap_label, gap_entry):
+            _bind_tooltip(w, DETECT_TOOLTIPS["merge_gap"])
+
+        self.detect_refine_var = tk.BooleanVar(value=True)
+        refine_chk = ttk.Checkbutton(
+            detect_panel,
+            text="Refine boundaries (maximize R²)",
+            variable=self.detect_refine_var,
+        )
+        refine_chk.pack(anchor=tk.W, pady=(2, 0))
+        _bind_tooltip(refine_chk, DETECT_TOOLTIPS["refine"])
+
+        self.detect_blocks_var = tk.BooleanVar(value=False)
+        blocks_chk = ttk.Checkbutton(
+            detect_panel,
+            text="Only inside contrast blocks (OKR log)",
+            variable=self.detect_blocks_var,
+        )
+        blocks_chk.pack(anchor=tk.W, pady=(2, 0))
+        _bind_tooltip(blocks_chk, DETECT_TOOLTIPS["blocks"])
+
+        detect_btns = ttk.Frame(detect_panel)
+        detect_btns.pack(fill=tk.X, pady=(4, 0))
+        propose_btn = ttk.Button(
+            detect_btns, text="Propose segments", command=self._propose_segments
+        )
+        propose_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        clear_btn = ttk.Button(
+            detect_btns, text="Clear proposed", command=self._clear_proposed
+        )
+        clear_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        _bind_tooltip(propose_btn, DETECT_TOOLTIPS["propose"])
+        _bind_tooltip(clear_btn, DETECT_TOOLTIPS["clear"])
+        _bind_tooltip(detect_panel, "Hover any auto-detect setting for a short explanation.")
+
         tree_frame = ttk.Frame(seg_panel)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        columns = ("id", "start", "end", "gain", "r2", "up")
+        columns = ("stat", "id", "start", "end", "gain", "r2")
         self.seg_tree = ttk.Treeview(
-            tree_frame, columns=columns, show="headings", height=14, selectmode="browse"
+            tree_frame, columns=columns, show="headings", height=10, selectmode="browse"
         )
+        self.seg_tree.heading("stat", text="")
         self.seg_tree.heading("id", text="#")
         self.seg_tree.heading("start", text="Start (s)")
         self.seg_tree.heading("end", text="End (s)")
         self.seg_tree.heading("gain", text="Gain")
         self.seg_tree.heading("r2", text="R²")
-        self.seg_tree.heading("up", text="Up")
+        self.seg_tree.column("stat", width=34, anchor=tk.CENTER)
         self.seg_tree.column("id", width=28, anchor=tk.CENTER)
         self.seg_tree.column("start", width=62, anchor=tk.E)
         self.seg_tree.column("end", width=62, anchor=tk.E)
-        self.seg_tree.column("gain", width=52, anchor=tk.E)
-        self.seg_tree.column("r2", width=44, anchor=tk.E)
-        self.seg_tree.column("up", width=32, anchor=tk.CENTER)
+        self.seg_tree.column("gain", width=48, anchor=tk.E)
+        self.seg_tree.column("r2", width=40, anchor=tk.E)
         seg_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.seg_tree.yview)
         self.seg_tree.configure(yscrollcommand=seg_scroll.set)
         self.seg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -237,8 +429,19 @@ class AnnotatorApp:
         seg_actions = ttk.Frame(seg_panel)
         seg_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         ttk.Button(
-            seg_actions, text="Delete selected (Del)", command=self._delete_selected_segment
+            seg_actions, text="Accept selected (A)", command=self._accept_segment
         ).pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(
+            seg_actions, text="Delete selected (Del)", command=self._delete_selected_segment
+        ).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        nav_row = ttk.Frame(seg_actions)
+        nav_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Button(
+            nav_row, text="Prev proposed (P)", command=lambda: self._jump_proposed(-1)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        ttk.Button(
+            nav_row, text="Next proposed (N)", command=lambda: self._jump_proposed(1)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
         ttk.Label(
             seg_actions,
             text="Selected: [ ] nudge start, , . nudge end (one data point)",
@@ -335,6 +538,10 @@ class AnnotatorApp:
             self._nudge_segment_boundary("end", -1)
         elif keysym in ("period",) or char == ".":
             self._nudge_segment_boundary("end", 1)
+        elif keysym in ("n", "N"):
+            self._jump_proposed(1)
+        elif keysym in ("p", "P"):
+            self._jump_proposed(-1)
         return None
 
     def _on_motion(self, event) -> None:
@@ -485,6 +692,8 @@ class AnnotatorApp:
             return True
         try:
             self.okr_log = load_okr_log(self.okr_log_path)
+            self.detect_dir_var.set("Auto")
+            self.detect_blocks_var.set(True)
             return True
         except Exception as exc:
             self.okr_log = None
@@ -499,16 +708,18 @@ class AnnotatorApp:
             raise ValueError("Stimulus velocity must be a number.") from exc
 
     def _has_unsaved_work(self) -> bool:
-        return bool(self.segments) or self.pending_fit is not None
+        return bool(self.segments) or bool(self.proposed_segments) or self.pending_fit is not None
 
     def _confirm_discard_work(self, action: str) -> bool:
         if not self._has_unsaved_work():
             return True
         n = len(self.segments)
+        p = len(self.proposed_segments)
         extra = f" and a pending segment" if self.pending_fit else ""
+        proposed_note = f", {p} proposed" if p else ""
         return messagebox.askyesno(
             "Discard annotations?",
-            f"You have {n} accepted segment(s){extra}.\n\n{action}?",
+            f"You have {n} accepted segment(s){proposed_note}{extra}.\n\n{action}?",
             icon="warning",
         )
 
@@ -564,7 +775,7 @@ class AnnotatorApp:
         vel = data.get("stimulus_velocity")
         if vel is not None:
             self.stim_vel_var.set(str(vel))
-        self.selected_segment_id = None
+        self.selected_segment_key = None
         self._clear_pending(redraw=False)
         self._refresh_segment_list()
         self._redraw()
@@ -574,7 +785,7 @@ class AnnotatorApp:
         )
 
     def _apply_stimulus_velocity(self, _event=None) -> None:
-        if not self.segments and self.pending_fit is None:
+        if not self.segments and not self.proposed_segments and self.pending_fit is None:
             return
 
         try:
@@ -592,6 +803,10 @@ class AnnotatorApp:
         self.segments = [
             replace(seg, gain=seg.slope_deg_s / vel, stimulus_velocity=vel)
             for seg in self.segments
+        ]
+        self.proposed_segments = [
+            replace(seg, gain=seg.slope_deg_s / vel, stimulus_velocity=vel)
+            for seg in self.proposed_segments
         ]
 
         if (
@@ -639,7 +854,8 @@ class AnnotatorApp:
             self.window_mask = analysis_window_mask(self.trial.times, t0, t_end=t1)
             self._update_elev_ylim()
             self.segments.clear()
-            self.selected_segment_id = None
+            self.proposed_segments.clear()
+            self.selected_segment_key = None
             self._clear_pending(redraw=False)
             self.view_var.set("2 s")
             self._reset_view()
@@ -647,6 +863,9 @@ class AnnotatorApp:
             self._refresh_segment_list()
             if self.okr_log_path and not self._parse_okr_log(show_error=True):
                 self.okr_log_path = None
+            if self.okr_log is not None:
+                self.detect_dir_var.set("Auto")
+                self.detect_blocks_var.set(True)
             self._update_files_label()
             self._redraw()
             duration = t1 - t0
@@ -847,49 +1066,222 @@ class AnnotatorApp:
             if seg.segment_id != i:
                 self.segments[i - 1] = replace(seg, segment_id=i)
 
-    def _selected_segment(self) -> SegmentFit | None:
-        if self.selected_segment_id is None:
+    def _renumber_proposed_segments(self) -> None:
+        for i, seg in enumerate(self.proposed_segments, start=1):
+            if seg.segment_id != i:
+                self.proposed_segments[i - 1] = replace(seg, segment_id=i)
+
+    def _segment_tree_iid(self, kind: str, segment_id: int) -> str:
+        return f"{kind}:{segment_id}"
+
+    def _parse_segment_tree_iid(self, iid: str) -> tuple[str, int]:
+        kind, sid = iid.split(":", 1)
+        return kind, int(sid)
+
+    def _segments_sorted_by_time(self) -> list[tuple[str, SegmentFit]]:
+        rows: list[tuple[str, SegmentFit]] = []
+        rows.extend(("accepted", seg) for seg in self.segments)
+        rows.extend(("proposed", seg) for seg in self.proposed_segments)
+        rows.sort(key=lambda item: item[1].t_start)
+        return rows
+
+    def _selected_segment_ref(self) -> tuple[str, SegmentFit] | None:
+        if self.selected_segment_key is None:
             return None
-        for seg in self.segments:
-            if seg.segment_id == self.selected_segment_id:
-                return seg
+        kind, seg_id = self.selected_segment_key
+        source = self.segments if kind == "accepted" else self.proposed_segments
+        for seg in source:
+            if seg.segment_id == seg_id:
+                return kind, seg
         return None
+
+    def _selected_segment(self) -> SegmentFit | None:
+        ref = self._selected_segment_ref()
+        return ref[1] if ref else None
+
+    def _detect_params(self) -> DetectParams:
+        raw_dir = self.detect_dir_var.get().strip().lower()
+        if raw_dir == "auto":
+            direction = "auto"
+        elif raw_dir == "up":
+            direction = "up"
+        elif raw_dir == "down":
+            direction = "down"
+        else:
+            raise ValueError("Direction must be Auto, Up, or Down.")
+        try:
+            max_saccade = float(self.detect_saccade_var.get().strip())
+            min_duration_ms = float(self.detect_min_dur_var.get().strip())
+            min_r2 = float(self.detect_min_r2_var.get().strip())
+            window_ms = float(self.detect_window_var.get().strip())
+            merge_gap_ms = float(self.detect_merge_gap_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("Auto-detect parameters must be numbers.") from exc
+        if max_saccade <= 0:
+            raise ValueError("Max saccade velocity must be positive.")
+        if min_duration_ms <= 0:
+            raise ValueError("Min duration must be positive.")
+        if window_ms <= 0:
+            raise ValueError("Window must be positive.")
+        if merge_gap_ms < 0:
+            raise ValueError("Merge gap must be non-negative.")
+        if not 0.0 <= min_r2 <= 1.0:
+            raise ValueError("Min R² must be between 0 and 1.")
+        restrict = bool(self.detect_blocks_var.get())
+        if direction == "auto" and (not restrict or self.okr_log is None):
+            raise ValueError(
+                "Auto direction needs an OKR log and 'Only inside contrast blocks' enabled."
+            )
+        if restrict and self.okr_log is None:
+            raise ValueError("Load an OKR log to restrict detection to contrast blocks.")
+        return DetectParams(
+            direction=direction,
+            min_duration_sec=min_duration_ms / 1000.0,
+            min_r2=min_r2,
+            max_saccade_velocity_deg_s=max_saccade,
+            restrict_to_blocks=restrict,
+            merge_gap_sec=merge_gap_ms / 1000.0,
+            window_sec=window_ms / 1000.0,
+            refine_boundaries=bool(self.detect_refine_var.get()),
+        )
+
+    def _propose_segments(self) -> None:
+        if self.trial is None or self.window_mask is None:
+            messagebox.showwarning("No trial", "Load a trial before auto-detecting.")
+            return
+        if self.proposed_segments and not messagebox.askyesno(
+            "Replace proposed segments?",
+            "Clear existing proposed segments and run auto-detect again?",
+        ):
+            return
+        try:
+            params = self._detect_params()
+            vel = self._stimulus_velocity()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid auto-detect settings", str(exc))
+            return
+        if vel == 0:
+            messagebox.showwarning("Invalid velocity", "Stimulus velocity cannot be zero.")
+            return
+
+        proposed = detect_slow_phases(
+            self.trial.times,
+            self.trial.elevation_deg,
+            self._valid_click_mask(),
+            vel,
+            params,
+            okr_log=self.okr_log,
+            exclude=self.segments,
+        )
+        self.proposed_segments = proposed
+        self._renumber_proposed_segments()
+        self.selected_segment_key = None
+        self._refresh_segment_list()
+        self._redraw()
+        scope = "contrast blocks" if params.restrict_to_blocks else "full trial"
+        self._set_status(
+            f"Proposed {len(proposed)} {params.direction} segment(s) "
+            f"({scope}, sorted by time). Review and accept or delete."
+        )
+
+    def _clear_proposed(self) -> None:
+        if not self.proposed_segments:
+            self._set_status("No proposed segments to clear.")
+            return
+        self.proposed_segments.clear()
+        if self.selected_segment_key and self.selected_segment_key[0] == "proposed":
+            self.selected_segment_key = None
+        self._refresh_segment_list()
+        self._redraw()
+        self._set_status("Cleared proposed segments.")
+
+    def _proposed_sorted(self) -> list[SegmentFit]:
+        return sorted(self.proposed_segments, key=lambda s: s.t_start)
+
+    def _center_view_on_time(self, center: float) -> None:
+        if self.view_xmin is not None and self.view_xmax is not None:
+            width = self.view_xmax - self.view_xmin
+        else:
+            width = self._preset_duration_sec()
+        half = width / 2
+        self.view_xmin = max(self.analysis_t0, center - half)
+        self.view_xmax = min(self.analysis_t1, center + half)
+        self._clamp_view()
+
+    def _jump_proposed(self, step: int) -> None:
+        proposed = self._proposed_sorted()
+        if not proposed:
+            self._set_status("No proposed segments to navigate.")
+            return
+
+        current_idx: int | None = None
+        if self.selected_segment_key and self.selected_segment_key[0] == "proposed":
+            for i, seg in enumerate(proposed):
+                if seg.segment_id == self.selected_segment_key[1]:
+                    current_idx = i
+                    break
+
+        if current_idx is None:
+            new_idx = 0 if step > 0 else len(proposed) - 1
+        else:
+            new_idx = (current_idx + step) % len(proposed)
+
+        seg = proposed[new_idx]
+        self.selected_segment_key = ("proposed", seg.segment_id)
+        self._center_view_on_time((seg.t_start + seg.t_end) / 2)
+        self._refresh_segment_list()
+        self._redraw()
+        self._set_status(
+            f"Proposed {new_idx + 1}/{len(proposed)}: "
+            f"{seg.t_start:.2f}–{seg.t_end:.2f} s, gain={seg.gain:.3f}, R²={seg.r2:.2f}"
+        )
 
     def _on_segment_select(self, _event=None) -> None:
         selection = self.seg_tree.selection()
         if not selection:
-            self.selected_segment_id = None
+            self.selected_segment_key = None
         else:
-            values = self.seg_tree.item(selection[0], "values")
-            self.selected_segment_id = int(values[0])
+            self.selected_segment_key = self._parse_segment_tree_iid(selection[0])
         self._redraw()
 
     def _refresh_segment_list(self) -> None:
         for item in self.seg_tree.get_children():
             self.seg_tree.delete(item)
-        for seg in self.segments:
-            up = "✓" if seg.direction_upward else "!"
+        display_id = 1
+        for kind, seg in self._segments_sorted_by_time():
+            stat = "✓" if kind == "accepted" else "?"
             r2 = f"{seg.r2:.2f}" if seg.r2 == seg.r2 else "—"
-            iid = self.seg_tree.insert(
+            iid = self._segment_tree_iid(kind, seg.segment_id)
+            self.seg_tree.insert(
                 "",
                 tk.END,
+                iid=iid,
                 values=(
-                    seg.segment_id,
+                    stat,
+                    display_id,
                     f"{seg.t_start:.2f}",
                     f"{seg.t_end:.2f}",
                     f"{seg.gain:.3f}",
                     r2,
-                    up,
                 ),
             )
-            if seg.segment_id == self.selected_segment_id:
+            display_id += 1
+            if self.selected_segment_key == (kind, seg.segment_id):
                 self.seg_tree.selection_set(iid)
                 self.seg_tree.see(iid)
 
+    def _replace_segment(self, kind: str, updated: SegmentFit) -> None:
+        target = self.segments if kind == "accepted" else self.proposed_segments
+        for i, existing in enumerate(target):
+            if existing.segment_id == updated.segment_id:
+                target[i] = updated
+                return
+
     def _nudge_segment_boundary(self, which: str, direction: int) -> None:
-        seg = self._selected_segment()
-        if seg is None or self.trial is None:
+        ref = self._selected_segment_ref()
+        if ref is None or self.trial is None:
             return
+        kind, seg = ref
         valid = self._valid_indices()
         if len(valid) < 2:
             return
@@ -925,44 +1317,81 @@ class AnnotatorApp:
             self._set_status(str(exc))
             return
 
-        for i, existing in enumerate(self.segments):
-            if existing.segment_id == seg.segment_id:
-                self.segments[i] = updated
-                break
-
+        self._replace_segment(kind, updated)
         self._refresh_segment_list()
         self._redraw()
-        self._write_autosave()
+        if kind == "accepted":
+            self._write_autosave()
         boundary = "start" if which == "start" else "end"
         t = updated.t_start if which == "start" else updated.t_end
+        label = "Accepted" if kind == "accepted" else "Proposed"
         self._set_status(
-            f"Segment #{updated.segment_id} {boundary} → {t:.3f} s "
+            f"{label} #{updated.segment_id} {boundary} → {t:.3f} s "
             f"(gain={updated.gain:.3f}, R²={updated.r2:.3f})"
         )
 
     def _delete_selected_segment(self) -> None:
-        seg = self._selected_segment()
-        if seg is None:
+        ref = self._selected_segment_ref()
+        if ref is None:
             self._set_status("Select a segment in the list to delete.")
             return
-        self.segments = [s for s in self.segments if s.segment_id != seg.segment_id]
+        kind, seg = ref
+        if kind == "accepted":
+            self.segments = [s for s in self.segments if s.segment_id != seg.segment_id]
+            self._renumber_segments()
+            self._write_autosave()
+        else:
+            self.proposed_segments = [
+                s for s in self.proposed_segments if s.segment_id != seg.segment_id
+            ]
+            self._renumber_proposed_segments()
+        self.selected_segment_key = None
+        self._refresh_segment_list()
+        self._redraw()
+        if kind == "accepted":
+            med = trial_summary_median_gain(self.segments)
+            n = len(self.segments)
+            status = f"Deleted accepted segment. {n} remaining."
+            if n:
+                status += f" Trial median gain={med:.3f}"
+        else:
+            status = f"Deleted proposed segment. {len(self.proposed_segments)} proposed remaining."
+        self._set_status(status)
+
+    def _accept_selected_proposed(self) -> bool:
+        ref = self._selected_segment_ref()
+        if ref is None or ref[0] != "proposed":
+            return False
+        _kind, seg = ref
+        self.proposed_segments = [
+            s for s in self.proposed_segments if s.segment_id != seg.segment_id
+        ]
+        self._renumber_proposed_segments()
+        accepted = replace(seg, segment_id=len(self.segments) + 1)
+        self.segments.append(accepted)
         self._renumber_segments()
-        self.selected_segment_id = None
+        self.selected_segment_key = ("accepted", accepted.segment_id)
         self._refresh_segment_list()
         self._redraw()
         self._write_autosave()
         med = trial_summary_median_gain(self.segments)
-        n = len(self.segments)
-        status = f"Deleted segment. {n} remaining."
-        if n:
-            status += f" Trial median gain={med:.3f}"
-        self._set_status(status)
+        self._set_status(
+            f"Accepted proposed segment as #{accepted.segment_id}: "
+            f"gain={accepted.gain:.3f}, R²={accepted.r2:.3f}, "
+            f"trial median gain={med:.3f} (n={len(self.segments)})"
+        )
+        return True
 
     def _accept_segment(self) -> None:
+        if self._accept_selected_proposed():
+            return
         if self.pending_fit is None:
-            self._set_status("Mark a segment (two clicks) before accepting.")
+            self._set_status(
+                "Mark a segment (two clicks), select a proposed segment, then press A."
+            )
             return
         self.segments.append(self.pending_fit)
+        self._renumber_segments()
         self._clear_pending(redraw=False)
         self._refresh_segment_list()
         self._redraw()
@@ -977,8 +1406,8 @@ class AnnotatorApp:
     def _undo_segment(self) -> None:
         if self.segments:
             removed = self.segments.pop()
-            if self.selected_segment_id == removed.segment_id:
-                self.selected_segment_id = None
+            if self.selected_segment_key == ("accepted", removed.segment_id):
+                self.selected_segment_key = None
             self._renumber_segments()
             self._refresh_segment_list()
             self._redraw()
@@ -1039,14 +1468,22 @@ class AnnotatorApp:
 
         self._draw_okr_log_markers(vx0, vx1)
 
-        for seg in self.segments:
+        for kind, seg in self._segments_sorted_by_time():
             if seg.t_end < vx0 or seg.t_start > vx1:
                 continue
-            selected = seg.segment_id == self.selected_segment_id
-            span_color = "limegreen" if selected else "green"
-            span_alpha = 0.35 if selected else 0.2
-            line_color = "forestgreen" if selected else "darkgreen"
-            line_width = 2.5 if selected else 1.5
+            selected = self.selected_segment_key == (kind, seg.segment_id)
+            if kind == "accepted":
+                span_color = "limegreen" if selected else "green"
+                span_alpha = 0.35 if selected else 0.2
+                line_color = "forestgreen" if selected else "darkgreen"
+                line_width = 2.5 if selected else 1.5
+                label_prefix = "#"
+            else:
+                span_color = "cornflowerblue" if selected else "steelblue"
+                span_alpha = 0.3 if selected else 0.15
+                line_color = "royalblue" if selected else "steelblue"
+                line_width = 2.5 if selected else 1.5
+                label_prefix = "?"
             self.ax.axvspan(seg.t_start, seg.t_end, color=span_color, alpha=span_alpha)
             seg_times = np.linspace(seg.t_start, seg.t_end, 50)
             self.ax.plot(
@@ -1054,6 +1491,7 @@ class AnnotatorApp:
                 seg.slope_deg_s * seg_times + seg.intercept_deg,
                 color=line_color,
                 linewidth=line_width,
+                linestyle="-" if kind == "accepted" else "--",
                 clip_on=True,
             )
             mid_t = (seg.t_start + seg.t_end) / 2
@@ -1062,7 +1500,7 @@ class AnnotatorApp:
                 self.ax.text(
                     mid_t,
                     mid_y,
-                    f"#{seg.segment_id}",
+                    f"{label_prefix}{seg.segment_id}",
                     color="white",
                     fontsize=8,
                     fontweight="bold",
@@ -1127,8 +1565,12 @@ class AnnotatorApp:
         else:
             med = trial_summary_median_gain(self.segments)
             n = len(self.segments)
+            p = len(self.proposed_segments)
             duration = t1 - t0
-            title = f"{self.trial.trial_id} — {n} segment(s), {duration:.1f} s trial"
+            title = f"{self.trial.trial_id} — {n} accepted"
+            if p:
+                title += f", {p} proposed"
+            title += f", {duration:.1f} s trial"
             if n:
                 title += f", median gain={med:.3f}"
             self.ax.set_title(title)

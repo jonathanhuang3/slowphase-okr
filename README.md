@@ -272,6 +272,8 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 
 ## Workflow
 
+### Manual annotation
+
 1. **Browse gaze file** — your gaze direction file (see [Data format](#data-format))
 2. **Browse time file** — your timestamp file (one time per gaze sample)
 3. **Browse OKR log** *(optional)* — stimulus event log with block and fixation timing (see [OKR log](#okr-log-optional))
@@ -282,6 +284,17 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 8. Press **Accept segment** (`A`) to keep the fit
 9. **Export Excel** when done
 
+### Semi-automatic annotation (recommended with OKR log)
+
+1. Complete steps 1–5 above (include OKR log if available).
+2. Adjust [auto-detect settings](#auto-detect-optional) — hover any parameter in the app for a short explanation.
+3. Click **Propose segments** — candidates appear as **?** (blue dashed lines).
+4. Use **N** / **P** (or the buttons) to step through proposals; **A** to accept, **Del** to reject.
+5. Nudge boundaries with `[` `]` `,` `.` if needed; manually click any slow phases the detector missed.
+6. **Export Excel** when done (only **✓** accepted segments are exported).
+
+**File pairing:** use `rotatedGaze.txt` with `gazeTime.txt` from the same folder (not `sranipalGazeTime.txt` unless you also use `sranipalGazeSpace.txt`).
+
 Hover over the plot to see time and elevation at the nearest sample. Press **`?`** (or the **Help** button) for the full shortcut list.
 
 ## Features
@@ -289,14 +302,17 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | Feature | Description |
 |---------|-------------|
 | **Analysis window** | Full trial — first timestamp to last timestamp |
-| **Segment list** | Panel showing #, times, gain, R², upward flag. Click to select. |
-| **Segment labels** | `#N` badges on accepted segments in the plot |
+| **Fixed y-axis** | Elevation scale stays fixed to the full trial while you pan in time |
+| **Segment list** | Shows proposed (`?`) and accepted (`✓`) segments sorted by time |
+| **Segment labels** | `#N` on accepted (green), `?N` on proposed (blue) segments in the plot |
 | **Edit segments** | Delete selected (`Del`), undo last (`U`), nudge boundaries (`[ ]` start, `, .` end) |
+| **Auto-detect** | Sliding-window detector proposes slow phases for manual review (see below) |
 | **Stimulus velocity** | Editable anytime. Enter recalculates gains for all segments. |
-| **JSON autosave** | Saves to `{trial_id}_slowphase_okr_autosave.json` in the trial folder. Offers restore on reload. |
-| **Reload guard** | Confirms before discarding accepted or pending segments |
-| **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray) on the plot |
-| **Invalid gaze samples** | `(NaN, NaN, NaN)` lines are kept for alignment but skipped for clicking and fitting |
+| **JSON autosave** | Saves accepted segments to `{trial_id}_slowphase_okr_autosave.json`; restore on reload |
+| **Reload guard** | Confirms before discarding accepted or proposed segments |
+| **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray) |
+| **Invalid gaze samples** | `(NaN, NaN, NaN)` lines stay aligned but are skipped for clicking and fitting |
+| **Parameter tooltips** | Hover auto-detect settings in the app for plain-language help |
 
 **R²** is displayed and written to Excel but segments are **not** auto-rejected.
 
@@ -306,17 +322,39 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 
 | Key | Action |
 |-----|--------|
-| Click × 2 | Mark start, then end of slow phase |
-| `A` | Accept pending segment |
-| `Esc` | Clear pending segment |
+| Click × 2 | Mark start, then end of slow phase (manual) |
+| `A` | Accept pending manual segment or selected proposed segment |
+| `Esc` | Clear pending manual segment |
+| `N` / `P` | Next / previous proposed segment (pans plot to it) |
 | `U` | Undo last accepted segment |
-| `Del` | Delete selected segment |
+| `Del` | Delete selected accepted or proposed segment |
 | `←` / `→` | Pan view by 20% of visible window |
 | Scroll (vertical) | Pan time forward / backward (20% of visible window per tick) |
 | `[` / `]` | Nudge selected segment start earlier / later |
 | `,` / `.` | Nudge selected segment end earlier / later |
 | `Enter` | Apply stimulus velocity (when editing the field) |
 | `?` | Open shortcuts help |
+
+## Auto-detect (optional)
+
+Conservative semi-automatic mode: the detector **proposes** segments; you **accept** or **delete** each one. Proposals are not exported until accepted.
+
+**How it works:** averages duplicate Unity timestamps, slides a short window along the elevation trace, fits a line in each window, merges nearby hits, optionally expands boundaries for a better R², and filters saccades.
+
+Hover any setting in the **Auto-detect** panel for a tooltip. Summary:
+
+| Parameter | Default | What it does |
+|-----------|---------|--------------|
+| **Direction** | Auto | **Auto:** Up/Down from each OKR contrast block. **Up/Down:** force one direction for the whole search. Auto requires OKR log + contrast-block checkbox. |
+| **Max saccade velocity** | 100 deg/s | Reject candidates with a speed spike above this inside the segment (filters saccades). Lower = stricter. |
+| **Min duration** | 50 ms | Shortest segment to keep. Shorter = more proposals. |
+| **Min R²** | 0.75 | Minimum straightness of the line fit (0–1). Lower = accept noisier traces. |
+| **Window** | 100 ms | Sliding fit window length. Typical slow phase is longer than this; window should be 80–150 ms. |
+| **Merge gap** | 40 ms | Join fragment proposals separated by less than this gap. |
+| **Refine boundaries** | on | Expand start/end while R² stays good. |
+| **Only inside contrast blocks** | off | Search only during stimulus blocks from OKR log (not fixation). Enable when using OKR log. |
+
+**Suggested starting point with OKR log:** Direction **Auto**, contrast blocks **on**, Window **100 ms**, Merge gap **40 ms**, Min R² **0.7–0.75**.
 
 ## Data format
 
@@ -340,6 +378,10 @@ This tool was developed for our lab to support gaze data recorded with a **HTC V
 - The same number of lines in both files (one timestamp per gaze line, including invalid samples)
 - Timestamps in seconds
 - Gaze lines as `(x, y, z)` tuples. Use `(NaN, NaN, NaN)` for missing tracking — these rows stay aligned with timestamps but are treated as invalid (no elevation, not clickable)
+
+**Duplicate timestamps:** Unity `gazeTime.txt` often repeats the same time for several gaze samples (one Unity frame, multiple eye samples). That is normal. Auto-detect averages elevation at each unique time before searching.
+
+**Pair the right files:** `rotatedGaze.txt` + `gazeTime.txt` (same line count). Do not mix `rotatedGaze.txt` with `sranipalGazeTime.txt`.
 
 ### OKR log (optional)
 
