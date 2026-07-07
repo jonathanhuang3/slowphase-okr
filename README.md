@@ -290,7 +290,7 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 2. Adjust [auto-detect settings](#auto-detect-optional) — hover any parameter in the app for a short explanation.
 3. Click **Propose segments** — candidates appear as **?** (blue dashed lines).
 4. Use **N** / **P** (or the buttons) to step through proposals; **A** to accept, **Del** to reject.
-5. Nudge boundaries with `[` `]` `,` `.` if needed; manually click any slow phases the detector missed.
+5. Hover near a segment edge to highlight it, then drag to adjust; or nudge with `[` `]` `,` `.` if needed; manually click any slow phases the detector missed.
 6. **Export Excel** when done (only **✓** accepted segments are exported).
 
 **File pairing:** use `rotatedGaze.txt` with `gazeTime.txt` from the same folder (not `sranipalGazeTime.txt` unless you also use `sranipalGazeSpace.txt`).
@@ -305,7 +305,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Fixed y-axis** | Elevation scale stays fixed to the full trial while you pan in time |
 | **Segment list** | Shows proposed (`?`) and accepted (`✓`) segments sorted by time |
 | **Segment labels** | `#N` on accepted (green), `?N` on proposed (blue) segments in the plot |
-| **Edit segments** | Delete selected (`Del`), undo last (`U`), nudge boundaries (`[ ]` start, `, .` end) |
+| **Edit segments** | Delete selected (`Del`), undo last (`U`), drag edges on plot, nudge boundaries (`[ ]` start, `, .` end) |
 | **Auto-detect** | Sliding-window detector proposes slow phases for manual review (see below) |
 | **Stimulus velocity** | Editable anytime. Enter recalculates gains for all segments. |
 | **JSON autosave** | Saves accepted segments to `{trial_id}_slowphase_okr_autosave.json`; restore on reload |
@@ -323,15 +323,16 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | Key | Action |
 |-----|--------|
 | Click × 2 | Mark start, then end of slow phase (manual) |
-| `A` | Accept pending manual segment or selected proposed segment |
-| `Esc` | Clear pending manual segment |
+| `A` | Accept pending manual segment (priority), hovered proposed segment, or selected proposed |
 | `N` / `P` | Next / previous proposed segment (pans plot to it) |
 | `U` | Undo last accepted segment |
 | `Del` | Delete selected accepted or proposed segment |
 | `←` / `→` | Pan view by 20% of visible window |
 | Scroll (vertical) | Pan time forward / backward (20% of visible window per tick) |
+| `Esc` | Cancel boundary drag or clear pending manual segment |
 | `[` / `]` | Nudge selected segment start earlier / later |
 | `,` / `.` | Nudge selected segment end earlier / later |
+| Drag edges | Select a segment, hover near start/end until the edge highlights, then drag (snaps to nearest data point) |
 | `Enter` | Apply stimulus velocity (when editing the field) |
 | `?` | Open shortcuts help |
 

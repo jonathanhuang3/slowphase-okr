@@ -34,7 +34,7 @@ HELP_TEXT = """Keyboard shortcuts
 ────────────────────────────────────────
 Marking
   Click × 2        Mark slow-phase start, then end (snaps to nearest data point)
-  A                Accept pending segment
+  A                Accept pending manual segment (priority), hovered proposed, or selected
   Esc              Clear pending segment (start over)
 
 Navigation
@@ -63,8 +63,13 @@ Auto-detect review
   Propose segments   Sliding-window detector (see panel parameters)
   Direction Auto     Uses Up/Down from OKR log per contrast block
   N / P              Jump to next / previous proposed segment
-  A                  Accept manual pending segment OR selected proposed segment
+  A                  Accept pending manual segment, hovered proposed, or selected proposed
   Del                Delete selected accepted or proposed segment
+
+Selected segment
+  Hover + A          Accept the proposed segment under the cursor
+  Drag start/end     Hover near a segment edge to highlight it, then drag
+  [  ]  ,  .         Nudge start / end by one data point
 """
 
 
@@ -110,17 +115,50 @@ DETECT_TOOLTIPS = {
 
 
 class _ToolTip:
-    """Hover tooltip for a widget."""
+    """Hover tooltip for a widget (only one visible at a time)."""
 
-    def __init__(self, widget: tk.Widget, text: str) -> None:
+    _active: "_ToolTip | None" = None
+    _show_after_id: str | None = None
+
+    def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 400) -> None:
         self.widget = widget
         self.text = text
+        self.delay_ms = delay_ms
         self._tip: tk.Toplevel | None = None
-        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Enter>", self._schedule_show, add="+")
         widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
 
-    def _show(self, _event=None) -> None:
+    @classmethod
+    def _cancel_scheduled(cls) -> None:
+        if cls._active is not None and cls._show_after_id is not None:
+            try:
+                cls._active.widget.after_cancel(cls._show_after_id)
+            except tk.TclError:
+                pass
+            cls._show_after_id = None
+
+    @classmethod
+    def _hide_active(cls) -> None:
+        cls._cancel_scheduled()
+        if cls._active is not None:
+            if cls._active._tip is not None:
+                cls._active._tip.destroy()
+                cls._active._tip = None
+            cls._active = None
+
+    def _schedule_show(self, _event=None) -> None:
+        self._cancel_scheduled()
+        _ToolTip._active = self
+        self._show_after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _show(self) -> None:
+        self._show_after_id = None
+        if _ToolTip._active is not self:
+            return
         if self._tip is not None:
+            return
+        if not self.widget.winfo_exists():
             return
         x = self.widget.winfo_rootx() + 16
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
@@ -140,9 +178,8 @@ class _ToolTip:
         ).pack()
 
     def _hide(self, _event=None) -> None:
-        if self._tip is not None:
-            self._tip.destroy()
-            self._tip = None
+        if _ToolTip._active is self:
+            _ToolTip._hide_active()
 
 
 def _bind_tooltip(widget: tk.Widget, text: str) -> None:
@@ -184,6 +221,9 @@ class AnnotatorApp:
         self._click_markers: list = []
         self._hover_idx: int | None = None
         self._hover_artists: list = []
+        self._boundary_drag: dict | None = None
+        self._hover_boundary: str | None = None
+        self._hover_proposed_key: tuple[str, int] | None = None
 
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
@@ -316,8 +356,7 @@ class AnnotatorApp:
             width=8,
         )
         dir_combo.pack(side=tk.LEFT, padx=(4, 0))
-        for w in (dir_row, dir_label, dir_combo):
-            _bind_tooltip(w, DETECT_TOOLTIPS["direction"])
+        _bind_tooltip(dir_row, DETECT_TOOLTIPS["direction"])
 
         vel_row = ttk.Frame(detect_panel)
         vel_row.pack(fill=tk.X, pady=1)
@@ -326,8 +365,7 @@ class AnnotatorApp:
         self.detect_saccade_var = tk.StringVar(value="100")
         saccade_entry = ttk.Entry(vel_row, textvariable=self.detect_saccade_var, width=8)
         saccade_entry.pack(side=tk.LEFT, padx=(4, 0))
-        for w in (vel_row, saccade_label, saccade_entry):
-            _bind_tooltip(w, DETECT_TOOLTIPS["saccade"])
+        _bind_tooltip(vel_row, DETECT_TOOLTIPS["saccade"])
 
         dur_row = ttk.Frame(detect_panel)
         dur_row.pack(fill=tk.X, pady=1)
@@ -336,8 +374,7 @@ class AnnotatorApp:
         self.detect_min_dur_var = tk.StringVar(value="50")
         dur_entry = ttk.Entry(dur_row, textvariable=self.detect_min_dur_var, width=8)
         dur_entry.pack(side=tk.LEFT, padx=(4, 0))
-        for w in (dur_row, dur_label, dur_entry):
-            _bind_tooltip(w, DETECT_TOOLTIPS["duration"])
+        _bind_tooltip(dur_row, DETECT_TOOLTIPS["duration"])
 
         r2_row = ttk.Frame(detect_panel)
         r2_row.pack(fill=tk.X, pady=1)
@@ -346,8 +383,7 @@ class AnnotatorApp:
         self.detect_min_r2_var = tk.StringVar(value="0.75")
         r2_entry = ttk.Entry(r2_row, textvariable=self.detect_min_r2_var, width=8)
         r2_entry.pack(side=tk.LEFT, padx=(4, 0))
-        for w in (r2_row, r2_label, r2_entry):
-            _bind_tooltip(w, DETECT_TOOLTIPS["r2"])
+        _bind_tooltip(r2_row, DETECT_TOOLTIPS["r2"])
 
         win_row = ttk.Frame(detect_panel)
         win_row.pack(fill=tk.X, pady=1)
@@ -356,8 +392,7 @@ class AnnotatorApp:
         self.detect_window_var = tk.StringVar(value="100")
         win_entry = ttk.Entry(win_row, textvariable=self.detect_window_var, width=8)
         win_entry.pack(side=tk.LEFT, padx=(4, 0))
-        for w in (win_row, win_label, win_entry):
-            _bind_tooltip(w, DETECT_TOOLTIPS["window"])
+        _bind_tooltip(win_row, DETECT_TOOLTIPS["window"])
 
         gap_row = ttk.Frame(detect_panel)
         gap_row.pack(fill=tk.X, pady=1)
@@ -366,8 +401,7 @@ class AnnotatorApp:
         self.detect_merge_gap_var = tk.StringVar(value="40")
         gap_entry = ttk.Entry(gap_row, textvariable=self.detect_merge_gap_var, width=8)
         gap_entry.pack(side=tk.LEFT, padx=(4, 0))
-        for w in (gap_row, gap_label, gap_entry):
-            _bind_tooltip(w, DETECT_TOOLTIPS["merge_gap"])
+        _bind_tooltip(gap_row, DETECT_TOOLTIPS["merge_gap"])
 
         self.detect_refine_var = tk.BooleanVar(value=True)
         refine_chk = ttk.Checkbutton(
@@ -399,7 +433,6 @@ class AnnotatorApp:
         clear_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
         _bind_tooltip(propose_btn, DETECT_TOOLTIPS["propose"])
         _bind_tooltip(clear_btn, DETECT_TOOLTIPS["clear"])
-        _bind_tooltip(detect_panel, "Hover any auto-detect setting for a short explanation.")
 
         tree_frame = ttk.Frame(seg_panel)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -425,6 +458,7 @@ class AnnotatorApp:
         self.seg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         seg_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.seg_tree.bind("<<TreeviewSelect>>", self._on_segment_select)
+        self.seg_tree.bind("<Double-1>", self._on_segment_double_click)
 
         seg_actions = ttk.Frame(seg_panel)
         seg_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
@@ -444,7 +478,7 @@ class AnnotatorApp:
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
         ttk.Label(
             seg_actions,
-            text="Selected: [ ] nudge start, , . nudge end (one data point)",
+            text="Selected: hover segment edges to drag, or [ ] , . nudge (one data point)",
             wraplength=180,
         ).pack(side=tk.TOP, pady=(4, 0))
 
@@ -468,6 +502,7 @@ class AnnotatorApp:
         ).pack(side=tk.BOTTOM, fill=tk.X)
 
         self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
 
@@ -523,7 +558,13 @@ class AnnotatorApp:
         elif keysym in ("u", "U"):
             self._undo_segment()
         elif keysym == "Escape":
-            self._clear_pending()
+            if self._boundary_drag is not None:
+                self._boundary_drag = None
+                self._set_boundary_hover(None)
+                self._redraw()
+                self._set_status("Cancelled boundary drag.")
+            else:
+                self._clear_pending()
         elif keysym == "Left":
             self._pan_view(-self._pan_step_sec())
         elif keysym == "Right":
@@ -544,25 +585,109 @@ class AnnotatorApp:
             self._jump_proposed(-1)
         return None
 
+    def _set_boundary_hover(self, boundary: str | None) -> None:
+        cursor = "sb_h_double_arrow" if boundary else ""
+        self.canvas.get_tk_widget().config(cursor=cursor)
+        if boundary == self._hover_boundary:
+            return
+        self._hover_boundary = boundary
+        self._redraw()
+
+    def _set_proposed_hover(self, key: tuple[str, int] | None) -> None:
+        if key == self._hover_proposed_key:
+            return
+        self._hover_proposed_key = key
+        self._redraw()
+
+    def _proposed_at_time(self, t: float) -> SegmentFit | None:
+        matches = [
+            seg for seg in self.proposed_segments if seg.t_start <= t <= seg.t_end
+        ]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        return min(matches, key=lambda s: abs((s.t_start + s.t_end) / 2 - t))
+
+    def _proposed_by_key(self, key: tuple[str, int]) -> SegmentFit | None:
+        kind, seg_id = key
+        if kind != "proposed":
+            return None
+        for seg in self.proposed_segments:
+            if seg.segment_id == seg_id:
+                return seg
+        return None
+
     def _on_motion(self, event) -> None:
+        if self._boundary_drag is not None:
+            if event.inaxes != self.ax or self.trial is None or event.xdata is None:
+                return
+            try:
+                mask = self._valid_click_mask()
+                idx = snap_index(self.trial.times, float(event.xdata), mask)
+            except ValueError:
+                return
+            if self._boundary_drag.get("preview_idx") == idx:
+                return
+            self._boundary_drag["preview_idx"] = idx
+            self._set_hover(idx)
+            self._redraw()
+            return
+
         if event.inaxes != self.ax or self.trial is None:
+            self._set_boundary_hover(None)
+            self._set_proposed_hover(None)
             self._set_hover(None)
             return
         if event.xdata is None:
+            self._set_boundary_hover(None)
+            self._set_proposed_hover(None)
             self._set_hover(None)
             return
+
+        boundary = self._hit_test_boundary(float(event.xdata))
+        self._set_boundary_hover(boundary)
+
+        if boundary is not None:
+            self._set_proposed_hover(None)
+            ref = self._selected_segment_ref()
+            if ref is not None:
+                _kind, seg = ref
+                idx = seg.idx_start if boundary == "start" else seg.idx_end
+                self._set_hover(idx)
+            return
+
         try:
             mask = self._valid_click_mask()
             if not np.any(mask):
+                self._set_proposed_hover(None)
                 self._set_hover(None)
                 return
             idx = snap_index(self.trial.times, float(event.xdata), mask)
+            t = float(self.trial.times[idx])
+            proposed = self._proposed_at_time(t)
+            self._set_proposed_hover(
+                ("proposed", proposed.segment_id) if proposed else None
+            )
             self._set_hover(idx)
         except ValueError:
+            self._set_proposed_hover(None)
             self._set_hover(None)
 
     def _hover_hint(self) -> str:
         if self.trial is not None:
+            if self.pending_fit is not None:
+                return "Pending manual segment ready — press A to accept."
+            if self.selected_segment_key is not None:
+                return (
+                    "Hover a proposed segment and press A to accept. "
+                    "Hover near a segment edge to drag, or use [ ] , . to nudge."
+                )
+            if self.proposed_segments:
+                return (
+                    "Hover a proposed segment and press A to accept, "
+                    "or hover a data point to mark a manual segment."
+                )
             return "Hover a data point to preview where a click will snap."
         return ""
 
@@ -575,7 +700,20 @@ class AnnotatorApp:
         assert self.trial is not None
         t = float(self.trial.times[idx])
         elev = float(self.trial.elevation_deg[idx])
-        self.hover_var.set(f"t = {t:.3f} s,  elevation = {elev:.2f}°")
+        if self.pending_fit is not None:
+            self.hover_var.set(
+                f"t = {t:.3f} s, elevation = {elev:.2f}° — "
+                f"pending manual segment: press A to accept"
+            )
+        else:
+            proposed = self._proposed_at_time(t)
+            if proposed is not None:
+                self.hover_var.set(
+                    f"t = {t:.3f} s, elevation = {elev:.2f}° — "
+                    f"proposed ?{proposed.segment_id}: press A to accept"
+                )
+            else:
+                self.hover_var.set(f"t = {t:.3f} s,  elevation = {elev:.2f}°")
         if idx == self._hover_idx and self._hover_artists:
             return
         self._hover_idx = idx
@@ -616,12 +754,33 @@ class AnnotatorApp:
             return int(matches[0])
         return int(np.clip(np.searchsorted(valid, idx), 0, len(valid) - 1))
 
+    def _x_tolerance_sec(self, pixels: float = 10.0) -> float:
+        bbox = self.ax.get_window_extent()
+        if bbox.width <= 0:
+            return 0.01
+        x0, x1 = self.ax.get_xlim()
+        return abs(x1 - x0) * pixels / bbox.width
+
+    def _hit_test_boundary(self, xdata: float) -> str | None:
+        ref = self._selected_segment_ref()
+        if ref is None:
+            return None
+        _kind, seg = ref
+        tol = self._x_tolerance_sec()
+        d_start = abs(xdata - seg.t_start)
+        d_end = abs(xdata - seg.t_end)
+        if d_start > tol and d_end > tol:
+            return None
+        if d_start <= d_end:
+            return "start"
+        return "end"
+
     def _update_files_label(self) -> None:
         self.gaze_file_label.config(
-            text="Gaze file uploaded" if self.gaze_path else ""
+            text=f"Gaze: {self.gaze_path.name}" if self.gaze_path else ""
         )
         self.time_file_label.config(
-            text="Time file uploaded" if self.time_path else ""
+            text=f"Time: {self.time_path.name}" if self.time_path else ""
         )
         if self.okr_log_path and self.okr_log is not None:
             n_blocks = len(self.okr_log.block_markers)
@@ -1025,6 +1184,30 @@ class AnnotatorApp:
             return
         if event.button != 1:
             return
+        if event.xdata is None:
+            return
+
+        boundary = self._hit_test_boundary(float(event.xdata))
+        if boundary is not None:
+            ref = self._selected_segment_ref()
+            if ref is None:
+                return
+            kind, seg = ref
+            try:
+                mask = self._valid_click_mask()
+                idx = snap_index(self.trial.times, float(event.xdata), mask)
+            except ValueError:
+                return
+            self._boundary_drag = {
+                "kind": kind,
+                "segment_id": seg.segment_id,
+                "which": boundary,
+                "preview_idx": idx,
+            }
+            self._set_hover(idx)
+            self._redraw()
+            return
+
         try:
             mask = self._valid_click_mask()
             idx = snap_index(self.trial.times, float(event.xdata), mask)
@@ -1060,6 +1243,76 @@ class AnnotatorApp:
             )
 
         self._redraw()
+
+    def _on_release(self, event) -> None:
+        if self._boundary_drag is None:
+            return
+        drag = self._boundary_drag
+        self._boundary_drag = None
+        preview_idx = drag.get("preview_idx")
+        if preview_idx is None:
+            self._redraw()
+            return
+        kind = drag["kind"]
+        segment_id = drag["segment_id"]
+        which = drag["which"]
+        self.selected_segment_key = (kind, segment_id)
+        self._set_segment_boundary_idx(which, int(preview_idx))
+
+    def _set_segment_boundary_idx(self, which: str, new_idx: int) -> None:
+        ref = self._selected_segment_ref()
+        if ref is None or self.trial is None:
+            return
+        kind, seg = ref
+        valid = self._valid_indices()
+        if len(valid) < 2:
+            return
+
+        start_pos = self._position_in_valid(seg.idx_start, valid)
+        end_pos = self._position_in_valid(seg.idx_end, valid)
+        new_pos = self._position_in_valid(new_idx, valid)
+
+        if which == "start":
+            if new_pos < 0 or new_pos >= end_pos:
+                self._set_status("Start must stay before end.")
+                self._redraw()
+                return
+            new_start = int(valid[new_pos])
+            new_end = seg.idx_end
+        else:
+            if new_pos <= start_pos or new_pos >= len(valid):
+                self._set_status("End must stay after start.")
+                self._redraw()
+                return
+            new_end = int(valid[new_pos])
+            new_start = seg.idx_start
+
+        try:
+            updated = fit_segment(
+                self.trial.times,
+                self.trial.elevation_deg,
+                new_start,
+                new_end,
+                self._stimulus_velocity(),
+                segment_id=seg.segment_id,
+            )
+        except ValueError as exc:
+            self._set_status(str(exc))
+            self._redraw()
+            return
+
+        self._replace_segment(kind, updated)
+        self._refresh_segment_list()
+        self._redraw()
+        if kind == "accepted":
+            self._write_autosave()
+        boundary = "start" if which == "start" else "end"
+        t = updated.t_start if which == "start" else updated.t_end
+        label = "Accepted" if kind == "accepted" else "Proposed"
+        self._set_status(
+            f"{label} #{updated.segment_id} {boundary} → {t:.3f} s "
+            f"(gain={updated.gain:.3f}, R²={updated.r2:.3f})"
+        )
 
     def _renumber_segments(self) -> None:
         for i, seg in enumerate(self.segments, start=1):
@@ -1198,6 +1451,9 @@ class AnnotatorApp:
     def _proposed_sorted(self) -> list[SegmentFit]:
         return sorted(self.proposed_segments, key=lambda s: s.t_start)
 
+    def _center_view_on_segment(self, seg: SegmentFit) -> None:
+        self._center_view_on_time((seg.t_start + seg.t_end) / 2)
+
     def _center_view_on_time(self, center: float) -> None:
         if self.view_xmin is not None and self.view_xmax is not None:
             width = self.view_xmax - self.view_xmin
@@ -1228,7 +1484,7 @@ class AnnotatorApp:
 
         seg = proposed[new_idx]
         self.selected_segment_key = ("proposed", seg.segment_id)
-        self._center_view_on_time((seg.t_start + seg.t_end) / 2)
+        self._center_view_on_segment(seg)
         self._refresh_segment_list()
         self._redraw()
         self._set_status(
@@ -1238,10 +1494,33 @@ class AnnotatorApp:
 
     def _on_segment_select(self, _event=None) -> None:
         selection = self.seg_tree.selection()
+        prev_key = self.selected_segment_key
         if not selection:
             self.selected_segment_key = None
         else:
             self.selected_segment_key = self._parse_segment_tree_iid(selection[0])
+        self._hover_boundary = None
+        self.canvas.get_tk_widget().config(cursor="")
+        if self.selected_segment_key != prev_key:
+            seg = self._selected_segment()
+            if seg is not None:
+                self._center_view_on_segment(seg)
+        self._redraw()
+
+    def _on_segment_double_click(self, event) -> None:
+        iid = self.seg_tree.identify_row(event.y)
+        if not iid:
+            return
+        kind, seg_id = self._parse_segment_tree_iid(iid)
+        self.selected_segment_key = (kind, seg_id)
+        self.seg_tree.selection_set(iid)
+        self.seg_tree.focus(iid)
+        seg = self._selected_segment()
+        if seg is None:
+            return
+        self._hover_boundary = None
+        self.canvas.get_tk_widget().config(cursor="")
+        self._center_view_on_segment(seg)
         self._redraw()
 
     def _refresh_segment_list(self) -> None:
@@ -1294,41 +1573,15 @@ class AnnotatorApp:
             if new_pos < 0 or new_pos >= end_pos:
                 self._set_status("Start must stay before end (one data point at a time).")
                 return
-            new_start = int(valid[new_pos])
-            new_end = seg.idx_end
+            new_idx = int(valid[new_pos])
         else:
             new_pos = end_pos + direction
             if new_pos <= start_pos or new_pos >= len(valid):
                 self._set_status("End must stay after start (one data point at a time).")
                 return
-            new_end = int(valid[new_pos])
-            new_start = seg.idx_start
+            new_idx = int(valid[new_pos])
 
-        try:
-            updated = fit_segment(
-                self.trial.times,
-                self.trial.elevation_deg,
-                new_start,
-                new_end,
-                self._stimulus_velocity(),
-                segment_id=seg.segment_id,
-            )
-        except ValueError as exc:
-            self._set_status(str(exc))
-            return
-
-        self._replace_segment(kind, updated)
-        self._refresh_segment_list()
-        self._redraw()
-        if kind == "accepted":
-            self._write_autosave()
-        boundary = "start" if which == "start" else "end"
-        t = updated.t_start if which == "start" else updated.t_end
-        label = "Accepted" if kind == "accepted" else "Proposed"
-        self._set_status(
-            f"{label} #{updated.segment_id} {boundary} → {t:.3f} s "
-            f"(gain={updated.gain:.3f}, R²={updated.r2:.3f})"
-        )
+        self._set_segment_boundary_idx(which, new_idx)
 
     def _delete_selected_segment(self) -> None:
         ref = self._selected_segment_ref()
@@ -1358,11 +1611,14 @@ class AnnotatorApp:
             status = f"Deleted proposed segment. {len(self.proposed_segments)} proposed remaining."
         self._set_status(status)
 
-    def _accept_selected_proposed(self) -> bool:
-        ref = self._selected_segment_ref()
-        if ref is None or ref[0] != "proposed":
+    def _accept_proposed_segment(self, seg: SegmentFit) -> bool:
+        match = next(
+            (s for s in self.proposed_segments if s.segment_id == seg.segment_id),
+            None,
+        )
+        if match is None:
             return False
-        _kind, seg = ref
+        seg = match
         self.proposed_segments = [
             s for s in self.proposed_segments if s.segment_id != seg.segment_id
         ]
@@ -1371,6 +1627,7 @@ class AnnotatorApp:
         self.segments.append(accepted)
         self._renumber_segments()
         self.selected_segment_key = ("accepted", accepted.segment_id)
+        self._hover_proposed_key = None
         self._refresh_segment_list()
         self._redraw()
         self._write_autosave()
@@ -1382,25 +1639,39 @@ class AnnotatorApp:
         )
         return True
 
+    def _accept_selected_proposed(self) -> bool:
+        ref = self._selected_segment_ref()
+        if ref is None or ref[0] != "proposed":
+            return False
+        return self._accept_proposed_segment(ref[1])
+
     def _accept_segment(self) -> None:
-        if self._accept_selected_proposed():
-            return
-        if self.pending_fit is None:
+        if self.pending_fit is not None:
+            self.segments.append(self.pending_fit)
+            self._renumber_segments()
+            self._clear_pending(redraw=False)
+            self._refresh_segment_list()
+            self._redraw()
+            self._write_autosave()
+            med = trial_summary_median_gain(self.segments)
             self._set_status(
-                "Mark a segment (two clicks), select a proposed segment, then press A."
+                f"Accepted segment {len(self.segments)}: "
+                f"gain={self.segments[-1].gain:.3f}, R²={self.segments[-1].r2:.3f}, "
+                f"trial median gain={med:.3f} (n={len(self.segments)})"
             )
             return
-        self.segments.append(self.pending_fit)
-        self._renumber_segments()
-        self._clear_pending(redraw=False)
-        self._refresh_segment_list()
-        self._redraw()
-        self._write_autosave()
-        med = trial_summary_median_gain(self.segments)
+
+        if self._hover_proposed_key is not None:
+            seg = self._proposed_by_key(self._hover_proposed_key)
+            if seg is not None and self._accept_proposed_segment(seg):
+                return
+
+        if self._accept_selected_proposed():
+            return
+
         self._set_status(
-            f"Accepted segment {len(self.segments)}: "
-            f"gain={self.segments[-1].gain:.3f}, R²={self.segments[-1].r2:.3f}, "
-            f"trial median gain={med:.3f} (n={len(self.segments)})"
+            "Mark a segment (two clicks), hover a proposed segment, "
+            "or select one in the list, then press A."
         )
 
     def _undo_segment(self) -> None:
@@ -1472,17 +1743,22 @@ class AnnotatorApp:
             if seg.t_end < vx0 or seg.t_start > vx1:
                 continue
             selected = self.selected_segment_key == (kind, seg.segment_id)
+            hovered = (
+                kind == "proposed"
+                and self._hover_proposed_key == (kind, seg.segment_id)
+            )
+            highlighted = selected or hovered
             if kind == "accepted":
-                span_color = "limegreen" if selected else "green"
-                span_alpha = 0.35 if selected else 0.2
-                line_color = "forestgreen" if selected else "darkgreen"
-                line_width = 2.5 if selected else 1.5
+                span_color = "limegreen" if highlighted else "green"
+                span_alpha = 0.35 if highlighted else 0.2
+                line_color = "forestgreen" if highlighted else "darkgreen"
+                line_width = 2.5 if highlighted else 1.5
                 label_prefix = "#"
             else:
-                span_color = "cornflowerblue" if selected else "steelblue"
-                span_alpha = 0.3 if selected else 0.15
-                line_color = "royalblue" if selected else "steelblue"
-                line_width = 2.5 if selected else 1.5
+                span_color = "cornflowerblue" if highlighted else "steelblue"
+                span_alpha = 0.3 if highlighted else 0.15
+                line_color = "royalblue" if highlighted else "steelblue"
+                line_width = 2.5 if highlighted else 1.5
                 label_prefix = "?"
             self.ax.axvspan(seg.t_start, seg.t_end, color=span_color, alpha=span_alpha)
             seg_times = np.linspace(seg.t_start, seg.t_end, 50)
@@ -1513,6 +1789,44 @@ class AnnotatorApp:
                         alpha=0.85,
                     ),
                 )
+            if selected:
+                active_boundary = self._hover_boundary
+                if self._boundary_drag:
+                    drag_kind = self._boundary_drag.get("kind")
+                    drag_id = self._boundary_drag.get("segment_id")
+                    if drag_kind == kind and drag_id == seg.segment_id:
+                        active_boundary = self._boundary_drag.get("which")
+
+                edge_color = "gold" if kind == "accepted" else "deepskyblue"
+                for boundary, t_bound in (
+                    ("start", seg.t_start),
+                    ("end", seg.t_end),
+                ):
+                    if self._boundary_drag:
+                        drag_kind = self._boundary_drag.get("kind")
+                        drag_id = self._boundary_drag.get("segment_id")
+                        which = self._boundary_drag.get("which")
+                        if (
+                            drag_kind == kind
+                            and drag_id == seg.segment_id
+                            and which == boundary
+                        ):
+                            preview_idx = self._boundary_drag.get("preview_idx")
+                            if preview_idx is not None:
+                                t_bound = float(times[preview_idx])
+
+                    if active_boundary != boundary:
+                        continue
+                    if t_bound < vx0 or t_bound > vx1:
+                        continue
+                    self.ax.axvline(
+                        t_bound,
+                        color=edge_color,
+                        linestyle="-",
+                        linewidth=3.0,
+                        alpha=0.95,
+                        zorder=8,
+                    )
 
         if self.pending_start_idx is not None:
             t_start = times[self.pending_start_idx]
