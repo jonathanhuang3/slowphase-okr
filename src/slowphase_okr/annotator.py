@@ -708,9 +708,10 @@ class AnnotatorApp:
         else:
             proposed = self._proposed_at_time(t)
             if proposed is not None:
+                label = self._segment_display_label("proposed", proposed)
                 self.hover_var.set(
                     f"t = {t:.3f} s, elevation = {elev:.2f}° — "
-                    f"proposed ?{proposed.segment_id}: press A to accept"
+                    f"proposed {label}: press A to accept"
                 )
             else:
                 self.hover_var.set(f"t = {t:.3f} s,  elevation = {elev:.2f}°")
@@ -1308,11 +1309,24 @@ class AnnotatorApp:
             self._write_autosave()
         boundary = "start" if which == "start" else "end"
         t = updated.t_start if which == "start" else updated.t_end
-        label = "Accepted" if kind == "accepted" else "Proposed"
+        label = self._segment_display_label(kind, updated)
         self._set_status(
-            f"{label} #{updated.segment_id} {boundary} → {t:.3f} s "
+            f"{label} {boundary} → {t:.3f} s "
             f"(gain={updated.gain:.3f}, R²={updated.r2:.3f})"
         )
+
+    def _segment_display_map(self) -> dict[tuple[str, int], int]:
+        return {
+            (kind, seg.segment_id): i
+            for i, (kind, seg) in enumerate(self._segments_sorted_by_time(), start=1)
+        }
+
+    def _segment_display_label(self, kind: str, seg: SegmentFit) -> str:
+        n = self._segment_display_map().get((kind, seg.segment_id), seg.segment_id)
+        return f"#{n}" if kind == "accepted" else f"?{n}"
+
+    def _sort_accepted_segments(self) -> None:
+        self.segments.sort(key=lambda s: s.t_start)
 
     def _renumber_segments(self) -> None:
         for i, seg in enumerate(self.segments, start=1):
@@ -1488,7 +1502,8 @@ class AnnotatorApp:
         self._refresh_segment_list()
         self._redraw()
         self._set_status(
-            f"Proposed {new_idx + 1}/{len(proposed)}: "
+            f"Proposed {self._segment_display_label('proposed', seg)} "
+            f"({new_idx + 1}/{len(proposed)}): "
             f"{seg.t_start:.2f}–{seg.t_end:.2f} s, gain={seg.gain:.3f}, R²={seg.r2:.2f}"
         )
 
@@ -1597,7 +1612,6 @@ class AnnotatorApp:
             self.proposed_segments = [
                 s for s in self.proposed_segments if s.segment_id != seg.segment_id
             ]
-            self._renumber_proposed_segments()
         self.selected_segment_key = None
         self._refresh_segment_list()
         self._redraw()
@@ -1619,21 +1633,28 @@ class AnnotatorApp:
         if match is None:
             return False
         seg = match
+        proposed_label = self._segment_display_label("proposed", seg)
         self.proposed_segments = [
             s for s in self.proposed_segments if s.segment_id != seg.segment_id
         ]
-        self._renumber_proposed_segments()
         accepted = replace(seg, segment_id=len(self.segments) + 1)
         self.segments.append(accepted)
+        self._sort_accepted_segments()
         self._renumber_segments()
+        accepted = next(
+            s
+            for s in self.segments
+            if s.idx_start == seg.idx_start and s.idx_end == seg.idx_end
+        )
         self.selected_segment_key = ("accepted", accepted.segment_id)
         self._hover_proposed_key = None
         self._refresh_segment_list()
         self._redraw()
         self._write_autosave()
         med = trial_summary_median_gain(self.segments)
+        accepted_label = self._segment_display_label("accepted", accepted)
         self._set_status(
-            f"Accepted proposed segment as #{accepted.segment_id}: "
+            f"Accepted {proposed_label} as {accepted_label}: "
             f"gain={accepted.gain:.3f}, R²={accepted.r2:.3f}, "
             f"trial median gain={med:.3f} (n={len(self.segments)})"
         )
@@ -1647,16 +1668,24 @@ class AnnotatorApp:
 
     def _accept_segment(self) -> None:
         if self.pending_fit is not None:
-            self.segments.append(self.pending_fit)
+            pending = self.pending_fit
+            self.segments.append(pending)
+            self._sort_accepted_segments()
             self._renumber_segments()
+            accepted = next(
+                s
+                for s in self.segments
+                if s.idx_start == pending.idx_start and s.idx_end == pending.idx_end
+            )
             self._clear_pending(redraw=False)
+            self.selected_segment_key = ("accepted", accepted.segment_id)
             self._refresh_segment_list()
             self._redraw()
             self._write_autosave()
             med = trial_summary_median_gain(self.segments)
             self._set_status(
-                f"Accepted segment {len(self.segments)}: "
-                f"gain={self.segments[-1].gain:.3f}, R²={self.segments[-1].r2:.3f}, "
+                f"Accepted {self._segment_display_label('accepted', accepted)}: "
+                f"gain={accepted.gain:.3f}, R²={accepted.r2:.3f}, "
                 f"trial median gain={med:.3f} (n={len(self.segments)})"
             )
             return
@@ -1739,6 +1768,9 @@ class AnnotatorApp:
 
         self._draw_okr_log_markers(vx0, vx1)
 
+        display_map = self._segment_display_map()
+        label_trans = blended_transform_factory(self.ax.transData, self.ax.transAxes)
+
         for kind, seg in self._segments_sorted_by_time():
             if seg.t_end < vx0 or seg.t_start > vx1:
                 continue
@@ -1753,13 +1785,13 @@ class AnnotatorApp:
                 span_alpha = 0.35 if highlighted else 0.2
                 line_color = "forestgreen" if highlighted else "darkgreen"
                 line_width = 2.5 if highlighted else 1.5
-                label_prefix = "#"
             else:
                 span_color = "cornflowerblue" if highlighted else "steelblue"
                 span_alpha = 0.3 if highlighted else 0.15
                 line_color = "royalblue" if highlighted else "steelblue"
                 line_width = 2.5 if highlighted else 1.5
-                label_prefix = "?"
+            display_n = display_map.get((kind, seg.segment_id), seg.segment_id)
+            label_text = f"{'#' if kind == 'accepted' else '?'}{display_n}"
             self.ax.axvspan(seg.t_start, seg.t_end, color=span_color, alpha=span_alpha)
             seg_times = np.linspace(seg.t_start, seg.t_end, 50)
             self.ax.plot(
@@ -1772,16 +1804,16 @@ class AnnotatorApp:
             )
             mid_t = (seg.t_start + seg.t_end) / 2
             if vx0 <= mid_t <= vx1:
-                mid_y = seg.slope_deg_s * mid_t + seg.intercept_deg
                 self.ax.text(
                     mid_t,
-                    mid_y,
-                    f"{label_prefix}{seg.segment_id}",
+                    0.97,
+                    label_text,
+                    transform=label_trans,
                     color="white",
                     fontsize=8,
                     fontweight="bold",
                     ha="center",
-                    va="center",
+                    va="top",
                     clip_on=True,
                     bbox=dict(
                         boxstyle="round,pad=0.2",
