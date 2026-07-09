@@ -10,6 +10,18 @@ import numpy as np
 
 
 @dataclass
+class PupilTrace:
+    """SRanipal pupil position in normalized screen coordinates."""
+
+    times: np.ndarray
+    x: np.ndarray
+    y: np.ndarray
+    eye: str  # "left" or "right"
+    source_position: str = ""
+    source_time: str = ""
+
+
+@dataclass
 class GazeTrial:
     """Eye position time series for one trial."""
 
@@ -18,6 +30,7 @@ class GazeTrial:
     trial_id: str = ""
     source_gaze: str = ""
     source_time: str = ""
+    pupil: PupilTrace | None = None
 
 
 def unity_gaze_direction(
@@ -120,6 +133,133 @@ def load_ush2a_trial(
         source_gaze=str(gaze_path.resolve()),
         source_time=str(time_path.resolve()),
     )
+
+
+def _parse_pupil_positions(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Parse one (x, y) tuple per non-empty line."""
+    tuple_pattern = re.compile(
+        r"^\(\s*([^,)]+)\s*,\s*([^,)]+)\s*\)\s*$",
+        re.IGNORECASE,
+    )
+    xs_list: list[float] = []
+    ys_list: list[float] = []
+
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = tuple_pattern.match(stripped)
+        if not match:
+            raise ValueError(f"No (x, y) tuple found in line: {stripped!r}")
+        xs_list.append(_parse_gaze_component(match.group(1)))
+        ys_list.append(_parse_gaze_component(match.group(2)))
+
+    if not xs_list:
+        raise ValueError(f"No (x, y) tuples found in {path}")
+
+    return np.array(xs_list, dtype=float), np.array(ys_list, dtype=float)
+
+
+def discover_pupil_files(
+    trial_dir: str | Path,
+    viewing_eye: str = "right",
+) -> tuple[Path, Path] | None:
+    """Return SRanipal pupil position + time files for the viewing eye, if present."""
+    trial_dir = Path(trial_dir)
+    eye = viewing_eye.strip().lower()
+    if eye not in {"left", "right"}:
+        raise ValueError(f"viewing_eye must be 'left' or 'right', got {viewing_eye!r}")
+
+    prefix = "sranipalRight" if eye == "right" else "sranipalLeft"
+    pos_path = trial_dir / f"{prefix}PupilPositions.txt"
+    if not pos_path.is_file():
+        return None
+
+    for time_name in (f"{prefix}PupilPositionTimes.txt", f"{prefix}PupilTimes.txt"):
+        time_path = trial_dir / time_name
+        if time_path.is_file():
+            return pos_path, time_path
+    return None
+
+
+def infer_viewing_eye(
+    *,
+    eye_patch: str | None = None,
+    trial_id: str = "",
+) -> str:
+    """Infer which eye was viewing (unpatched) from OKR log patch side or trial name."""
+    if eye_patch:
+        patch = eye_patch.strip().lower()
+        if patch == "left":
+            return "right"
+        if patch == "right":
+            return "left"
+
+    normalized = f" {trial_id.replace('_', ' ').upper()} "
+    if " LE " in normalized:
+        return "left"
+    if " RE " in normalized:
+        return "right"
+    return "right"
+
+
+def load_sranipal_pupil(
+    position_path: str | Path,
+    time_path: str | Path,
+    *,
+    eye: str,
+) -> PupilTrace:
+    """Load sranipal*PupilPositions.txt + matching time file."""
+    position_path = Path(position_path)
+    time_path = Path(time_path)
+    if not position_path.is_file():
+        raise FileNotFoundError(position_path)
+    if not time_path.is_file():
+        raise FileNotFoundError(time_path)
+
+    xs, ys = _parse_pupil_positions(position_path)
+    times = _parse_gaze_times(time_path)
+    if len(xs) != len(times):
+        raise ValueError(
+            f"Length mismatch: {len(xs)} pupil samples vs {len(times)} timestamps"
+        )
+
+    invalid = np.isnan(xs) | np.isnan(ys)
+    xs = xs.astype(float)
+    ys = ys.astype(float)
+    xs[invalid] = np.nan
+    ys[invalid] = np.nan
+
+    eye_norm = eye.strip().lower()
+    if eye_norm not in {"left", "right"}:
+        raise ValueError(f"eye must be 'left' or 'right', got {eye!r}")
+
+    return PupilTrace(
+        times=times,
+        x=xs,
+        y=ys,
+        eye=eye_norm,
+        source_position=str(position_path.resolve()),
+        source_time=str(time_path.resolve()),
+    )
+
+
+def attach_sranipal_pupil(
+    trial: GazeTrial,
+    trial_dir: str | Path,
+    *,
+    viewing_eye: str | None = None,
+) -> PupilTrace | None:
+    """Discover and attach SRanipal pupil trace to ``trial``, if files exist."""
+    eye = viewing_eye or infer_viewing_eye(trial_id=trial.trial_id)
+    discovered = discover_pupil_files(trial_dir, viewing_eye=eye)
+    if discovered is None:
+        trial.pupil = None
+        return None
+
+    pos_path, time_path = discovered
+    trial.pupil = load_sranipal_pupil(pos_path, time_path, eye=eye)
+    return trial.pupil
 
 
 def analysis_window_mask(

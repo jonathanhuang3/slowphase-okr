@@ -30,6 +30,7 @@ class OkrLog:
     source_path: str
     block_markers: list[OkrLogBlockMarker]
     fixation_markers: list[OkrLogFixationMarker]
+    stimulus_eye_patch: str | None = None
 
 
 def _is_fixation_event(event_type: str) -> bool:
@@ -96,8 +97,13 @@ def load_okr_log(path: str | Path) -> OkrLog:
 
     block_markers: list[OkrLogBlockMarker] = []
     fixation_markers: list[OkrLogFixationMarker] = []
+    stimulus_eye_patch: str | None = None
 
     for row in rows:
+        eye_patch = row.get("eyePatch", "").strip()
+        if eye_patch and eye_patch.upper() != "NA" and stimulus_eye_patch is None:
+            stimulus_eye_patch = eye_patch
+
         event_type = row["eventType"].strip()
         event_index = int(row["eventIndex"])
         block_index = _parse_optional_int(row.get("contrastBlockIndex", ""))
@@ -136,4 +142,5 @@ def load_okr_log(path: str | Path) -> OkrLog:
         source_path=str(path.resolve()),
         block_markers=block_markers,
         fixation_markers=fixation_markers,
+        stimulus_eye_patch=stimulus_eye_patch,
     )

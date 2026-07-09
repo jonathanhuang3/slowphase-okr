@@ -8,6 +8,10 @@ import pytest
 from slowphase_okr.fit import fit_segment, snap_index, trial_summary_median_gain
 from slowphase_okr.gaze import (
     analysis_window_mask,
+    attach_sranipal_pupil,
+    discover_pupil_files,
+    infer_viewing_eye,
+    load_sranipal_pupil,
     load_ush2a_trial,
     unity_gaze_direction,
 )
@@ -237,6 +241,64 @@ def test_gain_rescales_when_stimulus_velocity_changes():
     assert abs(seg.gain - 10.0 / 31.0) < 0.01
     rescaled_gain = seg.slope_deg_s / 10.0
     assert abs(rescaled_gain - seg.gain * (31.0 / 10.0)) < 1e-9
+
+
+def test_load_sranipal_pupil(tmp_path: Path):
+    pos = tmp_path / "sranipalRightPupilPositions.txt"
+    pos.write_text("(0.5, 0.4)\n(0.51, 0.41)\n(0.52, 0.42)\n")
+    timef = tmp_path / "sranipalRightPupilPositionTimes.txt"
+    timef.write_text("1.0\n1.01\n1.02\n")
+    pupil = load_sranipal_pupil(pos, timef, eye="right")
+    assert pupil.eye == "right"
+    assert len(pupil.times) == 3
+    assert pupil.y[0] == pytest.approx(0.4)
+    assert np.all(np.diff(pupil.y) > 0)
+
+
+def test_discover_pupil_files(tmp_path: Path):
+    pos = tmp_path / "sranipalLeftPupilPositions.txt"
+    pos.write_text("(0.1, 0.2)\n")
+    timef = tmp_path / "sranipalLeftPupilTimes.txt"
+    timef.write_text("0.0\n")
+    found = discover_pupil_files(tmp_path, viewing_eye="left")
+    assert found is not None
+    assert found[0] == pos
+    assert found[1] == timef
+    assert discover_pupil_files(tmp_path, viewing_eye="right") is None
+
+
+def test_infer_viewing_eye():
+    assert infer_viewing_eye(eye_patch="Left") == "right"
+    assert infer_viewing_eye(eye_patch="Right") == "left"
+    assert infer_viewing_eye(trial_id="Comb4 Block3 RE Increment") == "right"
+    assert infer_viewing_eye(trial_id="Comb2 Block1 LE") == "left"
+
+
+def test_attach_sranipal_pupil(tmp_path: Path):
+    gaze = tmp_path / "rotatedGaze.txt"
+    gaze.write_text("(0.0, 0.1, 1.0)\n")
+    timef = tmp_path / "gazeTime.txt"
+    timef.write_text("0.0\n")
+    trial = load_ush2a_trial(gaze, timef, trial_id="test RE")
+    pos = tmp_path / "sranipalRightPupilPositions.txt"
+    pos.write_text("(0.5, 0.4)\n")
+    pupil_time = tmp_path / "sranipalRightPupilPositionTimes.txt"
+    pupil_time.write_text("0.0\n")
+    attached = attach_sranipal_pupil(trial, tmp_path)
+    assert attached is not None
+    assert trial.pupil is not None
+    assert trial.pupil.eye == "right"
+
+
+def test_refit_segment_by_time():
+    from slowphase_okr.fit import refit_segment_by_time
+
+    times = np.linspace(0, 1, 100)
+    elev = 25.0 * times + 1.0
+    valid = np.ones(len(times), dtype=bool)
+    seg = refit_segment_by_time(times, elev, 0.1, 0.8, 31.0, 1, valid)
+    assert seg.slope_deg_s == pytest.approx(25.0, rel=1e-2)
+    assert seg.gain == pytest.approx(25.0 / 31.0, rel=1e-2)
 
 
 def test_autosave_roundtrip(tmp_path: Path):

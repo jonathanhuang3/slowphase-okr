@@ -279,10 +279,11 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 3. **Browse OKR log** *(optional)* — stimulus event log with block and fixation timing (see [OKR log](#okr-log-optional))
 4. Enter **Trial ID** and **stimulus velocity** (default 31 deg/s, press Enter to apply after editing)
 5. Click **Load trial**
-6. **Click twice** on the elevation trace: start and end of each upward slow phase (snaps to nearest sample)
-7. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
-8. Press **Accept segment** (`A`) to keep the fit
-9. **Export Excel** when done
+6. Choose **Signal** — elevation (default) or SRanipal pupil X/Y if those files are in the trial folder
+7. **Click twice** on the trace: start and end of each upward slow phase (snaps to nearest sample)
+8. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
+9. Press **Accept segment** (`A`) to keep the fit
+10. **Export Excel** when done
 
 ### Semi-automatic annotation (recommended with OKR log)
 
@@ -302,7 +303,8 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | Feature | Description |
 |---------|-------------|
 | **Analysis window** | Full trial — first timestamp to last timestamp |
-| **Fixed y-axis** | Elevation scale stays fixed to the full trial while you pan in time |
+| **Signal source** | Elevation from rotated gaze, or SRanipal pupil X/Y (auto-loaded from trial folder) |
+| **Fixed y-axis** | Signal scale stays fixed to the full trial while you pan in time |
 | **Segment list** | Shows proposed (`?`) and accepted (`✓`) segments sorted by time |
 | **Segment labels** | `#N` on accepted (green), `?N` on proposed (blue) segments in the plot |
 | **Edit segments** | Delete selected (`Del`), undo last (`U`), drag edges on plot, nudge boundaries (`[ ]` start, `, .` end) |
@@ -383,6 +385,8 @@ This tool was developed for our lab to support gaze data recorded with a **HTC V
 **Duplicate timestamps:** Unity `gazeTime.txt` often repeats the same time for several gaze samples (one Unity frame, multiple eye samples). That is normal. Auto-detect averages elevation at each unique time before searching.
 
 **Pair the right files:** `rotatedGaze.txt` + `gazeTime.txt` (same line count). Do not mix `rotatedGaze.txt` with `sranipalGazeTime.txt`.
+
+**SRanipal pupil position (optional):** If present in the same trial folder, the app also loads `sranipalLeftPupilPositions.txt` / `sranipalRightPupilPositions.txt` with matching `*PupilPositionTimes.txt` (or `*PupilTimes.txt`). Pupil coordinates are normalized screen units `(x, y)` per line. Use the **Signal** menu to plot pupil Y (vertical OKR) or pupil X instead of elevation. Segment marking, auto-detect, and gain (`slope / stimulus velocity`) work the same way; pupil slopes are in normalized units per second. The viewing eye is inferred from the OKR log `eyePatch` column (patched eye) or trial name (`RE` / `LE`).
 
 ### OKR log (optional)
 

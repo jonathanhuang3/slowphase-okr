@@ -87,6 +87,28 @@ def trial_summary_median_gain(segments: list[SegmentFit]) -> float:
     return float(np.median([s.gain for s in segments]))
 
 
+def refit_segment_by_time(
+    times: np.ndarray,
+    values: np.ndarray,
+    t_start: float,
+    t_end: float,
+    stimulus_velocity: float,
+    segment_id: int,
+    valid_mask: np.ndarray,
+) -> SegmentFit:
+    """Refit a segment using time boundaries on a (possibly different) signal."""
+    idx_start = snap_index(times, t_start, valid_mask)
+    idx_end = snap_index(times, t_end, valid_mask)
+    return fit_segment(
+        times,
+        values,
+        idx_start,
+        idx_end,
+        stimulus_velocity,
+        segment_id,
+    )
+
+
 def snap_index(times: np.ndarray, click_time: float, valid_mask: np.ndarray) -> int:
     """Snap a click time to the nearest sample index within valid_mask."""
     candidates = np.where(valid_mask)[0]

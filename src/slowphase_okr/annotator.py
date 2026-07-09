@@ -25,8 +25,20 @@ from slowphase_okr.autosave import (
 )
 from slowphase_okr.detect import DetectParams, detect_slow_phases
 from slowphase_okr.export import export_to_excel
-from slowphase_okr.fit import SegmentFit, fit_segment, snap_index, trial_summary_median_gain
-from slowphase_okr.gaze import GazeTrial, analysis_window_mask, load_ush2a_trial
+from slowphase_okr.fit import (
+    SegmentFit,
+    fit_segment,
+    refit_segment_by_time,
+    snap_index,
+    trial_summary_median_gain,
+)
+from slowphase_okr.gaze import (
+    GazeTrial,
+    analysis_window_mask,
+    attach_sranipal_pupil,
+    infer_viewing_eye,
+    load_ush2a_trial,
+)
 from slowphase_okr.okr_log import OkrLog, load_okr_log
 
 
@@ -54,6 +66,8 @@ Other
 
 Notes
   • Analysis window spans the full trial (first to last timestamp).
+  • Signal menu: elevation (rotated gaze) or SRanipal pupil X/Y for an alternate gain trace.
+  • Pupil gain uses the same slope / stimulus-velocity formula; slopes are in normalized pupil units/s.
   • R² is logged and exported but segments are not auto-rejected.
   • Annotations autosave to JSON in the trial folder; restore on reload.
   • Optional OKR log marks contrast-block and fixation-cross start times on the plot.
@@ -187,6 +201,15 @@ def _bind_tooltip(widget: tk.Widget, text: str) -> None:
 
 
 class AnnotatorApp:
+    SIGNAL_ELEVATION = "elevation"
+    SIGNAL_PUPIL_Y = "pupil_y"
+    SIGNAL_PUPIL_X = "pupil_x"
+    SIGNAL_CHOICES = (
+        ("Elevation (rotated gaze)", SIGNAL_ELEVATION),
+        ("Pupil Y (SRanipal)", SIGNAL_PUPIL_Y),
+        ("Pupil X (SRanipal)", SIGNAL_PUPIL_X),
+    )
+
     DEFAULT_VIEW_DURATION = 2.0
     VIEW_PRESET_LABELS = ("1 s", "2 s", "5 s", "10 s", "Full trial")
     VIEW_PRESET_SECONDS = {
@@ -228,7 +251,9 @@ class AnnotatorApp:
 
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
-        self.elev_ylim: tuple[float, float] | None = None
+        self.signal_ylim: tuple[float, float] | None = None
+        self._signal_mode_map = {label: mode for label, mode in self.SIGNAL_CHOICES}
+        self._signal_label_map = {mode: label for label, mode in self.SIGNAL_CHOICES}
         self.view_xmin: float | None = None
         self.view_xmax: float | None = None
 
@@ -242,6 +267,132 @@ class AnnotatorApp:
     @property
     def analysis_duration(self) -> float:
         return max(self.analysis_t1 - self.analysis_t0, self.MIN_VIEW_DURATION)
+
+    def _signal_mode(self) -> str:
+        return self._signal_mode_map.get(
+            self.signal_var.get(), self.SIGNAL_ELEVATION
+        )
+
+    def _pupil_available(self) -> bool:
+        return self.trial is not None and self.trial.pupil is not None
+
+    def _active_times(self) -> np.ndarray:
+        assert self.trial is not None
+        mode = self._signal_mode()
+        if mode in (self.SIGNAL_PUPIL_Y, self.SIGNAL_PUPIL_X):
+            assert self.trial.pupil is not None
+            return self.trial.pupil.times
+        return self.trial.times
+
+    def _active_values(self) -> np.ndarray:
+        assert self.trial is not None
+        mode = self._signal_mode()
+        if mode == self.SIGNAL_PUPIL_Y:
+            assert self.trial.pupil is not None
+            return self.trial.pupil.y
+        if mode == self.SIGNAL_PUPIL_X:
+            assert self.trial.pupil is not None
+            return self.trial.pupil.x
+        return self.trial.elevation_deg
+
+    def _signal_plot_label(self) -> str:
+        mode = self._signal_mode()
+        if mode == self.SIGNAL_PUPIL_Y:
+            return "Pupil Y"
+        if mode == self.SIGNAL_PUPIL_X:
+            return "Pupil X"
+        return "Elevation"
+
+    def _signal_y_label(self) -> str:
+        if self._signal_mode() == self.SIGNAL_ELEVATION:
+            return "Elevation (deg)"
+        return "Pupil position (norm.)"
+
+    def _signal_slope_unit(self) -> str:
+        if self._signal_mode() == self.SIGNAL_ELEVATION:
+            return "deg/s"
+        return "norm./s"
+
+    def _analysis_mask(self) -> np.ndarray:
+        if self.trial is None:
+            return np.array([], dtype=bool)
+        return analysis_window_mask(
+            self._active_times(), self.analysis_t0, t_end=self.analysis_t1
+        )
+
+    def _update_pupil_signal_options(self) -> None:
+        if self._pupil_available():
+            assert self.trial is not None and self.trial.pupil is not None
+            pupil = self.trial.pupil
+            self.signal_combo.configure(
+                state="readonly",
+                values=[label for label, _ in self.SIGNAL_CHOICES],
+            )
+            self.pupil_file_label.config(
+                text=(
+                    f"Pupil ({pupil.eye} eye): "
+                    f"{Path(pupil.source_position).name}, "
+                    f"{Path(pupil.source_time).name}"
+                )
+            )
+        else:
+            self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
+            self.signal_combo.configure(
+                state="readonly",
+                values=[self._signal_label_map[self.SIGNAL_ELEVATION]],
+            )
+            self.pupil_file_label.config(text="")
+
+    def _on_signal_selected(self, _event=None) -> None:
+        mode = self._signal_mode()
+        if mode != self.SIGNAL_ELEVATION and not self._pupil_available():
+            self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
+            messagebox.showwarning(
+                "Pupil data unavailable",
+                "No SRanipal pupil files were found for this trial.",
+            )
+            return
+        if self.pending_start_idx is not None or self.pending_fit is not None:
+            self._clear_pending(redraw=False)
+            self._set_status("Cleared pending segment after signal change.")
+        self._refit_all_segments()
+        self._update_signal_ylim()
+        self._redraw()
+
+    def _refit_all_segments(self) -> None:
+        if self.trial is None:
+            return
+        try:
+            vel = self._stimulus_velocity()
+        except ValueError:
+            return
+        valid = self._valid_click_mask()
+        if not np.any(valid):
+            return
+        times = self._active_times()
+        values = self._active_values()
+
+        def refit_list(segments: list[SegmentFit]) -> list[SegmentFit]:
+            refitted: list[SegmentFit] = []
+            for seg in segments:
+                try:
+                    refitted.append(
+                        refit_segment_by_time(
+                            times,
+                            values,
+                            seg.t_start,
+                            seg.t_end,
+                            vel,
+                            seg.segment_id,
+                            valid,
+                        )
+                    )
+                except ValueError:
+                    refitted.append(seg)
+            return refitted
+
+        self.segments = refit_list(self.segments)
+        self.proposed_segments = refit_list(self.proposed_segments)
 
     def _build_controls(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -292,6 +443,22 @@ class AnnotatorApp:
         self.time_file_label.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=4)
         self.okr_log_file_label = ttk.Label(top, text="")
         self.okr_log_file_label.grid(row=4, column=0, columnspan=3, sticky=tk.W, padx=4)
+
+        signal_row = ttk.Frame(top)
+        signal_row.grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=4, pady=(2, 0))
+        ttk.Label(signal_row, text="Signal:").pack(side=tk.LEFT)
+        self.signal_var = tk.StringVar(value=self.SIGNAL_CHOICES[0][0])
+        self.signal_combo = ttk.Combobox(
+            signal_row,
+            textvariable=self.signal_var,
+            values=[label for label, _ in self.SIGNAL_CHOICES],
+            state="readonly",
+            width=28,
+        )
+        self.signal_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self.signal_combo.bind("<<ComboboxSelected>>", self._on_signal_selected)
+        self.pupil_file_label = ttk.Label(top, text="")
+        self.pupil_file_label.grid(row=6, column=0, columnspan=3, sticky=tk.W, padx=4)
 
         view_row = ttk.Frame(top)
         view_row.grid(row=2, column=3, columnspan=2, rowspan=2, sticky=tk.W, padx=4, pady=2)
@@ -631,7 +798,7 @@ class AnnotatorApp:
                 return
             try:
                 mask = self._valid_click_mask()
-                idx = snap_index(self.trial.times, float(event.xdata), mask)
+                idx = snap_index(self._active_times(), float(event.xdata), mask)
             except ValueError:
                 return
             if self._boundary_drag.get("preview_idx") == idx:
@@ -670,8 +837,8 @@ class AnnotatorApp:
                 self._set_proposed_hover(None)
                 self._set_hover(None)
                 return
-            idx = snap_index(self.trial.times, float(event.xdata), mask)
-            t = float(self.trial.times[idx])
+            idx = snap_index(self._active_times(), float(event.xdata), mask)
+            t = float(self._active_times()[idx])
             proposed = self._proposed_at_time(t)
             self._set_proposed_hover(
                 ("proposed", proposed.segment_id) if proposed else None
@@ -705,11 +872,16 @@ class AnnotatorApp:
             self._clear_hover_artists()
             return
         assert self.trial is not None
-        t = float(self.trial.times[idx])
-        elev = float(self.trial.elevation_deg[idx])
+        t = float(self._active_times()[idx])
+        value = float(self._active_values()[idx])
+        value_label = (
+            f"elevation = {value:.2f}°"
+            if self._signal_mode() == self.SIGNAL_ELEVATION
+            else f"{self._signal_plot_label().lower()} = {value:.4f}"
+        )
         if self.pending_fit is not None:
             self.hover_var.set(
-                f"t = {t:.3f} s, elevation = {elev:.2f}° — "
+                f"t = {t:.3f} s, {value_label} — "
                 f"pending manual segment: press A to accept"
             )
         else:
@@ -717,11 +889,11 @@ class AnnotatorApp:
             if proposed is not None:
                 label = self._segment_display_label("proposed", proposed)
                 self.hover_var.set(
-                    f"t = {t:.3f} s, elevation = {elev:.2f}° — "
+                    f"t = {t:.3f} s, {value_label} — "
                     f"proposed {label}: press A to accept"
                 )
             else:
-                self.hover_var.set(f"t = {t:.3f} s,  elevation = {elev:.2f}°")
+                self.hover_var.set(f"t = {t:.3f} s, {value_label}")
         if idx == self._hover_idx and self._hover_artists:
             return
         self._hover_idx = idx
@@ -739,11 +911,11 @@ class AnnotatorApp:
         if self.trial is None:
             return
         self._clear_hover_artists()
-        t = float(self.trial.times[idx])
-        elev = float(self.trial.elevation_deg[idx])
+        t = float(self._active_times()[idx])
+        value = float(self._active_values()[idx])
         (ring,) = self.ax.plot(
             t,
-            elev,
+            value,
             "o",
             markersize=6,
             markerfacecolor="none",
@@ -861,6 +1033,15 @@ class AnnotatorApp:
             self.okr_log = load_okr_log(self.okr_log_path)
             self.detect_dir_var.set("Auto")
             self.detect_blocks_var.set(True)
+            if self.trial is not None and self.gaze_path is not None:
+                viewing_eye = infer_viewing_eye(
+                    eye_patch=self.okr_log.stimulus_eye_patch,
+                    trial_id=self.trial.trial_id,
+                )
+                attach_sranipal_pupil(
+                    self.trial, self.gaze_path.parent, viewing_eye=viewing_eye
+                )
+                self._update_pupil_signal_options()
             return True
         except Exception as exc:
             self.okr_log = None
@@ -915,8 +1096,8 @@ class AnnotatorApp:
         ):
             try:
                 self.pending_fit = fit_segment(
-                    self.trial.times,
-                    self.trial.elevation_deg,
+                    self._active_times(),
+                    self._active_values(),
                     self.pending_start_idx,
                     self.pending_end_idx,
                     vel,
@@ -965,6 +1146,7 @@ class AnnotatorApp:
             stimulus_velocity=vel,
             segments=self.segments,
             software_version=__version__,
+            signal_mode=self._signal_mode(),
         )
 
     def _try_restore_autosave(self, trial_id: str) -> None:
@@ -995,6 +1177,18 @@ class AnnotatorApp:
             self.stim_vel_var.set(str(vel))
             self._applied_stimulus_velocity = float(vel)
             self.stim_vel_applied_var.set(f"Applied: {float(vel):g} deg/s")
+        signal_mode = data.get("signal_mode")
+        if (
+            isinstance(signal_mode, str)
+            and signal_mode in self._signal_label_map
+            and (
+                signal_mode == self.SIGNAL_ELEVATION
+                or self._pupil_available()
+            )
+        ):
+            self.signal_var.set(self._signal_label_map[signal_mode])
+            self._refit_all_segments()
+            self._update_signal_ylim()
         self.selected_segment_key = None
         self._clear_pending(redraw=False)
         self._refresh_segment_list()
@@ -1058,12 +1252,22 @@ class AnnotatorApp:
             self.trial = load_ush2a_trial(
                 self.gaze_path, self.time_path, trial_id=trial_id
             )
+            viewing_eye = infer_viewing_eye(
+                eye_patch=(
+                    self.okr_log.stimulus_eye_patch if self.okr_log else None
+                ),
+                trial_id=trial_id,
+            )
+            pupil = attach_sranipal_pupil(
+                self.trial, self.gaze_path.parent, viewing_eye=viewing_eye
+            )
             t0 = float(self.trial.times[0])
             t1 = float(self.trial.times[-1])
             self.analysis_t0 = t0
             self.analysis_t1 = t1
             self.window_mask = analysis_window_mask(self.trial.times, t0, t_end=t1)
-            self._update_elev_ylim()
+            self._update_pupil_signal_options()
+            self._update_signal_ylim()
             self.segments.clear()
             self.proposed_segments.clear()
             self.selected_segment_key = None
@@ -1081,9 +1285,11 @@ class AnnotatorApp:
             self._redraw()
             duration = t1 - t0
             status = (
-                f"Loaded {trial_id}: {len(self.trial.times)} samples, "
+                f"Loaded {trial_id}: {len(self.trial.times)} gaze samples, "
                 f"analysis {t0:.2f}–{t1:.2f} s ({duration:.1f} s)"
             )
+            if pupil is not None:
+                status += f"; pupil ({pupil.eye}): {len(pupil.times)} samples"
             if self.okr_log is not None:
                 status += (
                     f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
@@ -1206,27 +1412,27 @@ class AnnotatorApp:
         self._pan_view(delta)
 
     def _valid_click_mask(self) -> np.ndarray:
-        if self.trial is None or self.window_mask is None:
-            return np.array([], dtype=bool)
-        return self.window_mask & ~np.isnan(self.trial.elevation_deg)
-
-    def _update_elev_ylim(self) -> None:
-        """Fix y-axis to full-trial elevation range so panning time does not rescale."""
         if self.trial is None:
-            self.elev_ylim = None
+            return np.array([], dtype=bool)
+        return self._analysis_mask() & ~np.isnan(self._active_values())
+
+    def _update_signal_ylim(self) -> None:
+        """Fix y-axis to full-trial signal range so panning time does not rescale."""
+        if self.trial is None:
+            self.signal_ylim = None
             return
         valid = self._valid_click_mask()
         if not np.any(valid):
-            self.elev_ylim = None
+            self.signal_ylim = None
             return
-        elev = self.trial.elevation_deg
-        pad = 0.5
-        ymin = float(np.nanmin(elev[valid])) - pad
-        ymax = float(np.nanmax(elev[valid])) + pad
+        values = self._active_values()
+        pad = 0.5 if self._signal_mode() == self.SIGNAL_ELEVATION else 0.002
+        ymin = float(np.nanmin(values[valid])) - pad
+        ymax = float(np.nanmax(values[valid])) + pad
         if ymin < ymax:
-            self.elev_ylim = (ymin, ymax)
+            self.signal_ylim = (ymin, ymax)
         else:
-            self.elev_ylim = None
+            self.signal_ylim = None
 
     def _valid_indices(self) -> np.ndarray:
         return np.where(self._valid_click_mask())[0]
@@ -1247,7 +1453,7 @@ class AnnotatorApp:
             kind, seg = ref
             try:
                 mask = self._valid_click_mask()
-                idx = snap_index(self.trial.times, float(event.xdata), mask)
+                idx = snap_index(self._active_times(), float(event.xdata), mask)
             except ValueError:
                 return
             self._boundary_drag = {
@@ -1262,7 +1468,7 @@ class AnnotatorApp:
 
         try:
             mask = self._valid_click_mask()
-            idx = snap_index(self.trial.times, float(event.xdata), mask)
+            idx = snap_index(self._active_times(), float(event.xdata), mask)
         except ValueError:
             return
 
@@ -1270,7 +1476,7 @@ class AnnotatorApp:
             self.pending_start_idx = idx
             self.pending_end_idx = None
             self.pending_fit = None
-            t_start = self.trial.times[idx]
+            t_start = self._active_times()[idx]
             self._set_status(
                 f"Start marked at {t_start:.3f} s — click end of slow phase"
             )
@@ -1278,8 +1484,8 @@ class AnnotatorApp:
             self.pending_end_idx = idx
             try:
                 self.pending_fit = fit_segment(
-                    self.trial.times,
-                    self.trial.elevation_deg,
+                    self._active_times(),
+                    self._active_values(),
                     self.pending_start_idx,
                     self.pending_end_idx,
                     self._stimulus_velocity(),
@@ -1341,8 +1547,8 @@ class AnnotatorApp:
 
         try:
             updated = fit_segment(
-                self.trial.times,
-                self.trial.elevation_deg,
+                self._active_times(),
+                self._active_values(),
                 new_start,
                 new_end,
                 self._stimulus_velocity(),
@@ -1464,7 +1670,7 @@ class AnnotatorApp:
         )
 
     def _propose_segments(self) -> None:
-        if self.trial is None or self.window_mask is None:
+        if self.trial is None:
             messagebox.showwarning("No trial", "Load a trial before auto-detecting.")
             return
         if self.proposed_segments and not messagebox.askyesno(
@@ -1483,8 +1689,8 @@ class AnnotatorApp:
             return
 
         proposed = detect_slow_phases(
-            self.trial.times,
-            self.trial.elevation_deg,
+            self._active_times(),
+            self._active_values(),
             self._valid_click_mask(),
             vel,
             params,
@@ -1787,8 +1993,8 @@ class AnnotatorApp:
             self.canvas.draw_idle()
             return
 
-        times = self.trial.times
-        elev = self.trial.elevation_deg
+        times = self._active_times()
+        values = self._active_values()
         t0 = self.analysis_t0
         t1 = self.analysis_t1
 
@@ -1798,19 +2004,19 @@ class AnnotatorApp:
         vx0, vx1 = self.view_xmin, self.view_xmax
 
         plot_mask = (
-            self.window_mask
-            & ~np.isnan(elev)
+            self._analysis_mask()
+            & ~np.isnan(values)
             & (times >= vx0)
             & (times <= vx1)
         )
         self.ax.plot(
             times[plot_mask],
-            elev[plot_mask],
+            values[plot_mask],
             linestyle="none",
             marker=".",
             markersize=4,
             color="0.25",
-            label="Elevation",
+            label=self._signal_plot_label(),
         )
 
         self.ax.axvspan(t0, t1, color="steelblue", alpha=0.04)
@@ -1915,7 +2121,7 @@ class AnnotatorApp:
             t_start = times[self.pending_start_idx]
             self.ax.axvline(t_start, color="orange", linestyle=":", linewidth=1.2)
             (marker,) = self.ax.plot(
-                t_start, elev[self.pending_start_idx], "o", color="orange", markersize=8
+                t_start, values[self.pending_start_idx], "o", color="orange", markersize=8
             )
             self._click_markers.append(marker)
             if self.pending_end_idx is None:
@@ -1930,7 +2136,7 @@ class AnnotatorApp:
             t_end = times[self.pending_end_idx]
             self.ax.axvline(t_end, color="darkorange", linestyle=":", linewidth=1.2)
             (marker,) = self.ax.plot(
-                t_end, elev[self.pending_end_idx], "o", color="darkorange", markersize=8
+                t_end, values[self.pending_end_idx], "o", color="darkorange", markersize=8
             )
             self._click_markers.append(marker)
 
@@ -1950,8 +2156,14 @@ class AnnotatorApp:
             )
             self._preview_line = line
             upward = "yes" if self.pending_fit.direction_upward else "FLAG: not upward"
+            slope_unit = self._signal_slope_unit()
+            slope_fmt = (
+                f"{self.pending_fit.slope_deg_s:.2f}"
+                if self._signal_mode() == self.SIGNAL_ELEVATION
+                else f"{self.pending_fit.slope_deg_s:.4f}"
+            )
             self.ax.set_title(
-                f"Pending: slope={self.pending_fit.slope_deg_s:.2f} deg/s, "
+                f"Pending: slope={slope_fmt} {slope_unit}, "
                 f"gain={self.pending_fit.gain:.3f}, R²={self.pending_fit.r2:.3f} ({upward})"
             )
         elif self.pending_start_idx is not None and self.pending_end_idx is None:
@@ -1973,11 +2185,11 @@ class AnnotatorApp:
             self.ax.set_title(title)
 
         self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Elevation (deg)")
+        self.ax.set_ylabel(self._signal_y_label())
         self.ax.set_xlim(vx0, vx1)
 
-        if self.elev_ylim is not None:
-            ymin, ymax = self.elev_ylim
+        if self.signal_ylim is not None:
+            ymin, ymax = self.signal_ylim
             if ymin < ymax:
                 self.ax.set_ylim(ymin, ymax)
 
