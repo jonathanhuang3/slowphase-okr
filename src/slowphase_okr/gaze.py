@@ -23,7 +23,6 @@ class GazeTrial:
 def unity_gaze_direction(
     x: np.ndarray, y: np.ndarray, z: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Match MATLAB unityGazeDirection.m."""
     r = np.sqrt(x**2 + y**2 + z**2)
     azimuth = np.arctan2(x, z)
     elevation = np.arcsin(np.divide(y, r, out=np.zeros_like(y), where=r != 0))

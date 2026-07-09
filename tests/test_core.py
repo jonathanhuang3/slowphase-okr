@@ -229,6 +229,16 @@ def test_detect_merge_gap_joins_fragments():
     assert len(merged_found) <= len(separate_found)
 
 
+def test_gain_rescales_when_stimulus_velocity_changes():
+    times = np.linspace(0, 1, 50)
+    elev = 10.0 * times
+    seg = fit_segment(times, elev, 0, 49, stimulus_velocity=31.0, segment_id=1)
+    assert abs(seg.slope_deg_s - 10.0) < 0.01
+    assert abs(seg.gain - 10.0 / 31.0) < 0.01
+    rescaled_gain = seg.slope_deg_s / 10.0
+    assert abs(rescaled_gain - seg.gain * (31.0 / 10.0)) < 1e-9
+
+
 def test_autosave_roundtrip(tmp_path: Path):
     from slowphase_okr.autosave import (
         autosave_matches_trial,

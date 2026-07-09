@@ -224,6 +224,7 @@ class AnnotatorApp:
         self._boundary_drag: dict | None = None
         self._hover_boundary: str | None = None
         self._hover_proposed_key: tuple[str, int] | None = None
+        self._applied_stimulus_velocity: float = 31.0
 
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
@@ -275,9 +276,15 @@ class AnnotatorApp:
         self.stim_vel_var = tk.StringVar(value="31")
         self.stim_vel_entry = ttk.Entry(vel_frame, textvariable=self.stim_vel_var, width=8)
         self.stim_vel_entry.pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(vel_frame, text="(Enter to apply)").pack(side=tk.LEFT, padx=(4, 0))
+        self.stim_vel_applied_var = tk.StringVar(value="Applied: 31 deg/s")
+        ttk.Label(
+            vel_frame,
+            textvariable=self.stim_vel_applied_var,
+            foreground="forestgreen",
+        ).pack(side=tk.LEFT, padx=(6, 0))
         self.stim_vel_entry.bind("<Return>", self._apply_stimulus_velocity)
-        self.stim_vel_entry.bind("<FocusOut>", self._apply_stimulus_velocity)
+        self.stim_vel_entry.bind("<FocusOut>", self._apply_stimulus_velocity_on_blur)
+        self.stim_vel_var.trace_add("write", self._on_stimulus_velocity_edited)
 
         self.gaze_file_label = ttk.Label(top, text="")
         self.gaze_file_label.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=4)
@@ -867,6 +874,57 @@ class AnnotatorApp:
         except ValueError as exc:
             raise ValueError("Stimulus velocity must be a number.") from exc
 
+    def _on_stimulus_velocity_edited(self, *_args) -> None:
+        raw = self.stim_vel_var.get().strip()
+        if not raw:
+            self.stim_vel_applied_var.set("Enter a value, then press Enter")
+            return
+        try:
+            vel = float(raw)
+        except ValueError:
+            self.stim_vel_applied_var.set("Invalid — enter a number")
+            return
+        if abs(vel - self._applied_stimulus_velocity) < 1e-9:
+            self.stim_vel_applied_var.set(f"Applied: {vel:g} deg/s")
+        else:
+            self.stim_vel_applied_var.set(f"Press Enter to apply ({vel:g} deg/s)")
+
+    def _apply_stimulus_velocity_on_blur(self, _event=None) -> str | None:
+        try:
+            vel = self._stimulus_velocity()
+        except ValueError:
+            return None
+        if abs(vel - self._applied_stimulus_velocity) < 1e-9:
+            return None
+        self._apply_stimulus_velocity(_event)
+        return None
+
+    def _recalculate_gains_for_velocity(self, vel: float) -> None:
+        self.segments = [
+            replace(seg, gain=seg.slope_deg_s / vel, stimulus_velocity=vel)
+            for seg in self.segments
+        ]
+        self.proposed_segments = [
+            replace(seg, gain=seg.slope_deg_s / vel, stimulus_velocity=vel)
+            for seg in self.proposed_segments
+        ]
+        if (
+            self.pending_start_idx is not None
+            and self.pending_end_idx is not None
+            and self.trial is not None
+        ):
+            try:
+                self.pending_fit = fit_segment(
+                    self.trial.times,
+                    self.trial.elevation_deg,
+                    self.pending_start_idx,
+                    self.pending_end_idx,
+                    vel,
+                    segment_id=len(self.segments) + 1,
+                )
+            except ValueError:
+                pass
+
     def _has_unsaved_work(self) -> bool:
         return bool(self.segments) or bool(self.proposed_segments) or self.pending_fit is not None
 
@@ -935,6 +993,8 @@ class AnnotatorApp:
         vel = data.get("stimulus_velocity")
         if vel is not None:
             self.stim_vel_var.set(str(vel))
+            self._applied_stimulus_velocity = float(vel)
+            self.stim_vel_applied_var.set(f"Applied: {float(vel):g} deg/s")
         self.selected_segment_key = None
         self._clear_pending(redraw=False)
         self._refresh_segment_list()
@@ -945,55 +1005,46 @@ class AnnotatorApp:
         )
 
     def _apply_stimulus_velocity(self, _event=None) -> None:
-        if not self.segments and not self.proposed_segments and self.pending_fit is None:
-            return
-
         try:
             vel = self._stimulus_velocity()
         except ValueError as exc:
             messagebox.showwarning("Invalid velocity", str(exc))
+            self.stim_vel_applied_var.set("Invalid — enter a number")
             return
 
         if vel == 0:
             messagebox.showwarning(
                 "Invalid velocity", "Stimulus velocity cannot be zero."
             )
+            self.stim_vel_applied_var.set("Invalid — cannot be zero")
             return
 
-        self.segments = [
-            replace(seg, gain=seg.slope_deg_s / vel, stimulus_velocity=vel)
-            for seg in self.segments
-        ]
-        self.proposed_segments = [
-            replace(seg, gain=seg.slope_deg_s / vel, stimulus_velocity=vel)
-            for seg in self.proposed_segments
-        ]
+        n_accepted = len(self.segments)
+        n_proposed = len(self.proposed_segments)
+        had_segments = n_accepted or n_proposed or self.pending_fit is not None
 
-        if (
-            self.pending_start_idx is not None
-            and self.pending_end_idx is not None
-            and self.trial is not None
-        ):
-            try:
-                self.pending_fit = fit_segment(
-                    self.trial.times,
-                    self.trial.elevation_deg,
-                    self.pending_start_idx,
-                    self.pending_end_idx,
-                    vel,
-                    segment_id=len(self.segments) + 1,
-                )
-            except ValueError:
-                pass
+        self._applied_stimulus_velocity = vel
+        self.stim_vel_applied_var.set(f"Applied: {vel:g} deg/s")
 
-        self._refresh_segment_list()
-        self._redraw()
-        self._write_autosave()
-        med = trial_summary_median_gain(self.segments)
-        n = len(self.segments)
-        status = f"Stimulus velocity set to {vel:.2f} deg/s."
-        if n:
-            status += f" Trial median gain={med:.3f} (n={n})"
+        if had_segments:
+            self._recalculate_gains_for_velocity(vel)
+            self._refresh_segment_list()
+            self._redraw()
+            self._write_autosave()
+
+        status = f"Stimulus velocity applied: {vel:g} deg/s."
+        if had_segments:
+            parts: list[str] = []
+            if n_accepted:
+                parts.append(f"{n_accepted} accepted")
+            if n_proposed:
+                parts.append(f"{n_proposed} proposed")
+            status += f" Recalculated gain for {', '.join(parts)} segment(s)."
+            med = trial_summary_median_gain(self.segments)
+            if n_accepted:
+                status += f" Trial median gain={med:.3f}."
+        else:
+            status += " Will be used for new segments and export."
         self._set_status(status)
 
     def _load_trial(self) -> None:
