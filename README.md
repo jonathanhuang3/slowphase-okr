@@ -46,12 +46,6 @@ If you see a version number like `Python 3.11.8`, you can skip to [Step 2](#step
 
 If `py` does not work, try `python --version`. If neither works, reinstall Python and make sure **Add python.exe to PATH** is checked.
 
-**PowerShell note:** If activating the virtual environment later shows a security error, use **Command Prompt** instead, or run this once in PowerShell:
-
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
-
 ---
 
 **Linux**
@@ -60,7 +54,7 @@ Install Python 3 and tkinter with your package manager. On Ubuntu:
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-venv python3-pip python3-tk
+sudo apt install python3 python3-pip python3-tk
 ```
 
 ### Step 2 — Get the code
@@ -84,176 +78,43 @@ You can also clone with **GitHub Desktop** (Repository → Clone repository).
 
 ### Step 3 — Install slowphase-okr
 
-Open a terminal in the project folder.
+Open a terminal in the project folder and install once. Replace the `cd` path with wherever you saved the folder.
 
 **macOS / Linux**
 
-Replace the `cd` path with wherever you saved the folder:
-
 ```bash
 cd ~/Desktop/slowphase-okr
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+python3 -m pip install -e .
 ```
 
-You should see `(.venv)` at the start of your terminal prompt. That means the virtual environment is active.
-
-**Windows (PowerShell)**
-
-Replace the `cd` path with wherever you saved the folder:
+**Windows**
 
 ```powershell
 cd $env:USERPROFILE\Desktop\slowphase-okr
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -e .
+py -m pip install -e .
 ```
 
-**Windows (Command Prompt)**
+If `py` is not found, use `python` instead.
 
-```cmd
-cd %USERPROFILE%\Desktop\slowphase-okr
-py -m venv .venv
-.venv\Scripts\activate.bat
-pip install -e .
-```
-
-If `py` is not found, use `python` instead in the commands above.
-
-**What is the virtual environment?** It keeps this app’s packages separate from the rest of your system. You only run `pip install -e .` **once** (or again after pulling code updates). Closing the terminal does **not** remove the venv or your installed packages — you only need to activate it again before running the app.
-
-### Step 3b — Auto-activate the virtual environment (optional)
-
-If you do not want to run `source .venv/bin/activate` every time you open a new terminal, you can set up automatic activation.
-
-**Important:** You do **not** need to run `pip install -e .` again when you open a new terminal. That step is one-time. Auto-activation only runs the activate step for you.
-
-#### macOS / Linux (zsh — default on modern macOS)
-
-Add this to `~/.zshrc` (open the file in a text editor, paste at the bottom, save):
-
-```bash
-# Auto-activate .venv when entering a project folder
-_auto_venv() {
-  if [[ -f .venv/bin/activate ]]; then
-    if [[ "$VIRTUAL_ENV" != "$PWD/.venv" ]]; then
-      source .venv/bin/activate
-    fi
-  elif [[ -n "$VIRTUAL_ENV" && "$VIRTUAL_ENV" != "$PWD/.venv" ]]; then
-    deactivate 2>/dev/null
-  fi
-}
-chpwd_functions+=(_auto_venv)
-_auto_venv
-```
-
-Then reload your shell:
-
-```bash
-source ~/.zshrc
-```
-
-From now on, whenever you `cd` into `slowphase-okr` (or any folder that contains a `.venv`), the environment activates automatically and you should see `(.venv)` in your prompt.
-
-#### macOS / Linux (bash)
-
-Add the same block to `~/.bashrc` instead of `~/.zshrc`, but replace the last two lines with:
-
-```bash
-cd() {
-  builtin cd "$@" || return
-  if [[ -f .venv/bin/activate ]]; then
-    source .venv/bin/activate
-  fi
-}
-```
-
-#### Windows (PowerShell)
-
-Add this to your PowerShell profile (run `notepad $PROFILE` — create the file if prompted):
-
-```powershell
-function Enter-VenvIfPresent {
-    if (Test-Path .venv\Scripts\Activate.ps1) {
-        . .venv\Scripts\Activate.ps1
-    }
-}
-function cd {
-    param([string]$Path)
-    if ($Path) { Set-Location $Path } else { Set-Location $HOME }
-    Enter-VenvIfPresent
-}
-Enter-VenvIfPresent
-```
-
-Open a new PowerShell window after saving.
-
-#### Alternative: direnv
-
-If you use [direnv](https://direnv.net/), create a file named `.envrc` in the project root:
-
-```bash
-source .venv/bin/activate
-```
-
-Then run `direnv allow` once in that folder. direnv will activate the venv whenever you enter the directory.
+This installs the app and its dependencies into your normal Python. You only need to do this once (or again after updating the code).
 
 ### Step 4 — Run the app
 
-#### First time (right after Step 3)
-
-If you just finished installing, the virtual environment should already be active — you will see `(.venv)` at the start of your terminal line. Run:
+Open a terminal and run:
 
 ```bash
 slowphase-okr
 ```
 
-A window should open.
+A window should open. After install, you can run this from any folder — you do not need to `cd` into the project each time.
 
-#### Every time after that (new terminal window)
-
-You only need **three steps**. You do **not** run `pip install` again.
-
-1. Open **Terminal** (macOS/Linux) or **PowerShell** / **Command Prompt** (Windows).
-2. Go to the project folder and **activate** the virtual environment.
-3. Start the app.
-
-**macOS / Linux** — replace the folder path with where yours lives:
+**If `slowphase-okr` does not work**, try:
 
 ```bash
-cd ~/Desktop/slowphase-okr
-source .venv/bin/activate
-slowphase-okr
+python3 -m slowphase_okr
 ```
 
-After step 2, your prompt should start with `(.venv)`. That means you are ready for step 3.
-
-**Windows (PowerShell)**:
-
-```powershell
-cd $env:USERPROFILE\Desktop\slowphase-okr
-.venv\Scripts\Activate.ps1
-slowphase-okr
-```
-
-**Windows (Command Prompt)**:
-
-```cmd
-cd %USERPROFILE%\Desktop\slowphase-okr
-.venv\Scripts\activate.bat
-slowphase-okr
-```
-
-**If `slowphase-okr` does not work**, try this instead (with the venv still active):
-
-```bash
-python -m slowphase_okr
-```
-
-On macOS/Linux you can also use `python3 -m slowphase_okr`.
-
-Closing the terminal or quitting the app does **not** uninstall anything. The next time, just repeat the three steps above. To skip the activate step automatically, see [Step 3b](#step-3b--auto-activate-the-virtual-environment-optional).
+On Windows, use `py -m slowphase_okr` if needed.
 
 If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 
@@ -262,13 +123,10 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 | Problem | What to try |
 |---------|-------------|
 | `python3` or `py` not found | Install Python from [python.org](https://www.python.org/downloads/). On Windows, reinstall with **Add to PATH** checked. |
-| `pip` not found | Run `python3 -m pip install -e .` (macOS/Linux) or `py -m pip install -e .` (Windows) |
-| PowerShell blocks activation | Use Command Prompt with `activate.bat`, or see the PowerShell note in Step 1 |
+| `pip` not found | Run `python3 -m pip install -e .` (macOS/Linux) or `py -m pip install -e .` (Windows) from the project folder |
 | `No module named '_tkinter'` (Linux) | Run `sudo apt install python3-tk` (Ubuntu) or install the tk package for your distro |
-| App opens then closes immediately | Run `python -m slowphase_okr` from the terminal to see the error message |
-| `slowphase-okr` command not found | Make sure the virtual environment is activated (`(.venv)` in your prompt), then try `python -m slowphase_okr` |
-| Have to activate venv every new terminal | See [Step 3b](#step-3b--auto-activate-the-virtual-environment-optional) for auto-activation |
-| Re-running `pip install` after closing terminal | Not needed — `pip install -e .` is one-time. Only activate the venv again (or set up auto-activation) |
+| App opens then closes immediately | Run `python3 -m slowphase_okr` (or `py -m slowphase_okr` on Windows) from the terminal to see the error message |
+| `slowphase-okr` command not found | Try `python3 -m slowphase_okr` / `py -m slowphase_okr`, or re-run Step 3 (`pip install -e .`) |
 
 ## Workflow
 
