@@ -88,6 +88,8 @@ def test_load_okr_log(tmp_path: Path):
     log = tmp_path / "OKR_Log_test.txt"
     log.write_text(
         "# OKR Condition Log\n"
+        "# StimulusName: Comb4 Block3 RE Increment White Dots\n"
+        "# StimulusEyePatch: Left\n"
         "eventIndex\teventType\teyePatch\tcontrastBlockIndex\tdotColor\t"
         "direction\tcontrastLevel\tdotStartSize\temissionRate\tusePersistentDots\t"
         "sessionContrastThreshold\tthresholdMultiplier\tisAnchor100\tstartTime\tendTime\n"
@@ -96,17 +98,63 @@ def test_load_okr_log(tmp_path: Path):
         "3\tFixationITI\tLeft\t0\tNA\tNA\tNA\tNA\tNA\t0\t0\t0\t0\t85.41\t89.4\n"
         "6\tContrastBlock\tLeft\t2\tWhite\tDown\t0.1525\t0.7\t20000\t0\t0.076\t2\t0\t108.44\t123.4\n"
         "7\tCustomStimulusBlock\tLeft\t3\tWhite\tUp\t0.3\t0.7\t20000\t0\t0.076\t4\t0\t130.0\t145.0\n"
+        "8\tAnchor100FlickerBlock\tLeft\t4\tWhite\tUp\t1.0\t0.7\t20000\t0\t0.076\tNA\t1\t150.0\t165.0\n"
     )
     okr = load_okr_log(log)
-    assert len(okr.block_markers) == 3
+    assert len(okr.block_markers) == 4
     assert len(okr.fixation_markers) == 2
+    assert okr.stimulus_name == "Comb4 Block3 RE Increment White Dots"
+    assert okr.stimulus_eye_patch == "Left"
     assert okr.block_markers[0].start_time == pytest.approx(70.42)
+    assert okr.block_markers[0].end_time == pytest.approx(85.4)
     assert okr.block_markers[0].label == "B0↑"
+    assert okr.block_markers[0].use_persistent_dots is True
+    assert okr.block_markers[0].is_anchor100 is True
     assert okr.block_markers[1].label == "B2↓"
+    assert okr.block_markers[1].threshold_multiplier == pytest.approx(2.0)
     assert okr.block_markers[2].event_type == "CustomStimulusBlock"
     assert okr.block_markers[2].label == "B3↑"
+    assert okr.block_markers[3].event_type == "Anchor100FlickerBlock"
+    assert okr.block_markers[3].use_persistent_dots is False
     assert okr.fixation_markers[0].event_type == "InitialFixation"
     assert okr.fixation_markers[1].start_time == pytest.approx(85.41)
+
+
+def test_condition_at_time(tmp_path: Path):
+    from slowphase_okr.okr_log import condition_at_time
+
+    log = tmp_path / "OKR_Log_test.txt"
+    log.write_text(
+        "# OKR Condition Log\n"
+        "# StimulusName: Comb4 Block3 RE Increment White Dots\n"
+        "eventIndex\teventType\teyePatch\tcontrastBlockIndex\tdotColor\t"
+        "direction\tcontrastLevel\tdotStartSize\temissionRate\tusePersistentDots\t"
+        "sessionContrastThreshold\tthresholdMultiplier\tisAnchor100\tstartTime\tendTime\n"
+        "1\tInitialFixation\tLeft\tNA\tNA\tNA\tNA\tNA\tNA\t0\t0\t0\t0\t66.4\t70.4\n"
+        "2\tAnchor100PersistentBlock\tLeft\t0\tWhite\tUp\t1.0\t0.7\t3000\t1\t0.076\tNA\t1\t70.42\t85.4\n"
+        "6\tContrastBlock\tLeft\t2\tWhite\tDown\t0.1525\t0.7\t20000\t0\t0.076\t2\t0\t108.44\t123.4\n"
+        "8\tAnchor100FlickerBlock\tLeft\t3\tWhite\tUp\t1.0\t0.7\t20000\t0\t0.076\tNA\t1\t130.0\t145.0\n"
+    )
+    okr = load_okr_log(log)
+    text = condition_at_time(okr, 75.0)
+    assert "Session: Increment · White dots" in text
+    assert "B0" in text
+    assert "Up" in text
+    assert "Persistent" in text
+    assert "contrast 1" in text
+
+    text_down = condition_at_time(okr, 110.0)
+    assert "B2" in text_down
+    assert "Down" in text_down
+    assert "Flicker" in text_down
+    assert "2×T" in text_down
+
+    text_flicker = condition_at_time(okr, 135.0)
+    assert "Flicker" in text_flicker
+    assert "B3" in text_flicker
+
+    text_fix = condition_at_time(okr, 68.0)
+    assert "Initial fixation" in text_fix
 
 
 def test_median_gain():

@@ -171,6 +171,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **JSON autosave** | Saves accepted segments to `{trial_id}_slowphase_okr_autosave.json`; restore on reload |
 | **Reload guard** | Confirms before discarding accepted or proposed segments |
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray) |
+| **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
 | **Invalid gaze samples** | `(NaN, NaN, NaN)` lines stay aligned but are skipped for clicking and fitting |
 | **Parameter tooltips** | Hover auto-detect settings in the app for plain-language help |
 
@@ -266,6 +267,8 @@ Older stimulus versions did not write this file. If your session includes an OKR
 | Anything else | Purple dashed line — contrast block start (label e.g. `B2↓`) |
 
 Block labels use `contrastBlockIndex` and direction when available. New block event names are detected automatically without updating the app.
+
+**Condition readout:** With an OKR log loaded, a line under the plot shows the condition at the hovered time (or the center of the current view): contrast level, direction, flicker vs persistent, and session tags from `StimulusName` (e.g. Increment / Decrement, White / Black dots).
 
 **Example filenames:** `OKR_Log_Patient_Testing.txt` or similar in the same folder as gaze/time files.
 

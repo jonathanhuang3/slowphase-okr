@@ -39,7 +39,7 @@ from slowphase_okr.gaze import (
     infer_viewing_eye,
     load_ush2a_trial,
 )
-from slowphase_okr.okr_log import OkrLog, load_okr_log
+from slowphase_okr.okr_log import OkrLog, condition_at_time, load_okr_log
 
 
 HELP_TEXT = """Keyboard shortcuts
@@ -71,6 +71,8 @@ Notes
   • R² is logged and exported but segments are not auto-rejected.
   • Annotations autosave to JSON in the trial folder; restore on reload.
   • Optional OKR log marks contrast-block and fixation-cross start times on the plot.
+  • With an OKR log loaded, the condition line under the plot shows contrast, direction,
+    flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time.
   • Auto-detect proposes segments (blue); review, nudge, accept (A), or delete.
 
 Auto-detect review
@@ -666,6 +668,16 @@ class AnnotatorApp:
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        self.condition_var = tk.StringVar(value="")
+        ttk.Label(
+            self.plot_frame,
+            textvariable=self.condition_var,
+            padding=(0, 2),
+            foreground="#4a3f6b",
+            anchor=tk.W,
+            wraplength=900,
+        ).pack(side=tk.BOTTOM, fill=tk.X)
+
         self.hover_var = tk.StringVar(value="")
         ttk.Label(
             self.plot_frame,
@@ -865,14 +877,31 @@ class AnnotatorApp:
             return "Hover a data point to preview where a click will snap."
         return ""
 
+    def _update_condition_display(self, t: float | None = None) -> None:
+        """Show OKR condition for time ``t``, or the center of the current view."""
+        if self.okr_log is None:
+            self.condition_var.set("")
+            return
+        if t is None:
+            if self.view_xmin is not None and self.view_xmax is not None:
+                t = (self.view_xmin + self.view_xmax) / 2
+            elif self.trial is not None:
+                t = float(self.trial.times[0])
+            else:
+                self.condition_var.set("")
+                return
+        self.condition_var.set(f"Condition @ {t:.2f} s: {condition_at_time(self.okr_log, t)}")
+
     def _set_hover(self, idx: int | None) -> None:
         if idx is None:
             self._hover_idx = None
             self.hover_var.set(self._hover_hint())
+            self._update_condition_display()
             self._clear_hover_artists()
             return
         assert self.trial is not None
         t = float(self._active_times()[idx])
+        self._update_condition_display(t)
         value = float(self._active_values()[idx])
         value_label = (
             f"elevation = {value:.2f}°"
@@ -1023,7 +1052,14 @@ class AnnotatorApp:
             self.okr_log = None
         self._update_files_label()
         if self.trial is not None:
+            self._update_condition_display()
             self._redraw()
+        elif self.okr_log is not None:
+            self._update_condition_display(
+                self.okr_log.block_markers[0].start_time
+                if self.okr_log.block_markers
+                else None
+            )
 
     def _parse_okr_log(self, show_error: bool = False) -> bool:
         if not self.okr_log_path:
@@ -1297,6 +1333,7 @@ class AnnotatorApp:
                 )
             self._set_status(status)
             self.hover_var.set(self._hover_hint())
+            self._update_condition_display()
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
 
@@ -2195,9 +2232,11 @@ class AnnotatorApp:
 
         if self._hover_idx is not None:
             self._draw_hover_highlight(self._hover_idx)
+            self._update_condition_display(float(self._active_times()[self._hover_idx]))
         else:
             self.canvas.draw_idle()
             self.hover_var.set(self._hover_hint())
+            self._update_condition_display()
 
     def _draw_okr_log_markers(self, vx0: float, vx1: float) -> None:
         if self.okr_log is None:
