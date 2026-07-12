@@ -67,6 +67,8 @@ Other
 Notes
   • Analysis window spans the full trial (first to last timestamp).
   • Signal menu: elevation (rotated gaze) or SRanipal pupil X/Y for an alternate gain trace.
+  • Zero elev at start: subtract elevation at the first valid sample so the trace starts at 0°
+    (removes headset pose offset; slopes and gains are unchanged).
   • Pupil gain uses the same slope / stimulus-velocity formula; slopes are in normalized pupil units/s.
   • R² is logged and exported but segments are not auto-rejected.
   • Annotations autosave to JSON in the trial folder; restore on reload.
@@ -295,7 +297,20 @@ class AnnotatorApp:
         if mode == self.SIGNAL_PUPIL_X:
             assert self.trial.pupil is not None
             return self.trial.pupil.x
-        return self.trial.elevation_deg
+        elev = self.trial.elevation_deg
+        return elev - self._elevation_zero_offset()
+
+    def _elevation_zero_offset(self) -> float:
+        """Offset so first valid elevation sample is 0° when the view option is on."""
+        if not getattr(self, "zero_elevation_var", None) or not self.zero_elevation_var.get():
+            return 0.0
+        if self.trial is None or self._signal_mode() != self.SIGNAL_ELEVATION:
+            return 0.0
+        elev = self.trial.elevation_deg
+        finite = elev[np.isfinite(elev)]
+        if finite.size == 0:
+            return 0.0
+        return float(finite[0])
 
     def _signal_plot_label(self) -> str:
         mode = self._signal_mode()
@@ -303,10 +318,14 @@ class AnnotatorApp:
             return "Pupil Y"
         if mode == self.SIGNAL_PUPIL_X:
             return "Pupil X"
+        if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
+            return "Elevation (zeroed)"
         return "Elevation"
 
     def _signal_y_label(self) -> str:
         if self._signal_mode() == self.SIGNAL_ELEVATION:
+            if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
+                return "Elevation (deg, zeroed at start)"
             return "Elevation (deg)"
         return "Pupil position (norm.)"
 
@@ -357,9 +376,30 @@ class AnnotatorApp:
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
             self._set_status("Cleared pending segment after signal change.")
+        self._sync_zero_elevation_control()
         self._refit_all_segments()
         self._update_signal_ylim()
         self._redraw()
+
+    def _sync_zero_elevation_control(self) -> None:
+        """Enable zeroing only for elevation (not pupil X/Y)."""
+        if self._signal_mode() == self.SIGNAL_ELEVATION:
+            self.zero_elevation_chk.configure(state=tk.NORMAL)
+        else:
+            self.zero_elevation_chk.configure(state=tk.DISABLED)
+
+    def _on_zero_elevation_toggled(self) -> None:
+        if self.pending_start_idx is not None or self.pending_fit is not None:
+            self._clear_pending(redraw=False)
+        self._refit_all_segments()
+        self._update_signal_ylim()
+        self._redraw()
+        if self.zero_elevation_var.get():
+            self._set_status(
+                "Elevation zeroed at first valid sample (display + fits; slopes/gains unchanged)."
+            )
+        else:
+            self._set_status("Showing absolute elevation.")
 
     def _refit_all_segments(self) -> None:
         if self.trial is None:
@@ -459,6 +499,14 @@ class AnnotatorApp:
         )
         self.signal_combo.pack(side=tk.LEFT, padx=(4, 0))
         self.signal_combo.bind("<<ComboboxSelected>>", self._on_signal_selected)
+        self.zero_elevation_var = tk.BooleanVar(value=True)
+        self.zero_elevation_chk = ttk.Checkbutton(
+            signal_row,
+            text="Zero elev at start",
+            variable=self.zero_elevation_var,
+            command=self._on_zero_elevation_toggled,
+        )
+        self.zero_elevation_chk.pack(side=tk.LEFT, padx=(10, 0))
         self.pupil_file_label = ttk.Label(top, text="")
         self.pupil_file_label.grid(row=6, column=0, columnspan=3, sticky=tk.W, padx=4)
 
@@ -1303,6 +1351,7 @@ class AnnotatorApp:
             self.analysis_t1 = t1
             self.window_mask = analysis_window_mask(self.trial.times, t0, t_end=t1)
             self._update_pupil_signal_options()
+            self._sync_zero_elevation_control()
             self._update_signal_ylim()
             self.segments.clear()
             self.proposed_segments.clear()
@@ -1311,6 +1360,7 @@ class AnnotatorApp:
             self.view_var.set("2 s")
             self._reset_view()
             self._try_restore_autosave(trial_id)
+            self._update_signal_ylim()
             self._refresh_segment_list()
             if self.okr_log_path and not self._parse_okr_log(show_error=True):
                 self.okr_log_path = None

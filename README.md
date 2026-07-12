@@ -162,6 +162,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 |---------|-------------|
 | **Analysis window** | Full trial — first timestamp to last timestamp |
 | **Signal source** | Elevation from rotated gaze, or SRanipal pupil X/Y (auto-loaded from trial folder) |
+| **Zero elev at start** | Optional (on by default). Subtracts elevation at the first valid sample so the trace starts at 0° — removes headset pose offset. Slopes and gains are unchanged. |
 | **Fixed y-axis** | Signal scale stays fixed to the full trial while you pan in time |
 | **Segment list** | Shows proposed (`?`) and accepted (`✓`) segments sorted by time |
 | **Segment labels** | `#N` on accepted (green), `?N` on proposed (blue) segments in the plot |
