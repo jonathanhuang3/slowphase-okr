@@ -70,7 +70,7 @@ sudo apt install python3 python3-pip python3-tk
 If you have [Git](https://git-scm.com/downloads) installed:
 
 ```bash
-git clone https://github.com/jonathanhuang/slowphase-okr.git
+git clone https://github.com/jonathanhuang3/slowphase-okr.git
 cd slowphase-okr
 ```
 
