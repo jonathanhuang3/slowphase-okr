@@ -23,6 +23,7 @@ from slowphase_okr.autosave import (
     save_autosave,
     segments_from_autosave,
 )
+from slowphase_okr.prefs import get_annotations_dir, set_annotations_dir
 from slowphase_okr.detect import DetectParams, detect_slow_phases
 from slowphase_okr.export import export_to_excel
 from slowphase_okr.fit import (
@@ -71,7 +72,8 @@ Notes
     (removes headset pose offset; slopes and gains are unchanged).
   • Pupil gain uses the same slope / stimulus-velocity formula; slopes are in normalized pupil units/s.
   • R² is logged and exported but segments are not auto-rejected.
-  • Annotations autosave to JSON in the trial folder; restore on reload.
+  • Load trial prompts for an annotations folder if none is set, so markings
+    autosave to your personal folder. Use Load markings… for a prior JSON.
   • Optional OKR log marks contrast-block and fixation-cross start times on the plot.
   • With an OKR log loaded, the condition line under the plot shows contrast, direction,
     flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time.
@@ -260,12 +262,14 @@ class AnnotatorApp:
         self._signal_label_map = {mode: label for label, mode in self.SIGNAL_CHOICES}
         self.view_xmin: float | None = None
         self.view_xmax: float | None = None
+        self.annotations_dir: Path | None = get_annotations_dir()
 
         self._build_controls()
         self._build_main_area()
         self._build_plot()
         self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._update_annotations_folder_label()
         self._set_status("Load gaze and time files to begin.")
 
     @property
@@ -509,6 +513,21 @@ class AnnotatorApp:
         self.zero_elevation_chk.pack(side=tk.LEFT, padx=(10, 0))
         self.pupil_file_label = ttk.Label(top, text="")
         self.pupil_file_label.grid(row=6, column=0, columnspan=3, sticky=tk.W, padx=4)
+
+        ann_row = ttk.Frame(top)
+        ann_row.grid(row=7, column=0, columnspan=5, sticky=tk.W, padx=4, pady=(4, 0))
+        ttk.Button(
+            ann_row,
+            text="Annotations folder…",
+            command=self._browse_annotations_folder,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            ann_row,
+            text="Load markings…",
+            command=self._load_markings_json,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        self.annotations_folder_label = ttk.Label(ann_row, text="")
+        self.annotations_folder_label.pack(side=tk.LEFT, padx=(8, 0))
 
         view_row = ttk.Frame(top)
         view_row.grid(row=2, column=3, columnspan=2, rowspan=2, sticky=tk.W, padx=4, pady=2)
@@ -1206,14 +1225,66 @@ class AnnotatorApp:
             icon="warning",
         )
 
+    def _update_annotations_folder_label(self) -> None:
+        if self.annotations_dir is None:
+            text = "Save folder: not set (required for autosave; use a personal folder)"
+        else:
+            text = f"Save folder: {self.annotations_dir}"
+        self.annotations_folder_label.config(text=text)
+
+    def _browse_annotations_folder(self) -> None:
+        initial = str(self.annotations_dir) if self.annotations_dir else str(Path.home())
+        path = filedialog.askdirectory(
+            title="Choose folder for your markings JSON (personal, not shared Box data)",
+            initialdir=initial,
+        )
+        if not path:
+            return
+        self.annotations_dir = set_annotations_dir(path)
+        self._update_annotations_folder_label()
+        self._set_status(f"Annotations will save to {self.annotations_dir}")
+
+    def _prompt_annotations_folder_if_needed(self, *, on_load: bool = False) -> Path | None:
+        """Ensure a personal save folder is set; prompt whenever missing."""
+        if self.annotations_dir is not None:
+            return self.annotations_dir
+        headline = (
+            "Before you mark this trial, choose where your markings JSON "
+            "will be saved."
+            if on_load
+            else "Choose where your markings JSON will be saved."
+        )
+        messagebox.showinfo(
+            "Set annotations folder",
+            f"{headline}\n\n"
+            "Use a personal folder (not the shared Box trial folder) so "
+            "others working on the same data won’t see or overwrite your marks.\n\n"
+            "You’ll be asked to pick a folder next.",
+        )
+        self._browse_annotations_folder()
+        if self.annotations_dir is None:
+            messagebox.showwarning(
+                "Annotations folder not set",
+                "No save folder was chosen. Accepted segments will not "
+                "autosave until you set one with Annotations folder…",
+            )
+        return self.annotations_dir
+
+    def _ensure_annotations_dir(self) -> Path | None:
+        return self._prompt_annotations_folder_if_needed(on_load=False)
+
     def _autosave_file(self) -> Path | None:
-        if not self.gaze_path:
+        if not self.gaze_path or self.annotations_dir is None:
             return None
         trial_id = self.trial_id_var.get().strip() or self.gaze_path.parent.name
-        return autosave_path(self.gaze_path.parent, trial_id)
+        if self.trial is not None:
+            trial_id = self.trial.trial_id
+        return autosave_path(self.annotations_dir, trial_id)
 
     def _write_autosave(self) -> None:
         if not self.gaze_path or not self.time_path or not self.trial:
+            return
+        if self._ensure_annotations_dir() is None:
             return
         path = self._autosave_file()
         if path is None:
@@ -1233,28 +1304,91 @@ class AnnotatorApp:
             signal_mode=self._signal_mode(),
         )
 
-    def _try_restore_autosave(self, trial_id: str) -> None:
-        if not self.gaze_path or not self.time_path:
+    def _load_markings_json(self) -> None:
+        if self.trial is None or not self.gaze_path or not self.time_path:
+            messagebox.showwarning(
+                "No trial loaded",
+                "Load a trial first, then load markings for that trial.",
+            )
             return
-        path = autosave_path(self.gaze_path.parent, trial_id)
+        initial = (
+            str(self.annotations_dir)
+            if self.annotations_dir
+            else str(self.gaze_path.parent)
+        )
+        path = filedialog.askopenfilename(
+            title="Load markings JSON",
+            initialdir=initial,
+            filetypes=[
+                ("Markings JSON", "*.json"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
         data = load_autosave(path)
         if data is None:
+            messagebox.showerror("Load failed", f"Could not read markings from:\n{path}")
             return
-        if not autosave_matches_trial(
-            data,
-            str(self.gaze_path.resolve()),
-            str(self.time_path.resolve()),
-        ):
+        if not self._confirm_discard_work("Replace with markings from this file"):
+            return
+        self._apply_autosave_data(data, source_label=Path(path).name, require_match=False)
+
+    def _try_restore_autosave(self, trial_id: str) -> None:
+        """Offer restore only from the personal annotations folder (not Box trial data)."""
+        if not self.gaze_path or not self.time_path or self.annotations_dir is None:
+            return
+        path = autosave_path(self.annotations_dir, trial_id)
+        data = load_autosave(path)
+        if data is None:
             return
         restored = segments_from_autosave(data)
         if not restored:
             return
         n = len(restored)
         if not messagebox.askyesno(
-            "Restore autosave",
-            f"Found autosave with {n} segment(s) for this trial.\nRestore?",
+            "Restore markings",
+            f"Found {n} segment(s) in your annotations folder for this trial.\n"
+            f"File: {path.name}\n\nRestore?",
         ):
             return
+        self._apply_autosave_data(data, source_label=path.name, require_match=True)
+
+    def _apply_autosave_data(
+        self,
+        data: dict,
+        *,
+        source_label: str,
+        require_match: bool,
+    ) -> None:
+        if not self.gaze_path or not self.time_path:
+            return
+        gaze_src = str(self.gaze_path.resolve())
+        time_src = str(self.time_path.resolve())
+        matched = autosave_matches_trial(data, gaze_src, time_src)
+        if not matched:
+            saved_gaze = data.get("gaze_source", "(unknown)")
+            saved_time = data.get("time_source", "(unknown)")
+            if require_match:
+                messagebox.showwarning(
+                    "Markings mismatch",
+                    "This JSON does not match the loaded gaze/time files "
+                    "(paths differ). Not restored.\n\n"
+                    f"JSON gaze: {saved_gaze}\n"
+                    f"JSON time: {saved_time}",
+                )
+                return
+            if not messagebox.askyesno(
+                "Markings mismatch",
+                "Gaze/time paths in this JSON differ from the loaded trial "
+                "(common if Box sync paths differ across machines).\n\n"
+                "Load segments anyway?\n\n"
+                f"JSON gaze: {saved_gaze}\n"
+                f"Current gaze: {gaze_src}",
+                icon="warning",
+            ):
+                return
+        restored = segments_from_autosave(data)
         self.segments = restored
         vel = data.get("stimulus_velocity")
         if vel is not None:
@@ -1277,10 +1411,15 @@ class AnnotatorApp:
         self._clear_pending(redraw=False)
         self._refresh_segment_list()
         self._redraw()
-        med = trial_summary_median_gain(self.segments)
-        self._set_status(
-            f"Restored {n} segment(s) from autosave. Trial median gain={med:.3f}"
-        )
+        n = len(restored)
+        med = trial_summary_median_gain(self.segments) if restored else float("nan")
+        if restored:
+            self._set_status(
+                f"Loaded {n} segment(s) from {source_label}. "
+                f"Trial median gain={med:.3f}"
+            )
+        else:
+            self._set_status(f"Loaded {source_label}: no segments in file.")
 
     def _apply_stimulus_velocity(self, _event=None) -> None:
         try:
@@ -1359,6 +1498,7 @@ class AnnotatorApp:
             self._clear_pending(redraw=False)
             self.view_var.set("2 s")
             self._reset_view()
+            self._prompt_annotations_folder_if_needed(on_load=True)
             self._try_restore_autosave(trial_id)
             self._update_signal_ylim()
             self._refresh_segment_list()

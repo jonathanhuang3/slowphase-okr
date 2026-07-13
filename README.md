@@ -118,6 +118,43 @@ On Windows, use `py -m slowphase_okr` if needed.
 
 If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 
+### Stay up to date (do this each time before you annotate)
+
+The version is shown in the window title (e.g. `slowphase-okr v0.2.5`). To pull the latest code before you open the app:
+
+**If you cloned with Git (recommended)**
+
+Open a terminal in the project folder and run:
+
+**macOS / Linux**
+
+```bash
+cd ~/Desktop/slowphase-okr
+git pull
+slowphase-okr
+```
+
+**Windows**
+
+```powershell
+cd $env:USERPROFILE\Desktop\slowphase-okr
+git pull
+slowphase-okr
+```
+
+`git pull` downloads updates from GitHub. Then launch the app as usual.
+
+**GitHub Desktop:** open the `slowphase-okr` repository → click **Fetch origin** / **Pull origin**, then run `slowphase-okr` from a terminal.
+
+**If you installed from a ZIP download**
+
+1. Download a fresh ZIP from the GitHub repo (**Code** → **Download ZIP**)
+2. Replace your old folder (or unzip to a new location)
+3. Run `python3 -m pip install -e .` (or `py -m pip install -e .` on Windows) from that folder again
+4. Run `slowphase-okr`
+
+ZIP installs do not update automatically — prefer cloning with Git if you annotate often.
+
 ## Troubleshooting
 
 | Problem | What to try |
@@ -127,6 +164,7 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 | `No module named '_tkinter'` (Linux) | Run `sudo apt install python3-tk` (Ubuntu) or install the tk package for your distro |
 | App opens then closes immediately | Run `python3 -m slowphase_okr` (or `py -m slowphase_okr` on Windows) from the terminal to see the error message |
 | `slowphase-okr` command not found | Try `python3 -m slowphase_okr` / `py -m slowphase_okr`, or re-run Step 3 (`pip install -e .`) |
+| Features from README are missing | You’re likely on an old copy — see [Stay up to date](#stay-up-to-date-do-this-each-time-before-you-annotate) (`git pull` + `pip install -e .`) |
 
 ## Workflow
 
@@ -169,7 +207,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Edit segments** | Delete selected (`Del`), undo last (`U`), drag edges on plot, nudge boundaries (`[ ]` start, `, .` end) |
 | **Auto-detect** | Sliding-window detector proposes slow phases for manual review (see below) |
 | **Stimulus velocity** | Editable anytime. Enter recalculates gains for all segments. |
-| **JSON autosave** | Saves accepted segments to `{trial_id}_slowphase_okr_autosave.json`; restore on reload |
+| **JSON markings** | Save/load accepted segments as `{trial_id}_slowphase_okr_autosave.json` in a **personal annotations folder** (not the shared Box trial folder). Use **Annotations folder…** and **Load markings…**. Load trial starts unmarked unless your folder has a matching file. |
 | **Reload guard** | Confirms before discarding accepted or proposed segments |
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray) |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
@@ -179,6 +217,17 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 **R²** is displayed and written to Excel but segments are **not** auto-rejected.
 
 **Upward OKR:** negative slopes are flagged (`direction_upward = false`) but still exportable.
+
+### Multi-user markings (shared Box data)
+
+When several people annotate the same trial folders on Box, keep markings out of the shared trial folder:
+
+1. On **Load trial**, if no save folder is set yet, the app prompts you to choose one (you can also use **Annotations folder…** anytime). Pick a **personal** directory that you create (e.g. Desktop or a private Box folder under your name).
+2. Mark segments as usual — accepted segments autosave as `{trial_id}_slowphase_okr_autosave.json` in that folder.
+3. Later, **Load trial** then either accept the restore prompt (if a matching file is in your folder) or click **Load markings…** to pick any JSON.
+4. Without a personal folder / without loading JSON, the trial shows **no marked segments**.
+
+The annotations folder preference is remembered in `~/.slowphase_okr_prefs.json`.
 
 ## Keyboard shortcuts
 

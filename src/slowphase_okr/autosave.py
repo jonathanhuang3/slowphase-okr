@@ -12,9 +12,9 @@ from slowphase_okr.fit import SegmentFit
 AUTOSAVE_FILENAME_SUFFIX = "_slowphase_okr_autosave.json"
 
 
-def autosave_path(trial_dir: str | Path, trial_id: str) -> Path:
-    """Default autosave location beside the trial gaze files."""
-    return Path(trial_dir) / f"{trial_id}{AUTOSAVE_FILENAME_SUFFIX}"
+def autosave_path(directory: str | Path, trial_id: str) -> Path:
+    """Autosave JSON path: ``{directory}/{trial_id}_slowphase_okr_autosave.json``."""
+    return Path(directory) / f"{trial_id}{AUTOSAVE_FILENAME_SUFFIX}"
 
 
 def segment_to_dict(segment: SegmentFit) -> dict[str, Any]:

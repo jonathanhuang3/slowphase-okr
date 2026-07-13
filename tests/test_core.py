@@ -352,6 +352,7 @@ def test_refit_segment_by_time():
 def test_autosave_roundtrip(tmp_path: Path):
     from slowphase_okr.autosave import (
         autosave_matches_trial,
+        autosave_path,
         load_autosave,
         save_autosave,
         segments_from_autosave,
@@ -370,7 +371,7 @@ def test_autosave_roundtrip(tmp_path: Path):
         time_source=str(timef.resolve()),
         stimulus_velocity=31.0,
         segments=segments,
-        software_version="0.1.1",
+        software_version="0.2.5",
     )
     data = load_autosave(out)
     assert data is not None
@@ -378,3 +379,22 @@ def test_autosave_roundtrip(tmp_path: Path):
     restored = segments_from_autosave(data)
     assert len(restored) == 1
     assert restored[0].gain == pytest.approx(20.0 / 31.0)
+
+
+def test_autosave_path_uses_directory(tmp_path: Path):
+    from slowphase_okr.autosave import autosave_path
+
+    personal = tmp_path / "my_markings"
+    path = autosave_path(personal, "Patient016_LE")
+    assert path == personal / "Patient016_LE_slowphase_okr_autosave.json"
+
+
+def test_annotations_dir_prefs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from slowphase_okr import prefs
+
+    monkeypatch.setattr(prefs, "prefs_path", lambda: tmp_path / ".slowphase_okr_prefs.json")
+    assert prefs.get_annotations_dir() is None
+    chosen = prefs.set_annotations_dir(tmp_path / "markings")
+    assert chosen == (tmp_path / "markings").resolve()
+    assert prefs.get_annotations_dir() == chosen
+
