@@ -38,8 +38,6 @@ from slowphase_okr.fit import (
 from slowphase_okr.gaze import (
     GazeTrial,
     analysis_window_mask,
-    attach_sranipal_pupil,
-    infer_viewing_eye,
     load_ush2a_trial,
 )
 from slowphase_okr.okr_log import OkrLog, condition_at_time, load_okr_log
@@ -70,12 +68,11 @@ Other
 Notes
   • Use tab “1. Load trial” for files/velocity, then “2. Annotate” for the plot and table.
   • Analysis window spans the full trial (first to last timestamp).
-  • Signal menu: elevation (rotated gaze) or SRanipal pupil X/Y for an alternate gain trace.
+  • Signal is elevation from rotated gaze.
   • Zero elev at start: subtract elevation at the first valid sample so the trace starts at 0°
     (removes headset pose offset; slopes and gains are unchanged).
-  • Pupil gain uses the same slope / stimulus-velocity formula; slopes are in normalized pupil units/s.
   • R² is logged and exported but segments are not auto-rejected.
-  • Step 1: choose a personal annotations folder (create your own; not shared Box data).
+  • On Load trial: choose a personal annotations folder (not shared Box data), then files + velocity.
     Press Save segments to write JSON; use Load markings… to reopen a prior file.
   • If that JSON name already exists, you will be asked to save under a new name.
   • Trial ID is set from the gaze file’s parent folder name.
@@ -213,13 +210,6 @@ def _bind_tooltip(widget: tk.Widget, text: str) -> None:
 
 class AnnotatorApp:
     SIGNAL_ELEVATION = "elevation"
-    SIGNAL_PUPIL_Y = "pupil_y"
-    SIGNAL_PUPIL_X = "pupil_x"
-    SIGNAL_CHOICES = (
-        ("Elevation (rotated gaze)", SIGNAL_ELEVATION),
-        ("Pupil Y (SRanipal)", SIGNAL_PUPIL_Y),
-        ("Pupil X (SRanipal)", SIGNAL_PUPIL_X),
-    )
 
     DEFAULT_VIEW_DURATION = 2.0
     VIEW_PRESET_LABELS = ("1 s", "2 s", "5 s", "10 s", "Full trial")
@@ -263,13 +253,10 @@ class AnnotatorApp:
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
         self.signal_ylim: tuple[float, float] | None = None
-        self._signal_mode_map = {label: mode for label, mode in self.SIGNAL_CHOICES}
-        self._signal_label_map = {mode: label for label, mode in self.SIGNAL_CHOICES}
         self.view_xmin: float | None = None
         self.view_xmax: float | None = None
         self.annotations_dir: Path | None = get_annotations_dir()
 
-        self._build_footer()
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4, 0))
 
@@ -286,8 +273,7 @@ class AnnotatorApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._update_annotations_folder_label()
         self._set_status(
-            "Open the Load trial tab: annotations folder → gaze → time → "
-            "velocity → Load trial, then switch to Annotate."
+            "Open the Load trial tab: complete sections 1–3, then Load trial."
         )
 
     def _on_notebook_tab_changed(self, _event=None) -> None:
@@ -304,38 +290,21 @@ class AnnotatorApp:
         return max(self.analysis_t1 - self.analysis_t0, self.MIN_VIEW_DURATION)
 
     def _signal_mode(self) -> str:
-        return self._signal_mode_map.get(
-            self.signal_var.get(), self.SIGNAL_ELEVATION
-        )
-
-    def _pupil_available(self) -> bool:
-        return self.trial is not None and self.trial.pupil is not None
+        return self.SIGNAL_ELEVATION
 
     def _active_times(self) -> np.ndarray:
         assert self.trial is not None
-        mode = self._signal_mode()
-        if mode in (self.SIGNAL_PUPIL_Y, self.SIGNAL_PUPIL_X):
-            assert self.trial.pupil is not None
-            return self.trial.pupil.times
         return self.trial.times
 
     def _active_values(self) -> np.ndarray:
         assert self.trial is not None
-        mode = self._signal_mode()
-        if mode == self.SIGNAL_PUPIL_Y:
-            assert self.trial.pupil is not None
-            return self.trial.pupil.y
-        if mode == self.SIGNAL_PUPIL_X:
-            assert self.trial.pupil is not None
-            return self.trial.pupil.x
-        elev = self.trial.elevation_deg
-        return elev - self._elevation_zero_offset()
+        return self.trial.elevation_deg - self._elevation_zero_offset()
 
     def _elevation_zero_offset(self) -> float:
         """Offset so first valid elevation sample is 0° when the view option is on."""
         if not getattr(self, "zero_elevation_var", None) or not self.zero_elevation_var.get():
             return 0.0
-        if self.trial is None or self._signal_mode() != self.SIGNAL_ELEVATION:
+        if self.trial is None:
             return 0.0
         elev = self.trial.elevation_deg
         finite = elev[np.isfinite(elev)]
@@ -344,26 +313,17 @@ class AnnotatorApp:
         return float(finite[0])
 
     def _signal_plot_label(self) -> str:
-        mode = self._signal_mode()
-        if mode == self.SIGNAL_PUPIL_Y:
-            return "Pupil Y"
-        if mode == self.SIGNAL_PUPIL_X:
-            return "Pupil X"
         if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
             return "Elevation (zeroed)"
         return "Elevation"
 
     def _signal_y_label(self) -> str:
-        if self._signal_mode() == self.SIGNAL_ELEVATION:
-            if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
-                return "Elevation (deg, zeroed at start)"
-            return "Elevation (deg)"
-        return "Pupil position (norm.)"
+        if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
+            return "Elevation (deg, zeroed at start)"
+        return "Elevation (deg)"
 
     def _signal_slope_unit(self) -> str:
-        if self._signal_mode() == self.SIGNAL_ELEVATION:
-            return "deg/s"
-        return "norm./s"
+        return "deg/s"
 
     def _analysis_mask(self) -> np.ndarray:
         if self.trial is None:
@@ -371,54 +331,6 @@ class AnnotatorApp:
         return analysis_window_mask(
             self._active_times(), self.analysis_t0, t_end=self.analysis_t1
         )
-
-    def _update_pupil_signal_options(self) -> None:
-        if self._pupil_available():
-            assert self.trial is not None and self.trial.pupil is not None
-            pupil = self.trial.pupil
-            self.signal_combo.configure(
-                state="readonly",
-                values=[label for label, _ in self.SIGNAL_CHOICES],
-            )
-            self.pupil_file_label.config(
-                text=(
-                    f"Pupil ({pupil.eye} eye): "
-                    f"{Path(pupil.source_position).name}, "
-                    f"{Path(pupil.source_time).name}"
-                )
-            )
-        else:
-            self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
-            self.signal_combo.configure(
-                state="readonly",
-                values=[self._signal_label_map[self.SIGNAL_ELEVATION]],
-            )
-            self.pupil_file_label.config(text="")
-
-    def _on_signal_selected(self, _event=None) -> None:
-        mode = self._signal_mode()
-        if mode != self.SIGNAL_ELEVATION and not self._pupil_available():
-            self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
-            messagebox.showwarning(
-                "Pupil data unavailable",
-                "No SRanipal pupil files were found for this trial.",
-            )
-            return
-        if self.pending_start_idx is not None or self.pending_fit is not None:
-            self._clear_pending(redraw=False)
-            self._set_status("Cleared pending segment after signal change.")
-        self._clear_interaction_state()
-        self._sync_zero_elevation_control()
-        self._refit_all_segments()
-        self._update_signal_ylim()
-        self._redraw()
-
-    def _sync_zero_elevation_control(self) -> None:
-        """Enable zeroing only for elevation (not pupil X/Y)."""
-        if self._signal_mode() == self.SIGNAL_ELEVATION:
-            self.zero_elevation_chk.configure(state=tk.NORMAL)
-        else:
-            self.zero_elevation_chk.configure(state=tk.DISABLED)
 
     def _on_zero_elevation_toggled(self) -> None:
         if self.pending_start_idx is not None or self.pending_fit is not None:
@@ -468,8 +380,9 @@ class AnnotatorApp:
         self.segments = refit_list(self.segments)
         self.proposed_segments = refit_list(self.proposed_segments)
 
-    def _build_footer(self) -> None:
-        footer = ttk.Frame(self.root)
+    def _build_annotate_footer(self) -> None:
+        """Annotation actions live only on the Annotate tab."""
+        footer = ttk.Frame(self.annotate_tab)
         footer.pack(side=tk.BOTTOM, fill=tk.X)
 
         action = ttk.Frame(footer, padding=(8, 4))
@@ -498,8 +411,7 @@ class AnnotatorApp:
 
         help_text = (
             "Click start then end of each upward slow phase (snaps to nearest data point). "
-            "Hover highlights the sample. Scroll to pan time. Use the tabs above to switch "
-            "between loading a trial and annotating."
+            "Hover highlights the sample. Scroll to pan time."
         )
         ttk.Label(footer, text=help_text, padding=(8, 0, 8, 4)).pack(
             side=tk.TOP, fill=tk.X
@@ -510,133 +422,149 @@ class AnnotatorApp:
         top.columnconfigure(0, weight=1)
 
         header = ttk.Frame(top)
-        header.grid(row=0, column=0, sticky=tk.EW, pady=(0, 4))
+        header.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
         header.columnconfigure(0, weight=1)
         ttk.Label(
             header,
-            text="Required steps first (left → right), then click Load trial. "
-            "Annotation happens on the Annotate tab.",
+            text="Fill in the items below, then press Load trial. "
+            "You will mark slow phases on the Annotate tab.",
             foreground="#444444",
-        ).pack(side=tk.LEFT)
+            wraplength=900,
+        ).pack(side=tk.LEFT, anchor=tk.W)
         ttk.Button(header, text="Help", command=self._show_help).pack(side=tk.RIGHT)
 
-        required = ttk.LabelFrame(
-            top,
-            text="Required — load trial data",
-            padding=6,
-        )
-        required.grid(row=1, column=0, sticky=tk.EW, pady=(0, 4))
+        # ── 1. Where to save ─────────────────────────────────────────
+        step1 = ttk.LabelFrame(top, text="1. Where to save your markings", padding=8)
+        step1.grid(row=1, column=0, sticky=tk.EW, pady=(0, 8))
+        step1.columnconfigure(1, weight=1)
 
-        ann_row = ttk.Frame(required)
-        ann_row.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(
-            ann_row,
-            text="1. Annotations folder…",
+            step1,
+            text="Choose folder…",
             command=self._browse_annotations_folder,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        self.annotations_folder_label = ttk.Label(ann_row, text="")
-        self.annotations_folder_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
+        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        self.annotations_folder_label = ttk.Label(
+            step1, text="", wraplength=780
+        )
+        self.annotations_folder_label.grid(row=0, column=1, sticky=tk.W)
         ttk.Label(
-            required,
-            text=(
-                "Create your own personal folder for markings (e.g. Desktop/okr_annotations_yourname). "
-                "Do not use the shared Box trial folder — each person needs their own save location."
-            ),
-            foreground="#6a4a00",
-            wraplength=980,
-        ).pack(side=tk.TOP, anchor=tk.W, pady=(2, 6))
+            step1,
+            text="Use a personal folder (e.g. Desktop/okr_annotations_YourName) — "
+            "not the shared Box trial data.",
+            foreground="#666666",
+            wraplength=900,
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
 
-        req_row = ttk.Frame(required)
-        req_row.pack(side=tk.TOP, fill=tk.X)
+        # ── 2. Trial files ───────────────────────────────────────────
+        step2 = ttk.LabelFrame(top, text="2. Trial files", padding=8)
+        step2.grid(row=2, column=0, sticky=tk.EW, pady=(0, 8))
+        step2.columnconfigure(1, weight=1)
 
-        ttk.Button(
-            req_row, text="2. Gaze file…", command=self._browse_gaze
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(
-            req_row, text="3. Time file…", command=self._browse_time
-        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(step2, text="Gaze file…", command=self._browse_gaze).grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 10), pady=(0, 4)
+        )
+        self.gaze_file_label = ttk.Label(step2, text="Not selected")
+        self.gaze_file_label.grid(row=0, column=1, sticky=tk.W, pady=(0, 4))
 
-        ttk.Label(req_row, text="4. Stimulus velocity (deg/s):").pack(side=tk.LEFT)
+        ttk.Button(step2, text="Time file…", command=self._browse_time).grid(
+            row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(0, 4)
+        )
+        self.time_file_label = ttk.Label(step2, text="Not selected")
+        self.time_file_label.grid(row=1, column=1, sticky=tk.W, pady=(0, 4))
+
+        self.trial_id_var = tk.StringVar(value="")
+        self.trial_id_label = ttk.Label(
+            step2,
+            text="Trial ID: (set automatically from folder names)",
+            foreground="#666666",
+            wraplength=900,
+        )
+        self.trial_id_label.grid(
+            row=2, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
+        )
+        self.trial_id_var.trace_add("write", self._on_trial_id_changed)
+
+        # ── 3. Stimulus velocity ─────────────────────────────────────
+        step3 = ttk.LabelFrame(top, text="3. Stimulus velocity", padding=8)
+        step3.grid(row=3, column=0, sticky=tk.EW, pady=(0, 8))
+
+        vel_row = ttk.Frame(step3)
+        vel_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(vel_row, text="Speed (deg/s):").pack(side=tk.LEFT)
         self.stim_vel_var = tk.StringVar(value="")
         self.stim_vel_entry = ttk.Entry(
-            req_row, textvariable=self.stim_vel_var, width=8
+            vel_row, textvariable=self.stim_vel_var, width=10
         )
-        self.stim_vel_entry.pack(side=tk.LEFT, padx=(4, 0))
-        self.stim_vel_applied_var = tk.StringVar(value="not set yet")
+        self.stim_vel_entry.pack(side=tk.LEFT, padx=(6, 8))
+        self.stim_vel_applied_var = tk.StringVar(value="required")
         self.stim_vel_status_label = ttk.Label(
-            req_row,
+            vel_row,
             textvariable=self.stim_vel_applied_var,
             foreground="#b25c00",
         )
-        self.stim_vel_status_label.pack(side=tk.LEFT, padx=(6, 12))
+        self.stim_vel_status_label.pack(side=tk.LEFT)
         self.stim_vel_entry.bind("<Return>", self._apply_stimulus_velocity)
         self.stim_vel_entry.bind("<FocusOut>", self._apply_stimulus_velocity_on_blur)
         self.stim_vel_var.trace_add("write", self._on_stimulus_velocity_edited)
         self._applied_stimulus_velocity = float("nan")
 
-        ttk.Button(
-            req_row, text="5. Load trial", command=self._load_trial
-        ).pack(side=tk.LEFT)
-
         ttk.Label(
-            required,
-            text=(
-                "Velocity is required for gain (slope ÷ velocity). "
-                "Enter the speed for this trial (e.g. 10, 20, or 30) before loading."
-            ),
-            foreground="#6a4a00",
-            wraplength=980,
-        ).pack(side=tk.TOP, anchor=tk.W, pady=(4, 0))
+            step3,
+            text="Enter this trial’s stimulus speed (e.g. 10, 20, or 30). "
+            "Gain = slope ÷ velocity.",
+            foreground="#666666",
+            wraplength=900,
+        ).pack(side=tk.TOP, anchor=tk.W, pady=(6, 0))
 
-        id_row = ttk.Frame(required)
-        id_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
-        ttk.Label(id_row, text="Trial ID (patient + condition folders):").pack(
-            side=tk.LEFT
+        # ── 4. Optional OKR log ──────────────────────────────────────
+        step4 = ttk.LabelFrame(
+            top, text="4. OKR log (optional — block / fixation markers)", padding=8
         )
-        self.trial_id_var = tk.StringVar(value="")
-        ttk.Entry(id_row, textvariable=self.trial_id_var, width=42).pack(
-            side=tk.LEFT, padx=(4, 0)
+        step4.grid(row=4, column=0, sticky=tk.EW, pady=(0, 8))
+        step4.columnconfigure(1, weight=1)
+
+        ttk.Button(step4, text="OKR log…", command=self._browse_okr_log).grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 10)
         )
+        self.okr_log_file_label = ttk.Label(step4, text="None (optional)")
+        self.okr_log_file_label.grid(row=0, column=1, sticky=tk.W)
 
-        self.gaze_file_label = ttk.Label(required, text="Gaze: (required)")
-        self.gaze_file_label.pack(side=tk.TOP, anchor=tk.W)
-        self.time_file_label = ttk.Label(required, text="Time: (required)")
-        self.time_file_label.pack(side=tk.TOP, anchor=tk.W)
-
-        optional = ttk.LabelFrame(
-            top,
-            text="Optional",
-            padding=6,
-        )
-        optional.grid(row=2, column=0, sticky=tk.EW)
-
-        opt_row = ttk.Frame(optional)
-        opt_row.pack(side=tk.TOP, fill=tk.X)
-
+        # ── Load ─────────────────────────────────────────────────────
+        load_row = ttk.Frame(top)
+        load_row.grid(row=5, column=0, sticky=tk.EW, pady=(4, 12))
         ttk.Button(
-            opt_row, text="OKR log…", command=self._browse_okr_log
-        ).pack(side=tk.LEFT, padx=(0, 4))
+            load_row,
+            text="Load trial",
+            command=self._load_trial,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            load_row,
+            text="Opens the Annotate tab when successful.",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        # ── Reopen prior work ────────────────────────────────────────
+        reopen = ttk.LabelFrame(
+            top, text="Already annotated this trial?", padding=8
+        )
+        reopen.grid(row=6, column=0, sticky=tk.EW)
         ttk.Button(
-            opt_row,
+            reopen,
             text="Load markings…",
             command=self._load_markings_json,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-
-        self.okr_log_file_label = ttk.Label(
-            optional, text="OKR log: (optional — block/fixation markers)"
-        )
-        self.okr_log_file_label.pack(side=tk.TOP, anchor=tk.W, pady=(4, 0))
-
-        go_row = ttk.Frame(top)
-        go_row.grid(row=3, column=0, sticky=tk.EW, pady=(12, 0))
-        ttk.Button(
-            go_row,
-            text="Go to Annotate tab →",
-            command=lambda: self.notebook.select(self.annotate_tab),
-        ).pack(side=tk.RIGHT)
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            reopen,
+            text="Open a saved JSON from your annotations folder "
+            "(after the trial above is loaded).",
+            foreground="#666666",
+            wraplength=780,
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
     def _build_annotate_tab(self) -> None:
+        # Footer first (BOTTOM) so Accept / Save / status stay under the plot.
+        self._build_annotate_footer()
+
         toolbar = ttk.Frame(self.annotate_tab, padding=(4, 4))
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
@@ -655,17 +583,6 @@ class AnnotatorApp:
             foreground="#333333",
         ).pack(side=tk.LEFT, padx=(0, 12))
 
-        ttk.Label(toolbar, text="Signal:").pack(side=tk.LEFT)
-        self.signal_var = tk.StringVar(value=self.SIGNAL_CHOICES[0][0])
-        self.signal_combo = ttk.Combobox(
-            toolbar,
-            textvariable=self.signal_var,
-            values=[label for label, _ in self.SIGNAL_CHOICES],
-            state="readonly",
-            width=22,
-        )
-        self.signal_combo.pack(side=tk.LEFT, padx=(4, 0))
-        self.signal_combo.bind("<<ComboboxSelected>>", self._on_signal_selected)
         self.zero_elevation_var = tk.BooleanVar(value=True)
         self.zero_elevation_chk = ttk.Checkbutton(
             toolbar,
@@ -673,7 +590,7 @@ class AnnotatorApp:
             variable=self.zero_elevation_var,
             command=self._on_zero_elevation_toggled,
         )
-        self.zero_elevation_chk.pack(side=tk.LEFT, padx=(8, 8))
+        self.zero_elevation_chk.pack(side=tk.LEFT, padx=(0, 8))
 
         ttk.Label(toolbar, text="Window:").pack(side=tk.LEFT)
         self.view_var = tk.StringVar(value="2 s")
@@ -692,9 +609,6 @@ class AnnotatorApp:
         ttk.Button(toolbar, text="Help", command=self._show_help).pack(
             side=tk.RIGHT, padx=4
         )
-
-        self.pupil_file_label = ttk.Label(self.annotate_tab, text="", padding=(4, 0))
-        self.pupil_file_label.pack(side=tk.TOP, anchor=tk.W)
 
         self.main_pane = ttk.PanedWindow(self.annotate_tab, orient=tk.HORIZONTAL)
         self.main_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -1127,11 +1041,7 @@ class AnnotatorApp:
         t = float(self._active_times()[idx])
         self._update_condition_display(t)
         value = float(self._active_values()[idx])
-        value_label = (
-            f"elevation = {value:.2f}°"
-            if self._signal_mode() == self.SIGNAL_ELEVATION
-            else f"{self._signal_plot_label().lower()} = {value:.4f}"
-        )
+        value_label = f"elevation = {value:.2f}°"
         if self.pending_fit is not None:
             self.hover_var.set(
                 f"t = {t:.3f} s, {value_label} — "
@@ -1208,36 +1118,35 @@ class AnnotatorApp:
             return "start"
         return "end"
 
+    def _on_trial_id_changed(self, *_args) -> None:
+        tid = self.trial_id_var.get().strip()
+        if tid:
+            self.trial_id_label.config(text=f"Trial ID: {tid}")
+        else:
+            self.trial_id_label.config(
+                text="Trial ID: (set automatically from folder names)"
+            )
+
     def _update_files_label(self) -> None:
         self.gaze_file_label.config(
-            text=(
-                f"Gaze: {self.gaze_path.name}"
-                if self.gaze_path
-                else "Gaze: (required)"
-            )
+            text=self.gaze_path.name if self.gaze_path else "Not selected"
         )
         self.time_file_label.config(
-            text=(
-                f"Time: {self.time_path.name}"
-                if self.time_path
-                else "Time: (required)"
-            )
+            text=self.time_path.name if self.time_path else "Not selected"
         )
         if self.okr_log_path and self.okr_log is not None:
             n_blocks = len(self.okr_log.block_markers)
             n_fix = len(self.okr_log.fixation_markers)
             self.okr_log_file_label.config(
                 text=(
-                    f"OKR log: {self.okr_log_path.name} "
+                    f"{self.okr_log_path.name} "
                     f"({n_blocks} block start(s), {n_fix} fixation start(s))"
                 )
             )
         elif self.okr_log_path:
-            self.okr_log_file_label.config(text="OKR log: selected (not loaded)")
+            self.okr_log_file_label.config(text="Selected (not loaded)")
         else:
-            self.okr_log_file_label.config(
-                text="OKR log: (optional — block/fixation markers)"
-            )
+            self.okr_log_file_label.config(text="None (optional)")
     def _pan_step_sec(self) -> float:
         if self.view_xmin is None or self.view_xmax is None:
             return self.DEFAULT_VIEW_DURATION * self.SCROLL_PAN_FRACTION
@@ -1301,15 +1210,6 @@ class AnnotatorApp:
             self.okr_log = load_okr_log(self.okr_log_path)
             self.detect_dir_var.set("Auto")
             self.detect_blocks_var.set(True)
-            if self.trial is not None and self.gaze_path is not None:
-                viewing_eye = infer_viewing_eye(
-                    eye_patch=self.okr_log.stimulus_eye_patch,
-                    trial_id=self.trial.trial_id,
-                )
-                attach_sranipal_pupil(
-                    self.trial, self.gaze_path.parent, viewing_eye=viewing_eye
-                )
-                self._update_pupil_signal_options()
             return True
         except Exception as exc:
             self.okr_log = None
@@ -1361,9 +1261,9 @@ class AnnotatorApp:
 
     def _update_annotations_folder_label(self) -> None:
         if self.annotations_dir is None:
-            text = "Annotations folder: (required — create and choose your personal folder)"
+            text = "Not chosen yet"
         else:
-            text = f"Annotations folder: {self.annotations_dir}"
+            text = str(self.annotations_dir)
         self.annotations_folder_label.config(text=text)
 
     def _set_velocity_status(self, text: str, *, kind: str = "pending") -> None:
@@ -1384,7 +1284,7 @@ class AnnotatorApp:
     def _on_stimulus_velocity_edited(self, *_args) -> None:
         raw = self.stim_vel_var.get().strip()
         if not raw:
-            self._set_velocity_status("not set yet", kind="pending")
+            self._set_velocity_status("required", kind="pending")
             return
         try:
             vel = float(raw)
@@ -1443,9 +1343,9 @@ class AnnotatorApp:
         if self.annotations_dir is not None:
             return self.annotations_dir
         headline = (
-            "Step 1: set your personal annotations folder before loading this trial."
+            "Choose your personal annotations folder (section 1) before loading this trial."
             if on_load
-            else "Step 1: set your personal annotations folder before saving."
+            else "Choose your personal annotations folder (section 1) before saving."
         )
         messagebox.showinfo(
             "Annotations folder required",
@@ -1459,7 +1359,7 @@ class AnnotatorApp:
         if self.annotations_dir is None:
             messagebox.showwarning(
                 "Annotations folder required",
-                "No personal folder was chosen. Set step 1 (Annotations folder…) "
+                "No personal folder was chosen. Complete section 1 "
                 "before Load trial or Save segments.",
             )
         return self.annotations_dir
@@ -1669,16 +1569,8 @@ class AnnotatorApp:
             self.stim_vel_var.set(str(vel))
             self._applied_stimulus_velocity = float(vel)
             self._set_velocity_status(f"Applied: {float(vel):g} deg/s", kind="ok")
-        signal_mode = data.get("signal_mode")
-        if (
-            isinstance(signal_mode, str)
-            and signal_mode in self._signal_label_map
-            and (
-                signal_mode == self.SIGNAL_ELEVATION
-                or self._pupil_available()
-            )
-        ):
-            self.signal_var.set(self._signal_label_map[signal_mode])
+        # Always use elevation; ignore any legacy pupil signal_mode in JSON.
+        if restored:
             self._refit_all_segments()
             self._update_signal_ylim()
         self.selected_segment_key = None
@@ -1743,15 +1635,15 @@ class AnnotatorApp:
                 return
         if not self.gaze_path or not self.time_path:
             messagebox.showwarning(
-                "Missing required files",
-                "Steps 2–3: select both a gaze file and a time file first.",
+                "Missing trial files",
+                "Select both a gaze file and a time file in section 2.",
             )
             return
         if not self.stim_vel_var.get().strip():
             messagebox.showwarning(
                 "Stimulus velocity required",
-                "Step 4: enter the stimulus velocity for this trial "
-                "(e.g. 10, 20, or 30 deg/s) before loading.",
+                "Enter the stimulus velocity for this trial "
+                "(e.g. 10, 20, or 30 deg/s) in section 3.",
             )
             self.stim_vel_entry.focus_set()
             return
@@ -1770,7 +1662,7 @@ class AnnotatorApp:
         if not messagebox.askyesno(
             "Confirm stimulus velocity",
             f"Load this trial using {vel:g} deg/s?\n\n"
-            "Gain = slope ÷ this velocity. Cancel and change step 4 "
+            "Gain = slope ÷ this velocity. Cancel and change the velocity "
             "if this is wrong for this condition.",
         ):
             self.stim_vel_entry.focus_set()
@@ -1784,22 +1676,11 @@ class AnnotatorApp:
             self.trial = load_ush2a_trial(
                 self.gaze_path, self.time_path, trial_id=trial_id
             )
-            viewing_eye = infer_viewing_eye(
-                eye_patch=(
-                    self.okr_log.stimulus_eye_patch if self.okr_log else None
-                ),
-                trial_id=trial_id,
-            )
-            pupil = attach_sranipal_pupil(
-                self.trial, self.gaze_path.parent, viewing_eye=viewing_eye
-            )
             t0 = float(self.trial.times[0])
             t1 = float(self.trial.times[-1])
             self.analysis_t0 = t0
             self.analysis_t1 = t1
             self.window_mask = analysis_window_mask(self.trial.times, t0, t_end=t1)
-            self._update_pupil_signal_options()
-            self._sync_zero_elevation_control()
             self.segments.clear()
             self.proposed_segments.clear()
             self.selected_segment_key = None
@@ -1823,8 +1704,6 @@ class AnnotatorApp:
                 f"Loaded {trial_id}: {len(self.trial.times)} gaze samples, "
                 f"analysis {t0:.2f}–{t1:.2f} s ({duration:.1f} s)"
             )
-            if pupil is not None:
-                status += f"; pupil ({pupil.eye}): {len(pupil.times)} samples"
             if self.okr_log is not None:
                 status += (
                     f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
@@ -1972,7 +1851,7 @@ class AnnotatorApp:
             self.signal_ylim = None
             return
         values = self._active_values()
-        pad = 0.5 if self._signal_mode() == self.SIGNAL_ELEVATION else 0.002
+        pad = 0.5
         ymin = float(np.nanmin(values[valid])) - pad
         ymax = float(np.nanmax(values[valid])) + pad
         if ymin < ymax:
@@ -2710,14 +2589,9 @@ class AnnotatorApp:
             )
             self._preview_line = line
             upward = "yes" if self.pending_fit.direction_upward else "FLAG: not upward"
-            slope_unit = self._signal_slope_unit()
-            slope_fmt = (
-                f"{self.pending_fit.slope_deg_s:.2f}"
-                if self._signal_mode() == self.SIGNAL_ELEVATION
-                else f"{self.pending_fit.slope_deg_s:.4f}"
-            )
             self.ax.set_title(
-                f"Pending: slope={slope_fmt} {slope_unit}, "
+                f"Pending: slope={self.pending_fit.slope_deg_s:.2f} "
+                f"{self._signal_slope_unit()}, "
                 f"gain={self.pending_fit.gain:.3f}, R²={self.pending_fit.r2:.3f} ({upward})"
             )
         elif self.pending_start_idx is not None and self.pending_end_idx is None:

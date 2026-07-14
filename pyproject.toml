@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slowphase-okr"
-version = "0.2.6"
+version = "0.2.7"
 description = "Manual slow-phase annotation tool for OKR gain estimation"
 readme = "README.md"
 license = { text = "MIT" }

@@ -371,7 +371,7 @@ def test_autosave_roundtrip(tmp_path: Path):
         time_source=str(timef.resolve()),
         stimulus_velocity=31.0,
         segments=segments,
-        software_version="0.2.6",
+        software_version="0.2.7",
     )
     data = load_autosave(out)
     assert data is not None

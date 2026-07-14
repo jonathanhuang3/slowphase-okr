@@ -120,7 +120,7 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 
 ### Stay up to date (do this each time before you annotate)
 
-The version is shown in the window title (e.g. `slowphase-okr v0.2.6`). To pull the latest code before you open the app:
+The version is shown in the window title (e.g. `slowphase-okr v0.2.7`). To pull the latest code before you open the app:
 
 **If you cloned with Git (recommended)**
 
@@ -170,18 +170,17 @@ ZIP installs do not update automatically — prefer cloning with Git if you anno
 
 ### Manual annotation
 
-1. On the **1. Load trial** tab (left → right):
-   1. **Annotations folder…** — create a **personal** folder (e.g. `Desktop/okr_annotations_YourName`). Do **not** use the shared Box trial folder. Each person needs their own place to store markings.
-   2. **Gaze file…** — your gaze direction file (see [Data format](#data-format))
-   3. **Time file…** — your timestamp file (one time per gaze sample)
-   4. **Stimulus velocity** — enter the speed for this trial (e.g. 10, 20, or 30). Load asks you to confirm so you don’t forget.
-   5. **Load trial** — the app switches to the **2. Annotate** tab
-2. **Optional** on Load trial: OKR log, Load markings
-3. **Trial ID** is filled automatically as `{patient/session folder}_{condition folder}`
-4. On **Annotate**, **click twice** on the trace: start and end of each upward slow phase (snaps to nearest sample)
-5. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
-6. Press **Accept segment** (`A`) to keep the fit
-7. **Save segments** for JSON (if that filename already exists, you’ll be asked to choose a new name), then **Export Excel** when done
+1. On the **1. Load trial** tab, work top to bottom:
+   1. **Where to save** — choose a **personal** annotations folder (e.g. `Desktop/okr_annotations_YourName`). Do **not** use the shared Box trial folder.
+   2. **Trial files** — gaze file, then time file. Trial ID is set automatically from the folder names.
+   3. **Stimulus velocity** — enter the speed for this trial (e.g. 10, 20, or 30). Load asks you to confirm.
+   4. **OKR log** (optional) — contrast-block / fixation markers
+   5. Press **Load trial** — switches to the **2. Annotate** tab
+2. To reopen prior work: **Load markings…** at the bottom of the Load trial tab (after the trial is loaded)
+3. On **Annotate**, **click twice** on the trace: start and end of each upward slow phase (snaps to nearest sample)
+4. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
+5. Press **Accept segment** (`A`) to keep the fit
+6. **Save segments** for JSON (if that filename already exists, you’ll be asked to choose a new name), then **Export Excel** when done
 
 ### Semi-automatic annotation (recommended with OKR log)
 
@@ -201,7 +200,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | Feature | Description |
 |---------|-------------|
 | **Analysis window** | Full trial — first timestamp to last timestamp |
-| **Signal source** | Elevation from rotated gaze, or SRanipal pupil X/Y (auto-loaded from trial folder) |
+| **Signal** | Elevation from rotated gaze (deg) |
 | **Zero elev at start** | Optional (on by default). Subtracts elevation at the first valid sample so the trace starts at 0° — removes headset pose offset. Slopes and gains are unchanged. |
 | **Fixed y-axis** | Signal scale stays fixed to the full trial while you pan in time |
 | **Segment list** | Shows proposed (`?`) and accepted (`✓`) segments sorted by time |
@@ -298,8 +297,6 @@ This tool was developed for our lab to support gaze data recorded with a **HTC V
 **Duplicate timestamps:** Unity `gazeTime.txt` often repeats the same time for several gaze samples (one Unity frame, multiple eye samples). That is normal. Auto-detect averages elevation at each unique time before searching.
 
 **Pair the right files:** `rotatedGaze.txt` + `gazeTime.txt` (same line count). Do not mix `rotatedGaze.txt` with `sranipalGazeTime.txt`.
-
-**SRanipal pupil position (optional):** If present in the same trial folder, the app also loads `sranipalLeftPupilPositions.txt` / `sranipalRightPupilPositions.txt` with matching `*PupilPositionTimes.txt` (or `*PupilTimes.txt`). Pupil coordinates are normalized screen units `(x, y)` per line. Use the **Signal** menu to plot pupil Y (vertical OKR) or pupil X instead of elevation. Segment marking, auto-detect, and gain (`slope / stimulus velocity`) work the same way; pupil slopes are in normalized units per second. The viewing eye is inferred from the OKR log `eyePatch` column (patched eye) or trial name (`RE` / `LE`).
 
 ### OKR log (optional)
 
