@@ -19,7 +19,9 @@ from slowphase_okr import __version__
 from slowphase_okr.autosave import (
     autosave_matches_trial,
     autosave_path,
+    legacy_autosave_path,
     load_autosave,
+    markings_id_from_gaze_path,
     save_autosave,
     segments_from_autosave,
 )
@@ -53,7 +55,7 @@ Marking
 Navigation
   Scroll wheel     Pan time forward / backward (vertical scroll only)
   ← / →            Pan view by 20% of visible window
-  View menu        1 s, 2 s, 5 s, 10 s, or Full trial window
+  View menu        1 s, 2 s, 5 s, 10 s, or Full trial window (Annotate tab)
 
 Segments (select one in the list first)
   Del              Delete selected segment
@@ -62,18 +64,21 @@ Segments (select one in the list first)
   ,  .             Nudge end to previous / next data point
 
 Other
-  Enter            Apply stimulus velocity (in velocity field)
+  Enter            Apply stimulus velocity (in velocity field on Load trial tab)
   ?                Show this help
 
 Notes
+  • Use tab “1. Load trial” for files/velocity, then “2. Annotate” for the plot and table.
   • Analysis window spans the full trial (first to last timestamp).
   • Signal menu: elevation (rotated gaze) or SRanipal pupil X/Y for an alternate gain trace.
   • Zero elev at start: subtract elevation at the first valid sample so the trace starts at 0°
     (removes headset pose offset; slopes and gains are unchanged).
   • Pupil gain uses the same slope / stimulus-velocity formula; slopes are in normalized pupil units/s.
   • R² is logged and exported but segments are not auto-rejected.
-  • Load trial prompts for an annotations folder if none is set, so markings
-    autosave to your personal folder. Use Load markings… for a prior JSON.
+  • Step 1: choose a personal annotations folder (create your own; not shared Box data).
+    Press Save segments to write JSON; use Load markings… to reopen a prior file.
+  • If that JSON name already exists, you will be asked to save under a new name.
+  • Trial ID is set from the gaze file’s parent folder name.
   • Optional OKR log marks contrast-block and fixation-cross start times on the plot.
   • With an OKR log loaded, the condition line under the plot shows contrast, direction,
     flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time.
@@ -230,7 +235,7 @@ class AnnotatorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"slowphase-okr v{__version__}")
-        self.root.minsize(1100, 680)
+        self.root.minsize(1100, 760)
 
         self.gaze_path: Path | None = None
         self.time_path: Path | None = None
@@ -253,7 +258,7 @@ class AnnotatorApp:
         self._boundary_drag: dict | None = None
         self._hover_boundary: str | None = None
         self._hover_proposed_key: tuple[str, int] | None = None
-        self._applied_stimulus_velocity: float = 31.0
+        self._applied_stimulus_velocity: float = float("nan")
 
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
@@ -264,13 +269,35 @@ class AnnotatorApp:
         self.view_xmax: float | None = None
         self.annotations_dir: Path | None = get_annotations_dir()
 
-        self._build_controls()
-        self._build_main_area()
+        self._build_footer()
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4, 0))
+
+        self.setup_tab = ttk.Frame(self.notebook, padding=8)
+        self.annotate_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.setup_tab, text="1. Load trial")
+        self.notebook.add(self.annotate_tab, text="2. Annotate")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+
+        self._build_setup_tab()
+        self._build_annotate_tab()
         self._build_plot()
         self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._update_annotations_folder_label()
-        self._set_status("Load gaze and time files to begin.")
+        self._set_status(
+            "Open the Load trial tab: annotations folder → gaze → time → "
+            "velocity → Load trial, then switch to Annotate."
+        )
+
+    def _on_notebook_tab_changed(self, _event=None) -> None:
+        try:
+            if self.notebook.select() == str(self.annotate_tab) and hasattr(
+                self, "canvas"
+            ):
+                self.root.after_idle(self.canvas.draw_idle)
+        except tk.TclError:
+            pass
 
     @property
     def analysis_duration(self) -> float:
@@ -380,6 +407,7 @@ class AnnotatorApp:
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
             self._set_status("Cleared pending segment after signal change.")
+        self._clear_interaction_state()
         self._sync_zero_elevation_control()
         self._refit_all_segments()
         self._update_signal_ylim()
@@ -440,114 +468,12 @@ class AnnotatorApp:
         self.segments = refit_list(self.segments)
         self.proposed_segments = refit_list(self.proposed_segments)
 
-    def _build_controls(self) -> None:
-        top = ttk.Frame(self.root, padding=8)
-        top.pack(side=tk.TOP, fill=tk.X)
+    def _build_footer(self) -> None:
+        footer = ttk.Frame(self.root)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
 
-        ttk.Button(top, text="Browse gaze file…", command=self._browse_gaze).grid(
-            row=0, column=0, padx=4, pady=2, sticky=tk.W
-        )
-        ttk.Button(top, text="Browse time file…", command=self._browse_time).grid(
-            row=0, column=1, padx=4, pady=2, sticky=tk.W
-        )
-        ttk.Button(top, text="Load trial", command=self._load_trial).grid(
-            row=0, column=2, padx=4, pady=2, sticky=tk.W
-        )
-        ttk.Button(top, text="Browse OKR log…", command=self._browse_okr_log).grid(
-            row=0, column=3, padx=4, pady=2, sticky=tk.W
-        )
-        top.columnconfigure(5, weight=1)
-        ttk.Button(top, text="Help", command=self._show_help).grid(
-            row=0, column=5, padx=4, pady=2, sticky=tk.E
-        )
-
-        ttk.Label(top, text="Trial ID:").grid(row=1, column=0, sticky=tk.E, padx=4)
-        self.trial_id_var = tk.StringVar(value="")
-        ttk.Entry(top, textvariable=self.trial_id_var, width=28).grid(
-            row=1, column=1, columnspan=2, sticky=tk.W, padx=4
-        )
-
-        vel_frame = ttk.Frame(top)
-        vel_frame.grid(row=1, column=3, columnspan=2, sticky=tk.W, padx=4)
-        ttk.Label(vel_frame, text="Stimulus velocity (deg/s):").pack(side=tk.LEFT)
-        self.stim_vel_var = tk.StringVar(value="31")
-        self.stim_vel_entry = ttk.Entry(vel_frame, textvariable=self.stim_vel_var, width=8)
-        self.stim_vel_entry.pack(side=tk.LEFT, padx=(4, 0))
-        self.stim_vel_applied_var = tk.StringVar(value="Applied: 31 deg/s")
-        ttk.Label(
-            vel_frame,
-            textvariable=self.stim_vel_applied_var,
-            foreground="forestgreen",
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        self.stim_vel_entry.bind("<Return>", self._apply_stimulus_velocity)
-        self.stim_vel_entry.bind("<FocusOut>", self._apply_stimulus_velocity_on_blur)
-        self.stim_vel_var.trace_add("write", self._on_stimulus_velocity_edited)
-
-        self.gaze_file_label = ttk.Label(top, text="")
-        self.gaze_file_label.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=4)
-        self.time_file_label = ttk.Label(top, text="")
-        self.time_file_label.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=4)
-        self.okr_log_file_label = ttk.Label(top, text="")
-        self.okr_log_file_label.grid(row=4, column=0, columnspan=3, sticky=tk.W, padx=4)
-
-        signal_row = ttk.Frame(top)
-        signal_row.grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=4, pady=(2, 0))
-        ttk.Label(signal_row, text="Signal:").pack(side=tk.LEFT)
-        self.signal_var = tk.StringVar(value=self.SIGNAL_CHOICES[0][0])
-        self.signal_combo = ttk.Combobox(
-            signal_row,
-            textvariable=self.signal_var,
-            values=[label for label, _ in self.SIGNAL_CHOICES],
-            state="readonly",
-            width=28,
-        )
-        self.signal_combo.pack(side=tk.LEFT, padx=(4, 0))
-        self.signal_combo.bind("<<ComboboxSelected>>", self._on_signal_selected)
-        self.zero_elevation_var = tk.BooleanVar(value=True)
-        self.zero_elevation_chk = ttk.Checkbutton(
-            signal_row,
-            text="Zero elev at start",
-            variable=self.zero_elevation_var,
-            command=self._on_zero_elevation_toggled,
-        )
-        self.zero_elevation_chk.pack(side=tk.LEFT, padx=(10, 0))
-        self.pupil_file_label = ttk.Label(top, text="")
-        self.pupil_file_label.grid(row=6, column=0, columnspan=3, sticky=tk.W, padx=4)
-
-        ann_row = ttk.Frame(top)
-        ann_row.grid(row=7, column=0, columnspan=5, sticky=tk.W, padx=4, pady=(4, 0))
-        ttk.Button(
-            ann_row,
-            text="Annotations folder…",
-            command=self._browse_annotations_folder,
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            ann_row,
-            text="Load markings…",
-            command=self._load_markings_json,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        self.annotations_folder_label = ttk.Label(ann_row, text="")
-        self.annotations_folder_label.pack(side=tk.LEFT, padx=(8, 0))
-
-        view_row = ttk.Frame(top)
-        view_row.grid(row=2, column=3, columnspan=2, rowspan=2, sticky=tk.W, padx=4, pady=2)
-        ttk.Label(view_row, text="Window:").pack(side=tk.LEFT, padx=(0, 4))
-        self.view_var = tk.StringVar(value="2 s")
-        self.view_combo = ttk.Combobox(
-            view_row,
-            textvariable=self.view_var,
-            values=self.VIEW_PRESET_LABELS,
-            state="readonly",
-            width=10,
-        )
-        self.view_combo.pack(side=tk.LEFT, padx=2)
-        self.view_combo.bind("<<ComboboxSelected>>", self._on_view_selected)
-        ttk.Button(view_row, text="Reset", width=6, command=self._reset_view).pack(
-            side=tk.LEFT, padx=2
-        )
-
-        action = ttk.Frame(self.root, padding=8)
-        action.pack(side=tk.BOTTOM, fill=tk.X)
+        action = ttk.Frame(footer, padding=(8, 4))
+        action.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Button(action, text="Accept segment (A)", command=self._accept_segment).pack(
             side=tk.LEFT, padx=4
@@ -557,6 +483,9 @@ class AnnotatorApp:
         )
         ttk.Button(action, text="Clear pending (Esc)", command=self._clear_pending).pack(
             side=tk.LEFT, padx=4
+        )
+        ttk.Button(action, text="Save segments", command=self._save_segments).pack(
+            side=tk.RIGHT, padx=4
         )
         ttk.Button(action, text="Export Excel…", command=self._export).pack(
             side=tk.RIGHT, padx=4
@@ -569,13 +498,206 @@ class AnnotatorApp:
 
         help_text = (
             "Click start then end of each upward slow phase (snaps to nearest data point). "
-            "Hover highlights the sample that will be used (red ring). Scroll vertically to pan time. See Help top right."
+            "Hover highlights the sample. Scroll to pan time. Use the tabs above to switch "
+            "between loading a trial and annotating."
         )
-        ttk.Label(self.root, text=help_text, padding=(8, 0)).pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(footer, text=help_text, padding=(8, 0, 8, 4)).pack(
+            side=tk.TOP, fill=tk.X
+        )
 
-    def _build_main_area(self) -> None:
-        self.main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        self.main_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=4)
+    def _build_setup_tab(self) -> None:
+        top = self.setup_tab
+        top.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(top)
+        header.grid(row=0, column=0, sticky=tk.EW, pady=(0, 4))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(
+            header,
+            text="Required steps first (left → right), then click Load trial. "
+            "Annotation happens on the Annotate tab.",
+            foreground="#444444",
+        ).pack(side=tk.LEFT)
+        ttk.Button(header, text="Help", command=self._show_help).pack(side=tk.RIGHT)
+
+        required = ttk.LabelFrame(
+            top,
+            text="Required — load trial data",
+            padding=6,
+        )
+        required.grid(row=1, column=0, sticky=tk.EW, pady=(0, 4))
+
+        ann_row = ttk.Frame(required)
+        ann_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(
+            ann_row,
+            text="1. Annotations folder…",
+            command=self._browse_annotations_folder,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.annotations_folder_label = ttk.Label(ann_row, text="")
+        self.annotations_folder_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        ttk.Label(
+            required,
+            text=(
+                "Create your own personal folder for markings (e.g. Desktop/okr_annotations_yourname). "
+                "Do not use the shared Box trial folder — each person needs their own save location."
+            ),
+            foreground="#6a4a00",
+            wraplength=980,
+        ).pack(side=tk.TOP, anchor=tk.W, pady=(2, 6))
+
+        req_row = ttk.Frame(required)
+        req_row.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(
+            req_row, text="2. Gaze file…", command=self._browse_gaze
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            req_row, text="3. Time file…", command=self._browse_time
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(req_row, text="4. Stimulus velocity (deg/s):").pack(side=tk.LEFT)
+        self.stim_vel_var = tk.StringVar(value="")
+        self.stim_vel_entry = ttk.Entry(
+            req_row, textvariable=self.stim_vel_var, width=8
+        )
+        self.stim_vel_entry.pack(side=tk.LEFT, padx=(4, 0))
+        self.stim_vel_applied_var = tk.StringVar(value="not set yet")
+        self.stim_vel_status_label = ttk.Label(
+            req_row,
+            textvariable=self.stim_vel_applied_var,
+            foreground="#b25c00",
+        )
+        self.stim_vel_status_label.pack(side=tk.LEFT, padx=(6, 12))
+        self.stim_vel_entry.bind("<Return>", self._apply_stimulus_velocity)
+        self.stim_vel_entry.bind("<FocusOut>", self._apply_stimulus_velocity_on_blur)
+        self.stim_vel_var.trace_add("write", self._on_stimulus_velocity_edited)
+        self._applied_stimulus_velocity = float("nan")
+
+        ttk.Button(
+            req_row, text="5. Load trial", command=self._load_trial
+        ).pack(side=tk.LEFT)
+
+        ttk.Label(
+            required,
+            text=(
+                "Velocity is required for gain (slope ÷ velocity). "
+                "Enter the speed for this trial (e.g. 10, 20, or 30) before loading."
+            ),
+            foreground="#6a4a00",
+            wraplength=980,
+        ).pack(side=tk.TOP, anchor=tk.W, pady=(4, 0))
+
+        id_row = ttk.Frame(required)
+        id_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Label(id_row, text="Trial ID (patient + condition folders):").pack(
+            side=tk.LEFT
+        )
+        self.trial_id_var = tk.StringVar(value="")
+        ttk.Entry(id_row, textvariable=self.trial_id_var, width=42).pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+
+        self.gaze_file_label = ttk.Label(required, text="Gaze: (required)")
+        self.gaze_file_label.pack(side=tk.TOP, anchor=tk.W)
+        self.time_file_label = ttk.Label(required, text="Time: (required)")
+        self.time_file_label.pack(side=tk.TOP, anchor=tk.W)
+
+        optional = ttk.LabelFrame(
+            top,
+            text="Optional",
+            padding=6,
+        )
+        optional.grid(row=2, column=0, sticky=tk.EW)
+
+        opt_row = ttk.Frame(optional)
+        opt_row.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(
+            opt_row, text="OKR log…", command=self._browse_okr_log
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            opt_row,
+            text="Load markings…",
+            command=self._load_markings_json,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        self.okr_log_file_label = ttk.Label(
+            optional, text="OKR log: (optional — block/fixation markers)"
+        )
+        self.okr_log_file_label.pack(side=tk.TOP, anchor=tk.W, pady=(4, 0))
+
+        go_row = ttk.Frame(top)
+        go_row.grid(row=3, column=0, sticky=tk.EW, pady=(12, 0))
+        ttk.Button(
+            go_row,
+            text="Go to Annotate tab →",
+            command=lambda: self.notebook.select(self.annotate_tab),
+        ).pack(side=tk.RIGHT)
+
+    def _build_annotate_tab(self) -> None:
+        toolbar = ttk.Frame(self.annotate_tab, padding=(4, 4))
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(
+            toolbar,
+            text="← Load trial",
+            command=lambda: self.notebook.select(self.setup_tab),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.annotate_summary_var = tk.StringVar(
+            value="No trial loaded — use the Load trial tab first."
+        )
+        ttk.Label(
+            toolbar,
+            textvariable=self.annotate_summary_var,
+            foreground="#333333",
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(toolbar, text="Signal:").pack(side=tk.LEFT)
+        self.signal_var = tk.StringVar(value=self.SIGNAL_CHOICES[0][0])
+        self.signal_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.signal_var,
+            values=[label for label, _ in self.SIGNAL_CHOICES],
+            state="readonly",
+            width=22,
+        )
+        self.signal_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self.signal_combo.bind("<<ComboboxSelected>>", self._on_signal_selected)
+        self.zero_elevation_var = tk.BooleanVar(value=True)
+        self.zero_elevation_chk = ttk.Checkbutton(
+            toolbar,
+            text="Zero elev at start",
+            variable=self.zero_elevation_var,
+            command=self._on_zero_elevation_toggled,
+        )
+        self.zero_elevation_chk.pack(side=tk.LEFT, padx=(8, 8))
+
+        ttk.Label(toolbar, text="Window:").pack(side=tk.LEFT)
+        self.view_var = tk.StringVar(value="2 s")
+        self.view_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.view_var,
+            values=self.VIEW_PRESET_LABELS,
+            state="readonly",
+            width=10,
+        )
+        self.view_combo.pack(side=tk.LEFT, padx=2)
+        self.view_combo.bind("<<ComboboxSelected>>", self._on_view_selected)
+        ttk.Button(toolbar, text="Reset", width=6, command=self._reset_view).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(toolbar, text="Help", command=self._show_help).pack(
+            side=tk.RIGHT, padx=4
+        )
+
+        self.pupil_file_label = ttk.Label(self.annotate_tab, text="", padding=(4, 0))
+        self.pupil_file_label.pack(side=tk.TOP, anchor=tk.W)
+
+        self.main_pane = ttk.PanedWindow(self.annotate_tab, orient=tk.HORIZONTAL)
+        self.main_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         self.plot_frame = ttk.Frame(self.main_pane)
         self.main_pane.add(self.plot_frame, weight=3)
@@ -583,7 +705,54 @@ class AnnotatorApp:
         seg_panel = ttk.LabelFrame(self.main_pane, text="Segments", padding=6)
         self.main_pane.add(seg_panel, weight=1)
 
-        detect_panel = ttk.LabelFrame(seg_panel, text="Auto-detect", padding=4)
+        # Pin action buttons at the bottom so they are never clipped.
+        seg_actions = ttk.Frame(seg_panel)
+        seg_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        ttk.Button(
+            seg_actions, text="Accept selected (A)", command=self._accept_segment
+        ).pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(
+            seg_actions, text="Delete selected (Del)", command=self._delete_selected_segment
+        ).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        nav_row = ttk.Frame(seg_actions)
+        nav_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Button(
+            nav_row, text="Prev proposed (P)", command=lambda: self._jump_proposed(-1)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        ttk.Button(
+            nav_row, text="Next proposed (N)", command=lambda: self._jump_proposed(1)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        ttk.Label(
+            seg_actions,
+            text="Selected: hover segment edges to drag, or [ ] , . nudge (one data point)",
+            wraplength=180,
+        ).pack(side=tk.TOP, pady=(4, 0))
+
+        # Scrollable area above so auto-detect + table stay reachable on short screens.
+        scroll_wrap = ttk.Frame(seg_panel)
+        scroll_wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        scroll_wrap.rowconfigure(0, weight=1)
+        scroll_wrap.columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(scroll_wrap, highlightthickness=0, borderwidth=0)
+        vscroll = ttk.Scrollbar(scroll_wrap, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vscroll.grid(row=0, column=1, sticky="ns")
+
+        scroll_inner = ttk.Frame(canvas)
+        inner_window = canvas.create_window((0, 0), window=scroll_inner, anchor="nw")
+
+        def _sync_scroll_region(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_inner_width(event) -> None:
+            canvas.itemconfigure(inner_window, width=event.width)
+
+        scroll_inner.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_inner_width)
+
+        detect_panel = ttk.LabelFrame(scroll_inner, text="Auto-detect", padding=4)
         detect_panel.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
 
         dir_row = ttk.Frame(detect_panel)
@@ -677,12 +846,12 @@ class AnnotatorApp:
         _bind_tooltip(propose_btn, DETECT_TOOLTIPS["propose"])
         _bind_tooltip(clear_btn, DETECT_TOOLTIPS["clear"])
 
-        tree_frame = ttk.Frame(seg_panel)
+        tree_frame = ttk.Frame(scroll_inner)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         columns = ("stat", "id", "start", "end", "gain", "r2")
         self.seg_tree = ttk.Treeview(
-            tree_frame, columns=columns, show="headings", height=10, selectmode="browse"
+            tree_frame, columns=columns, show="headings", height=8, selectmode="browse"
         )
         self.seg_tree.heading("stat", text="")
         self.seg_tree.heading("id", text="#")
@@ -702,28 +871,6 @@ class AnnotatorApp:
         seg_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.seg_tree.bind("<<TreeviewSelect>>", self._on_segment_select)
         self.seg_tree.bind("<Double-1>", self._on_segment_double_click)
-
-        seg_actions = ttk.Frame(seg_panel)
-        seg_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
-        ttk.Button(
-            seg_actions, text="Accept selected (A)", command=self._accept_segment
-        ).pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(
-            seg_actions, text="Delete selected (Del)", command=self._delete_selected_segment
-        ).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
-        nav_row = ttk.Frame(seg_actions)
-        nav_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
-        ttk.Button(
-            nav_row, text="Prev proposed (P)", command=lambda: self._jump_proposed(-1)
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
-        ttk.Button(
-            nav_row, text="Next proposed (N)", command=lambda: self._jump_proposed(1)
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
-        ttk.Label(
-            seg_actions,
-            text="Selected: hover segment edges to drag, or [ ] , . nudge (one data point)",
-            wraplength=180,
-        ).pack(side=tk.TOP, pady=(4, 0))
 
     def _build_plot(self) -> None:
         self.fig, self.ax = plt.subplots(figsize=(10, 4))
@@ -959,6 +1106,16 @@ class AnnotatorApp:
                 return
         self.condition_var.set(f"Condition @ {t:.2f} s: {condition_at_time(self.okr_log, t)}")
 
+    def _clear_interaction_state(self) -> None:
+        """Drop hover/drag indices that are invalid after loading a different trial."""
+        self._hover_idx = None
+        self._hover_artists = []
+        self._hover_boundary = None
+        self._hover_proposed_key = None
+        self._boundary_drag = None
+        self._preview_line = None
+        self._click_markers = []
+
     def _set_hover(self, idx: int | None) -> None:
         if idx is None:
             self._hover_idx = None
@@ -1053,25 +1210,34 @@ class AnnotatorApp:
 
     def _update_files_label(self) -> None:
         self.gaze_file_label.config(
-            text=f"Gaze: {self.gaze_path.name}" if self.gaze_path else ""
+            text=(
+                f"Gaze: {self.gaze_path.name}"
+                if self.gaze_path
+                else "Gaze: (required)"
+            )
         )
         self.time_file_label.config(
-            text=f"Time: {self.time_path.name}" if self.time_path else ""
+            text=(
+                f"Time: {self.time_path.name}"
+                if self.time_path
+                else "Time: (required)"
+            )
         )
         if self.okr_log_path and self.okr_log is not None:
             n_blocks = len(self.okr_log.block_markers)
             n_fix = len(self.okr_log.fixation_markers)
             self.okr_log_file_label.config(
                 text=(
-                    f"OKR log uploaded ({n_blocks} block start(s), "
-                    f"{n_fix} fixation start(s))"
+                    f"OKR log: {self.okr_log_path.name} "
+                    f"({n_blocks} block start(s), {n_fix} fixation start(s))"
                 )
             )
         elif self.okr_log_path:
-            self.okr_log_file_label.config(text="OKR log selected (not loaded)")
+            self.okr_log_file_label.config(text="OKR log: selected (not loaded)")
         else:
-            self.okr_log_file_label.config(text="")
-
+            self.okr_log_file_label.config(
+                text="OKR log: (optional — block/fixation markers)"
+            )
     def _pan_step_sec(self) -> float:
         if self.view_xmin is None or self.view_xmax is None:
             return self.DEFAULT_VIEW_DURATION * self.SCROLL_PAN_FRACTION
@@ -1088,8 +1254,7 @@ class AnnotatorApp:
         if path:
             self.gaze_path = Path(path)
             self._update_files_label()
-            if not self.trial_id_var.get().strip():
-                self.trial_id_var.set(self.gaze_path.parent.name)
+            self.trial_id_var.set(markings_id_from_gaze_path(self.gaze_path))
 
     def _browse_time(self) -> None:
         path = filedialog.askopenfilename(
@@ -1152,37 +1317,6 @@ class AnnotatorApp:
                 messagebox.showerror("OKR log failed", str(exc))
             return False
 
-    def _stimulus_velocity(self) -> float:
-        try:
-            return float(self.stim_vel_var.get().strip())
-        except ValueError as exc:
-            raise ValueError("Stimulus velocity must be a number.") from exc
-
-    def _on_stimulus_velocity_edited(self, *_args) -> None:
-        raw = self.stim_vel_var.get().strip()
-        if not raw:
-            self.stim_vel_applied_var.set("Enter a value, then press Enter")
-            return
-        try:
-            vel = float(raw)
-        except ValueError:
-            self.stim_vel_applied_var.set("Invalid — enter a number")
-            return
-        if abs(vel - self._applied_stimulus_velocity) < 1e-9:
-            self.stim_vel_applied_var.set(f"Applied: {vel:g} deg/s")
-        else:
-            self.stim_vel_applied_var.set(f"Press Enter to apply ({vel:g} deg/s)")
-
-    def _apply_stimulus_velocity_on_blur(self, _event=None) -> str | None:
-        try:
-            vel = self._stimulus_velocity()
-        except ValueError:
-            return None
-        if abs(vel - self._applied_stimulus_velocity) < 1e-9:
-            return None
-        self._apply_stimulus_velocity(_event)
-        return None
-
     def _recalculate_gains_for_velocity(self, vel: float) -> None:
         self.segments = [
             replace(seg, gain=seg.slope_deg_s / vel, stimulus_velocity=vel)
@@ -1227,75 +1361,199 @@ class AnnotatorApp:
 
     def _update_annotations_folder_label(self) -> None:
         if self.annotations_dir is None:
-            text = "Save folder: not set (required for autosave; use a personal folder)"
+            text = "Annotations folder: (required — create and choose your personal folder)"
         else:
-            text = f"Save folder: {self.annotations_dir}"
+            text = f"Annotations folder: {self.annotations_dir}"
         self.annotations_folder_label.config(text=text)
 
-    def _browse_annotations_folder(self) -> None:
+    def _set_velocity_status(self, text: str, *, kind: str = "pending") -> None:
+        colors = {
+            "pending": "#b25c00",
+            "ok": "forestgreen",
+            "bad": "#a40000",
+        }
+        self.stim_vel_applied_var.set(text)
+        self.stim_vel_status_label.configure(foreground=colors.get(kind, "#b25c00"))
+
+    def _stimulus_velocity(self) -> float:
+        try:
+            return float(self.stim_vel_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("Stimulus velocity must be a number.") from exc
+
+    def _on_stimulus_velocity_edited(self, *_args) -> None:
+        raw = self.stim_vel_var.get().strip()
+        if not raw:
+            self._set_velocity_status("not set yet", kind="pending")
+            return
+        try:
+            vel = float(raw)
+        except ValueError:
+            self._set_velocity_status("Invalid — enter a number", kind="bad")
+            return
+        if vel == 0:
+            self._set_velocity_status("Invalid — cannot be zero", kind="bad")
+            return
+        if (
+            np.isfinite(self._applied_stimulus_velocity)
+            and abs(vel - self._applied_stimulus_velocity) < 1e-9
+        ):
+            self._set_velocity_status(f"Applied: {vel:g} deg/s", kind="ok")
+        else:
+            self._set_velocity_status(
+                f"Press Enter to apply ({vel:g} deg/s)", kind="pending"
+            )
+
+    def _apply_stimulus_velocity_on_blur(self, _event=None) -> str | None:
+        try:
+            vel = self._stimulus_velocity()
+        except ValueError:
+            return None
+        if (
+            np.isfinite(self._applied_stimulus_velocity)
+            and abs(vel - self._applied_stimulus_velocity) < 1e-9
+        ):
+            return None
+        self._apply_stimulus_velocity(_event)
+        return None
+
+    def _browse_annotations_folder(self, *, explain: bool = True) -> None:
+        if explain:
+            messagebox.showinfo(
+                "Personal annotations folder",
+                "Create a folder that only you use for markings JSON — for example:\n"
+                "  Desktop/okr_annotations_YourName\n\n"
+                "Do not pick the shared Box trial data folder. Multiple people can "
+                "work on the same gaze files without seeing each other’s marks.\n\n"
+                "You’ll choose the folder next (create it in Finder/Explorer first if needed).",
+            )
         initial = str(self.annotations_dir) if self.annotations_dir else str(Path.home())
         path = filedialog.askdirectory(
-            title="Choose folder for your markings JSON (personal, not shared Box data)",
+            title="Choose YOUR personal annotations folder (not shared Box trial data)",
             initialdir=initial,
         )
         if not path:
             return
         self.annotations_dir = set_annotations_dir(path)
         self._update_annotations_folder_label()
-        self._set_status(f"Annotations will save to {self.annotations_dir}")
+        self._set_status(f"Segment JSON will save to {self.annotations_dir}")
 
     def _prompt_annotations_folder_if_needed(self, *, on_load: bool = False) -> Path | None:
         """Ensure a personal save folder is set; prompt whenever missing."""
         if self.annotations_dir is not None:
             return self.annotations_dir
         headline = (
-            "Before you mark this trial, choose where your markings JSON "
-            "will be saved."
+            "Step 1: set your personal annotations folder before loading this trial."
             if on_load
-            else "Choose where your markings JSON will be saved."
+            else "Step 1: set your personal annotations folder before saving."
         )
         messagebox.showinfo(
-            "Set annotations folder",
+            "Annotations folder required",
             f"{headline}\n\n"
-            "Use a personal folder (not the shared Box trial folder) so "
-            "others working on the same data won’t see or overwrite your marks.\n\n"
+            "Create and choose a folder that only you use "
+            "(e.g. Desktop/okr_annotations_YourName). "
+            "Do not use the shared Box trial folder.\n\n"
             "You’ll be asked to pick a folder next.",
         )
-        self._browse_annotations_folder()
+        self._browse_annotations_folder(explain=False)
         if self.annotations_dir is None:
             messagebox.showwarning(
-                "Annotations folder not set",
-                "No save folder was chosen. Accepted segments will not "
-                "autosave until you set one with Annotations folder…",
+                "Annotations folder required",
+                "No personal folder was chosen. Set step 1 (Annotations folder…) "
+                "before Load trial or Save segments.",
             )
         return self.annotations_dir
-
     def _ensure_annotations_dir(self) -> Path | None:
         return self._prompt_annotations_folder_if_needed(on_load=False)
+
+    def _default_markings_id(self) -> str:
+        if self.gaze_path is not None:
+            return markings_id_from_gaze_path(self.gaze_path)
+        return self.trial_id_var.get().strip() or "trial"
 
     def _autosave_file(self) -> Path | None:
         if not self.gaze_path or self.annotations_dir is None:
             return None
-        trial_id = self.trial_id_var.get().strip() or self.gaze_path.parent.name
-        if self.trial is not None:
-            trial_id = self.trial.trial_id
+        trial_id = self._default_markings_id()
         return autosave_path(self.annotations_dir, trial_id)
 
-    def _write_autosave(self) -> None:
+    def _unique_markings_suggestion(self, path: Path) -> str:
+        """Suggest a free filename near ``path`` (e.g. stem_v2.json)."""
+        stem = path.stem
+        suffix = path.suffix or ".json"
+        parent = path.parent
+        for n in range(2, 1000):
+            candidate = parent / f"{stem}_v{n}{suffix}"
+            if not candidate.exists():
+                return candidate.name
+        return f"{stem}_new{suffix}"
+
+    def _resolve_save_path(self, preferred: Path) -> Path | None:
+        """If preferred JSON exists, notify and ask for a different name."""
+        path = preferred
+        if path.is_file():
+            messagebox.showwarning(
+                "Markings file already exists",
+                f"A file named:\n  {path.name}\n"
+                f"already exists in:\n  {path.parent}\n\n"
+                "Choose a different name so you don’t overwrite it "
+                "(e.g. add your initials, a date, or _v2).",
+            )
+            suggested = self._unique_markings_suggestion(path)
+            chosen = filedialog.asksaveasfilename(
+                title="Save segments under a new name",
+                initialdir=str(path.parent),
+                initialfile=suggested,
+                defaultextension=".json",
+                filetypes=[
+                    ("Markings JSON", "*.json"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not chosen:
+                return None
+            path = Path(chosen)
+            if path.is_file():
+                if not messagebox.askyesno(
+                    "Overwrite existing file?",
+                    f"{path.name} already exists.\n\nOverwrite it?",
+                    icon="warning",
+                ):
+                    return None
+        return path
+
+    def _save_segments(self) -> None:
+        """Write accepted segments JSON to the annotations folder (manual save only)."""
         if not self.gaze_path or not self.time_path or not self.trial:
+            messagebox.showwarning(
+                "No trial loaded",
+                "Load a trial before saving segments.",
+            )
             return
         if self._ensure_annotations_dir() is None:
             return
-        path = self._autosave_file()
+        preferred = self._autosave_file()
+        if preferred is None:
+            return
+        path = self._resolve_save_path(preferred)
         if path is None:
+            self._set_status("Save cancelled.")
             return
         try:
             vel = self._stimulus_velocity()
         except ValueError:
-            vel = 31.0
+            messagebox.showwarning(
+                "Stimulus velocity required",
+                "Enter a valid stimulus velocity before saving.",
+            )
+            return
+        # Keep Trial ID as subject_condition for file naming and export.
+        trial_id = self._default_markings_id()
+        self.trial_id_var.set(trial_id)
+        self.trial.trial_id = trial_id
         save_autosave(
             path,
-            trial_id=self.trial.trial_id,
+            trial_id=trial_id,
             gaze_source=str(self.gaze_path.resolve()),
             time_source=str(self.time_path.resolve()),
             stimulus_velocity=vel,
@@ -1303,7 +1561,9 @@ class AnnotatorApp:
             software_version=__version__,
             signal_mode=self._signal_mode(),
         )
-
+        n = len(self.segments)
+        messagebox.showinfo("Segments saved", f"Saved {n} segment(s) to:\n{path}")
+        self._set_status(f"Saved {n} segment(s) to {path.name}")
     def _load_markings_json(self) -> None:
         if self.trial is None or not self.gaze_path or not self.time_path:
             messagebox.showwarning(
@@ -1338,9 +1598,23 @@ class AnnotatorApp:
         """Offer restore only from the personal annotations folder (not Box trial data)."""
         if not self.gaze_path or not self.time_path or self.annotations_dir is None:
             return
-        path = autosave_path(self.annotations_dir, trial_id)
-        data = load_autosave(path)
-        if data is None:
+        # Prefer new markings name; also check legacy autosave / condition-only names.
+        candidates = [
+            autosave_path(self.annotations_dir, trial_id),
+            legacy_autosave_path(self.annotations_dir, trial_id),
+        ]
+        legacy_id = self.gaze_path.parent.name
+        if legacy_id and legacy_id != trial_id:
+            candidates.append(autosave_path(self.annotations_dir, legacy_id))
+            candidates.append(legacy_autosave_path(self.annotations_dir, legacy_id))
+        path = None
+        data = None
+        for candidate in candidates:
+            data = load_autosave(candidate)
+            if data is not None:
+                path = candidate
+                break
+        if path is None or data is None:
             return
         restored = segments_from_autosave(data)
         if not restored:
@@ -1394,7 +1668,7 @@ class AnnotatorApp:
         if vel is not None:
             self.stim_vel_var.set(str(vel))
             self._applied_stimulus_velocity = float(vel)
-            self.stim_vel_applied_var.set(f"Applied: {float(vel):g} deg/s")
+            self._set_velocity_status(f"Applied: {float(vel):g} deg/s", kind="ok")
         signal_mode = data.get("signal_mode")
         if (
             isinstance(signal_mode, str)
@@ -1426,14 +1700,14 @@ class AnnotatorApp:
             vel = self._stimulus_velocity()
         except ValueError as exc:
             messagebox.showwarning("Invalid velocity", str(exc))
-            self.stim_vel_applied_var.set("Invalid — enter a number")
+            self._set_velocity_status("Invalid — enter a number", kind="bad")
             return
 
         if vel == 0:
             messagebox.showwarning(
                 "Invalid velocity", "Stimulus velocity cannot be zero."
             )
-            self.stim_vel_applied_var.set("Invalid — cannot be zero")
+            self._set_velocity_status("Invalid — cannot be zero", kind="bad")
             return
 
         n_accepted = len(self.segments)
@@ -1441,13 +1715,12 @@ class AnnotatorApp:
         had_segments = n_accepted or n_proposed or self.pending_fit is not None
 
         self._applied_stimulus_velocity = vel
-        self.stim_vel_applied_var.set(f"Applied: {vel:g} deg/s")
+        self._set_velocity_status(f"Applied: {vel:g} deg/s", kind="ok")
 
         if had_segments:
             self._recalculate_gains_for_velocity(vel)
             self._refresh_segment_list()
             self._redraw()
-            self._write_autosave()
 
         status = f"Stimulus velocity applied: {vel:g} deg/s."
         if had_segments:
@@ -1465,13 +1738,49 @@ class AnnotatorApp:
         self._set_status(status)
 
     def _load_trial(self) -> None:
+        if self.annotations_dir is None:
+            if self._prompt_annotations_folder_if_needed(on_load=True) is None:
+                return
         if not self.gaze_path or not self.time_path:
-            messagebox.showwarning("Missing files", "Select both gaze and time files.")
+            messagebox.showwarning(
+                "Missing required files",
+                "Steps 2–3: select both a gaze file and a time file first.",
+            )
+            return
+        if not self.stim_vel_var.get().strip():
+            messagebox.showwarning(
+                "Stimulus velocity required",
+                "Step 4: enter the stimulus velocity for this trial "
+                "(e.g. 10, 20, or 30 deg/s) before loading.",
+            )
+            self.stim_vel_entry.focus_set()
+            return
+        try:
+            vel = self._stimulus_velocity()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid velocity", str(exc))
+            self.stim_vel_entry.focus_set()
+            return
+        if vel == 0:
+            messagebox.showwarning(
+                "Invalid velocity", "Stimulus velocity cannot be zero."
+            )
+            self.stim_vel_entry.focus_set()
+            return
+        if not messagebox.askyesno(
+            "Confirm stimulus velocity",
+            f"Load this trial using {vel:g} deg/s?\n\n"
+            "Gain = slope ÷ this velocity. Cancel and change step 4 "
+            "if this is wrong for this condition.",
+        ):
+            self.stim_vel_entry.focus_set()
             return
         if not self._confirm_discard_work("Load this trial anyway"):
             return
+        self._apply_stimulus_velocity()
         try:
-            trial_id = self.trial_id_var.get().strip() or self.gaze_path.parent.name
+            trial_id = self._default_markings_id()
+            self.trial_id_var.set(trial_id)
             self.trial = load_ush2a_trial(
                 self.gaze_path, self.time_path, trial_id=trial_id
             )
@@ -1491,14 +1800,14 @@ class AnnotatorApp:
             self.window_mask = analysis_window_mask(self.trial.times, t0, t_end=t1)
             self._update_pupil_signal_options()
             self._sync_zero_elevation_control()
-            self._update_signal_ylim()
             self.segments.clear()
             self.proposed_segments.clear()
             self.selected_segment_key = None
             self._clear_pending(redraw=False)
+            self._clear_interaction_state()
+            self._update_signal_ylim()
             self.view_var.set("2 s")
             self._reset_view()
-            self._prompt_annotations_folder_if_needed(on_load=True)
             self._try_restore_autosave(trial_id)
             self._update_signal_ylim()
             self._refresh_segment_list()
@@ -1524,6 +1833,16 @@ class AnnotatorApp:
             self._set_status(status)
             self.hover_var.set(self._hover_hint())
             self._update_condition_display()
+            try:
+                applied_vel = self._stimulus_velocity()
+            except ValueError:
+                applied_vel = float("nan")
+            vel_txt = f"{applied_vel:g} deg/s" if np.isfinite(applied_vel) else "velocity?"
+            self.annotate_summary_var.set(
+                f"{trial_id}  ·  {vel_txt}  ·  {len(self.trial.times)} samples"
+            )
+            self.notebook.select(self.annotate_tab)
+            self.root.after_idle(self.canvas.draw_idle)
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
 
@@ -1789,8 +2108,6 @@ class AnnotatorApp:
         self._replace_segment(kind, updated)
         self._refresh_segment_list()
         self._redraw()
-        if kind == "accepted":
-            self._write_autosave()
         boundary = "start" if which == "start" else "end"
         t = updated.t_start if which == "start" else updated.t_end
         label = self._segment_display_label(kind, updated)
@@ -2091,7 +2408,6 @@ class AnnotatorApp:
         if kind == "accepted":
             self.segments = [s for s in self.segments if s.segment_id != seg.segment_id]
             self._renumber_segments()
-            self._write_autosave()
         else:
             self.proposed_segments = [
                 s for s in self.proposed_segments if s.segment_id != seg.segment_id
@@ -2134,7 +2450,6 @@ class AnnotatorApp:
         self._hover_proposed_key = None
         self._refresh_segment_list()
         self._redraw()
-        self._write_autosave()
         med = trial_summary_median_gain(self.segments)
         accepted_label = self._segment_display_label("accepted", accepted)
         self._set_status(
@@ -2165,7 +2480,6 @@ class AnnotatorApp:
             self.selected_segment_key = ("accepted", accepted.segment_id)
             self._refresh_segment_list()
             self._redraw()
-            self._write_autosave()
             med = trial_summary_median_gain(self.segments)
             self._set_status(
                 f"Accepted {self._segment_display_label('accepted', accepted)}: "
@@ -2195,7 +2509,6 @@ class AnnotatorApp:
             self._renumber_segments()
             self._refresh_segment_list()
             self._redraw()
-            self._write_autosave()
             med = trial_summary_median_gain(self.segments)
             self._set_status(
                 f"Removed last segment. Trial median gain={med:.3f} (n={len(self.segments)})"
@@ -2222,6 +2535,20 @@ class AnnotatorApp:
 
         times = self._active_times()
         values = self._active_values()
+        n = len(times)
+        if self._hover_idx is not None and not (0 <= self._hover_idx < n):
+            self._hover_idx = None
+        if self.pending_start_idx is not None and not (0 <= self.pending_start_idx < n):
+            self.pending_start_idx = None
+            self.pending_end_idx = None
+            self.pending_fit = None
+        if self.pending_end_idx is not None and not (0 <= self.pending_end_idx < n):
+            self.pending_end_idx = None
+            self.pending_fit = None
+        if self._boundary_drag is not None:
+            preview_idx = self._boundary_drag.get("preview_idx")
+            if preview_idx is not None and not (0 <= int(preview_idx) < n):
+                self._boundary_drag = None
         t0 = self.analysis_t0
         t1 = self.analysis_t1
 
@@ -2525,8 +2852,14 @@ class AnnotatorApp:
             messagebox.showerror("Export failed", str(exc))
 
     def _on_close(self) -> None:
-        if self.segments:
-            self._write_autosave()
+        if self.segments and not messagebox.askyesno(
+            "Quit without saving?",
+            f"You have {len(self.segments)} accepted segment(s). "
+            "Nothing is written to disk unless you press Save segments.\n\n"
+            "Quit anyway?",
+            icon="warning",
+        ):
+            return
         self.root.destroy()
 
     def _set_status(self, msg: str) -> None:

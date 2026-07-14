@@ -365,13 +365,13 @@ def test_autosave_roundtrip(tmp_path: Path):
         SegmentFit(1, 0, 1, 0.0, 0.1, 2, 20.0, 0.0, 20.0 / 31.0, 0.99, True, 31.0),
     ]
     out = save_autosave(
-        tmp_path / "trial_slowphase_okr_autosave.json",
+        tmp_path / "trial_slowphase_okr_markings.json",
         trial_id="trial",
         gaze_source=str(gaze.resolve()),
         time_source=str(timef.resolve()),
         stimulus_velocity=31.0,
         segments=segments,
-        software_version="0.2.5",
+        software_version="0.2.6",
     )
     data = load_autosave(out)
     assert data is not None
@@ -382,11 +382,25 @@ def test_autosave_roundtrip(tmp_path: Path):
 
 
 def test_autosave_path_uses_directory(tmp_path: Path):
-    from slowphase_okr.autosave import autosave_path
+    from slowphase_okr.autosave import autosave_path, markings_id_from_gaze_path
 
     personal = tmp_path / "my_markings"
     path = autosave_path(personal, "Patient016_LE")
-    assert path == personal / "Patient016_LE_slowphase_okr_autosave.json"
+    assert path == personal / "Patient016_LE_slowphase_okr_markings.json"
+
+    gaze = (
+        tmp_path
+        / "Jonathan Test"
+        / "Param Block3 RE Increment 1deg 30dps White Dots"
+        / "rotatedGaze.txt"
+    )
+    gaze.parent.mkdir(parents=True)
+    gaze.write_text("(0,0,1)\n")
+    stem = markings_id_from_gaze_path(gaze)
+    assert stem == (
+        "Jonathan Test_Param Block3 RE Increment 1deg 30dps White Dots"
+    )
+    assert autosave_path(personal, stem).name.endswith("_slowphase_okr_markings.json")
 
 
 def test_annotations_dir_prefs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

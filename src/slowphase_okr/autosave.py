@@ -1,4 +1,4 @@
-"""JSON autosave for in-progress trial annotations."""
+"""JSON markings save/load for trial annotations (manual Save segments only)."""
 
 from __future__ import annotations
 
@@ -9,12 +9,33 @@ from typing import Any
 
 from slowphase_okr.fit import SegmentFit
 
-AUTOSAVE_FILENAME_SUFFIX = "_slowphase_okr_autosave.json"
+MARKINGS_FILENAME_SUFFIX = "_slowphase_okr_markings.json"
+# Older saves used this name before manual-only save.
+LEGACY_AUTOSAVE_FILENAME_SUFFIX = "_slowphase_okr_autosave.json"
+
+
+def markings_id_from_gaze_path(gaze_path: str | Path) -> str:
+    """Build a markings/trial id from subject folder + condition folder.
+
+    Gaze lives at ``…/{subject}/{condition}/rotatedGaze.txt``, so the default
+    JSON stem is ``{subject}_{condition}`` (patient/session + block condition).
+    """
+    trial_dir = Path(gaze_path).resolve().parent
+    condition = trial_dir.name or "trial"
+    subject = trial_dir.parent.name
+    if not subject or subject in {".", ""}:
+        return condition
+    return f"{subject}_{condition}"
 
 
 def autosave_path(directory: str | Path, trial_id: str) -> Path:
-    """Autosave JSON path: ``{directory}/{trial_id}_slowphase_okr_autosave.json``."""
-    return Path(directory) / f"{trial_id}{AUTOSAVE_FILENAME_SUFFIX}"
+    """Default markings JSON path (manual Save segments)."""
+    return Path(directory) / f"{trial_id}{MARKINGS_FILENAME_SUFFIX}"
+
+
+def legacy_autosave_path(directory: str | Path, trial_id: str) -> Path:
+    """Previous default filename, still checked on restore."""
+    return Path(directory) / f"{trial_id}{LEGACY_AUTOSAVE_FILENAME_SUFFIX}"
 
 
 def segment_to_dict(segment: SegmentFit) -> dict[str, Any]:

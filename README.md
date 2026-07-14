@@ -120,7 +120,7 @@ If nothing happens or you see an error, see [Troubleshooting](#troubleshooting).
 
 ### Stay up to date (do this each time before you annotate)
 
-The version is shown in the window title (e.g. `slowphase-okr v0.2.5`). To pull the latest code before you open the app:
+The version is shown in the window title (e.g. `slowphase-okr v0.2.6`). To pull the latest code before you open the app:
 
 **If you cloned with Git (recommended)**
 
@@ -170,25 +170,27 @@ ZIP installs do not update automatically — prefer cloning with Git if you anno
 
 ### Manual annotation
 
-1. **Browse gaze file** — your gaze direction file (see [Data format](#data-format))
-2. **Browse time file** — your timestamp file (one time per gaze sample)
-3. **Browse OKR log** *(optional)* — stimulus event log with block and fixation timing (see [OKR log](#okr-log-optional))
-4. Enter **Trial ID** and **stimulus velocity** (default 31 deg/s, press Enter to apply after editing)
-5. Click **Load trial**
-6. Choose **Signal** — elevation (default) or SRanipal pupil X/Y if those files are in the trial folder
-7. **Click twice** on the trace: start and end of each upward slow phase (snaps to nearest sample)
-8. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
-9. Press **Accept segment** (`A`) to keep the fit
-10. **Export Excel** when done
+1. On the **1. Load trial** tab (left → right):
+   1. **Annotations folder…** — create a **personal** folder (e.g. `Desktop/okr_annotations_YourName`). Do **not** use the shared Box trial folder. Each person needs their own place to store markings.
+   2. **Gaze file…** — your gaze direction file (see [Data format](#data-format))
+   3. **Time file…** — your timestamp file (one time per gaze sample)
+   4. **Stimulus velocity** — enter the speed for this trial (e.g. 10, 20, or 30). Load asks you to confirm so you don’t forget.
+   5. **Load trial** — the app switches to the **2. Annotate** tab
+2. **Optional** on Load trial: OKR log, Load markings
+3. **Trial ID** is filled automatically as `{patient/session folder}_{condition folder}`
+4. On **Annotate**, **click twice** on the trace: start and end of each upward slow phase (snaps to nearest sample)
+5. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
+6. Press **Accept segment** (`A`) to keep the fit
+7. **Save segments** for JSON (if that filename already exists, you’ll be asked to choose a new name), then **Export Excel** when done
 
 ### Semi-automatic annotation (recommended with OKR log)
 
-1. Complete steps 1–5 above (include OKR log if available).
+1. Complete the required load steps above (include OKR log if available).
 2. Adjust [auto-detect settings](#auto-detect-optional) — hover any parameter in the app for a short explanation.
 3. Click **Propose segments** — candidates appear as **?** (blue dashed lines).
 4. Use **N** / **P** (or the buttons) to step through proposals; **A** to accept, **Del** to reject.
 5. Hover near a segment edge to highlight it, then drag to adjust; or nudge with `[` `]` `,` `.` if needed; manually click any slow phases the detector missed.
-6. **Export Excel** when done (only **✓** accepted segments are exported).
+6. **Save segments** / **Export Excel** when done (only **✓** accepted segments are exported).
 
 **File pairing:** use `rotatedGaze.txt` with `gazeTime.txt` from the same folder (not `sranipalGazeTime.txt` unless you also use `sranipalGazeSpace.txt`).
 
@@ -206,8 +208,8 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Segment labels** | `#N` on accepted (green), `?N` on proposed (blue) segments in the plot |
 | **Edit segments** | Delete selected (`Del`), undo last (`U`), drag edges on plot, nudge boundaries (`[ ]` start, `, .` end) |
 | **Auto-detect** | Sliding-window detector proposes slow phases for manual review (see below) |
-| **Stimulus velocity** | Editable anytime. Enter recalculates gains for all segments. |
-| **JSON markings** | Save/load accepted segments as `{trial_id}_slowphase_okr_autosave.json` in a **personal annotations folder** (not the shared Box trial folder). Use **Annotations folder…** and **Load markings…**. Load trial starts unmarked unless your folder has a matching file. |
+| **Stimulus velocity** | Required before Load trial (empty until you enter it). Confirmed in a dialog on load. Gain = slope ÷ velocity. |
+| **JSON markings** | **Annotations folder** is required (personal folder only). Press **Save segments** to write JSON. If that filename already exists, you must pick a new name. Use **Load markings…** to reopen. |
 | **Reload guard** | Confirms before discarding accepted or proposed segments |
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray) |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
@@ -222,10 +224,12 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 
 When several people annotate the same trial folders on Box, keep markings out of the shared trial folder:
 
-1. On **Load trial**, if no save folder is set yet, the app prompts you to choose one (you can also use **Annotations folder…** anytime). Pick a **personal** directory that you create (e.g. Desktop or a private Box folder under your name).
-2. Mark segments as usual — accepted segments autosave as `{trial_id}_slowphase_okr_autosave.json` in that folder.
+1. **Annotations folder** is required (step 1). Create a **personal** directory only you use (e.g. `Desktop/okr_annotations_YourName`). Never point this at the shared Box trial folder.
+2. Mark segments as usual, then click **Save segments** to write JSON there (default name `{subject}_{condition}_slowphase_okr_markings.json`). Accepting or editing segments does **not** write a file. If that name already exists, the app warns you and asks you to **save under a different name**.
 3. Later, **Load trial** then either accept the restore prompt (if a matching file is in your folder) or click **Load markings…** to pick any JSON.
-4. Without a personal folder / without loading JSON, the trial shows **no marked segments**.
+4. Without loading JSON, the trial shows **no marked segments**.
+
+**Trial ID** is `{parent of trial folder}_{trial folder}` — subject/patient session folder plus the condition folder that holds the gaze file.
 
 The annotations folder preference is remembered in `~/.slowphase_okr_prefs.json`.
 
