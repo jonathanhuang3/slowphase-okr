@@ -82,6 +82,9 @@ def _block_label(
     if direction in ("Up", "Down"):
         arrow = "↑" if direction == "Up" else "↓"
         return f"{prefix}{arrow}"
+    if direction in ("Left", "Right"):
+        arrow = "←" if direction == "Left" else "→"
+        return f"{prefix}{arrow}"
     return prefix
 
 
@@ -149,7 +152,7 @@ def format_block_condition(marker: OkrLogBlockMarker) -> str:
     elif marker.is_anchor100:
         parts.append("anchor 100%")
 
-    if marker.direction in ("Up", "Down"):
+    if marker.direction in ("Up", "Down", "Left", "Right"):
         parts.append(marker.direction)
 
     flicker = _flicker_label(marker)

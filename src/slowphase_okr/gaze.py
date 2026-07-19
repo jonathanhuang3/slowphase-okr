@@ -27,6 +27,7 @@ class GazeTrial:
 
     times: np.ndarray  # seconds
     elevation_deg: np.ndarray  # degrees
+    azimuth_deg: np.ndarray | None = None  # degrees (horizontal)
     trial_id: str = ""
     source_gaze: str = ""
     source_time: str = ""
@@ -111,17 +112,18 @@ def load_ush2a_trial(
 
     invalid = np.isnan(xs) | np.isnan(ys) | np.isnan(zs)
     azimuth, elevation, _ = unity_gaze_direction(xs, ys, zs)
-    elevation_deg = np.degrees(elevation)
-    azimuth_deg = np.degrees(azimuth)
+    elevation_deg = np.degrees(elevation).astype(float)
+    azimuth_deg = np.degrees(azimuth).astype(float)
     elevation_deg[invalid] = np.nan
+    azimuth_deg[invalid] = np.nan
 
     failure = (~invalid) & (azimuth_deg == 0) & (elevation_deg == 0)
     padded = failure.copy()
     for offset in range(1, padding_frames + 1):
         padded[offset:] |= failure[:-offset]
         padded[:-offset] |= failure[offset:]
-    elevation_deg = elevation_deg.astype(float)
     elevation_deg[padded] = np.nan
+    azimuth_deg[padded] = np.nan
 
     if not trial_id:
         trial_id = gaze_path.parent.name or gaze_path.stem
@@ -129,6 +131,7 @@ def load_ush2a_trial(
     return GazeTrial(
         times=times,
         elevation_deg=elevation_deg,
+        azimuth_deg=azimuth_deg,
         trial_id=trial_id,
         source_gaze=str(gaze_path.resolve()),
         source_time=str(time_path.resolve()),

@@ -65,7 +65,21 @@ def test_load_ush2a_trial(tmp_path: Path):
     trial = load_ush2a_trial(gaze, timef, trial_id="test")
     assert trial.trial_id == "test"
     assert len(trial.times) == 3
+    assert trial.azimuth_deg is not None
+    assert len(trial.azimuth_deg) == 3
     assert np.all(np.diff(trial.elevation_deg[~np.isnan(trial.elevation_deg)]) > 0)
+
+
+def test_load_ush2a_trial_azimuth(tmp_path: Path):
+    gaze = tmp_path / "rotatedGaze.txt"
+    # Increasing x with fixed z → increasing azimuth (avoid 0,0 which is treated as invalid)
+    gaze.write_text("(0.1, 0.05, 1.0)\n(0.3, 0.05, 1.0)\n(0.5, 0.05, 1.0)\n")
+    timef = tmp_path / "gazeTime.txt"
+    timef.write_text("0.0\n0.01\n0.02\n")
+    trial = load_ush2a_trial(gaze, timef, trial_id="az_test")
+    assert trial.azimuth_deg is not None
+    assert np.all(np.isfinite(trial.azimuth_deg))
+    assert np.all(np.diff(trial.azimuth_deg) > 0)
 
 
 def test_load_ush2a_trial_with_nan_gaze(tmp_path: Path):
@@ -82,6 +96,9 @@ def test_load_ush2a_trial_with_nan_gaze(tmp_path: Path):
     assert len(trial.times) == 4
     assert np.isnan(trial.elevation_deg[:2]).all()
     assert np.isfinite(trial.elevation_deg[2:]).all()
+    assert trial.azimuth_deg is not None
+    assert np.isnan(trial.azimuth_deg[:2]).all()
+    assert np.isfinite(trial.azimuth_deg[2:]).all()
 
 
 def test_load_okr_log(tmp_path: Path):
@@ -155,6 +172,26 @@ def test_condition_at_time(tmp_path: Path):
 
     text_fix = condition_at_time(okr, 68.0)
     assert "Initial fixation" in text_fix
+
+
+def test_okr_left_right_labels_and_detect_map(tmp_path: Path):
+    from slowphase_okr.detect import _okr_direction_to_detect
+    from slowphase_okr.okr_log import load_okr_log
+
+    log = tmp_path / "OKR_Log_lr.txt"
+    log.write_text(
+        "# OKR Condition Log\n"
+        "eventIndex\teventType\teyePatch\tcontrastBlockIndex\tdotColor\t"
+        "direction\tcontrastLevel\tdotStartSize\temissionRate\tusePersistentDots\t"
+        "sessionContrastThreshold\tthresholdMultiplier\tisAnchor100\tstartTime\tendTime\n"
+        "1\tContrastBlock\tLeft\t0\tWhite\tLeft\t0.5\t0.7\t20000\t0\t0.1\t2\t0\t10.0\t20.0\n"
+        "2\tContrastBlock\tLeft\t1\tWhite\tRight\t0.5\t0.7\t20000\t0\t0.1\t2\t0\t25.0\t35.0\n"
+    )
+    okr = load_okr_log(log)
+    assert okr.block_markers[0].label == "B0←"
+    assert okr.block_markers[1].label == "B1→"
+    assert _okr_direction_to_detect("Left") == "down"
+    assert _okr_direction_to_detect("Right") == "up"
 
 
 def test_median_gain():

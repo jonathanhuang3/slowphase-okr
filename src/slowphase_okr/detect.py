@@ -39,9 +39,11 @@ class CollapsedSeries:
 
 
 def _okr_direction_to_detect(direction: str | None) -> str | None:
-    if direction == "Up":
+    # "up"/"down" mean positive/negative slope in the active signal.
+    # For azimuth: Right → increasing (positive), Left → decreasing (negative).
+    if direction in ("Up", "Right"):
         return "up"
-    if direction == "Down":
+    if direction in ("Down", "Left"):
         return "down"
     return None
 

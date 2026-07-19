@@ -68,8 +68,8 @@ Other
 Notes
   • Use tab “1. Load trial” for files/velocity, then “2. Annotate” for the plot and table.
   • Analysis window spans the full trial (first to last timestamp).
-  • Signal is elevation from rotated gaze.
-  • Zero elev at start: subtract elevation at the first valid sample so the trace starts at 0°
+  • Signal: Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze.
+  • Zero at start: subtract angle at the first valid sample so the trace starts at 0°
     (removes headset pose offset; slopes and gains are unchanged).
   • R² is logged and exported but segments are not auto-rejected.
   • On Load trial: choose a personal annotations folder (not shared Box data), then files + velocity.
@@ -77,13 +77,15 @@ Notes
   • If that JSON name already exists, you will be asked to save under a new name.
   • Trial ID is set from the gaze file’s parent folder name.
   • Optional OKR log marks contrast-block and fixation-cross start times on the plot.
+    Use Clear OKR log on the Load trial tab to remove markers for the next patient.
   • With an OKR log loaded, the condition line under the plot shows contrast, direction,
     flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time.
   • Auto-detect proposes segments (blue); review, nudge, accept (A), or delete.
 
 Auto-detect review
   Propose segments   Sliding-window detector (see panel parameters)
-  Direction Auto     Uses Up/Down from OKR log per contrast block
+  Direction Auto     Uses Up/Down/Left/Right from OKR log per contrast block
+                     (Left/Right map to negative/positive azimuth slope)
   N / P              Jump to next / previous proposed segment
   A                  Accept pending manual segment, hovered proposed, or selected proposed
   Del                Delete selected accepted or proposed segment
@@ -210,6 +212,11 @@ def _bind_tooltip(widget: tk.Widget, text: str) -> None:
 
 class AnnotatorApp:
     SIGNAL_ELEVATION = "elevation"
+    SIGNAL_AZIMUTH = "azimuth"
+    SIGNAL_CHOICES = (
+        ("Elevation (vertical OKR)", SIGNAL_ELEVATION),
+        ("Azimuth (left/right OKR)", SIGNAL_AZIMUTH),
+    )
 
     DEFAULT_VIEW_DURATION = 2.0
     VIEW_PRESET_LABELS = ("1 s", "2 s", "5 s", "10 s", "Full trial")
@@ -256,6 +263,8 @@ class AnnotatorApp:
         self.view_xmin: float | None = None
         self.view_xmax: float | None = None
         self.annotations_dir: Path | None = get_annotations_dir()
+        self._signal_mode_map = {label: mode for label, mode in self.SIGNAL_CHOICES}
+        self._signal_label_map = {mode: label for label, mode in self.SIGNAL_CHOICES}
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4, 0))
@@ -290,37 +299,55 @@ class AnnotatorApp:
         return max(self.analysis_t1 - self.analysis_t0, self.MIN_VIEW_DURATION)
 
     def _signal_mode(self) -> str:
-        return self.SIGNAL_ELEVATION
+        if not hasattr(self, "signal_var"):
+            return self.SIGNAL_ELEVATION
+        return self._signal_mode_map.get(
+            self.signal_var.get(), self.SIGNAL_ELEVATION
+        )
 
     def _active_times(self) -> np.ndarray:
         assert self.trial is not None
         return self.trial.times
 
-    def _active_values(self) -> np.ndarray:
+    def _raw_signal_values(self) -> np.ndarray:
         assert self.trial is not None
-        return self.trial.elevation_deg - self._elevation_zero_offset()
+        if self._signal_mode() == self.SIGNAL_AZIMUTH:
+            az = self.trial.azimuth_deg
+            if az is None:
+                return np.full_like(self.trial.elevation_deg, np.nan)
+            return az
+        return self.trial.elevation_deg
 
-    def _elevation_zero_offset(self) -> float:
-        """Offset so first valid elevation sample is 0° when the view option is on."""
+    def _active_values(self) -> np.ndarray:
+        return self._raw_signal_values() - self._signal_zero_offset()
+
+    def _signal_zero_offset(self) -> float:
+        """Offset so first valid sample is 0° when the zero-at-start option is on."""
         if not getattr(self, "zero_elevation_var", None) or not self.zero_elevation_var.get():
             return 0.0
         if self.trial is None:
             return 0.0
-        elev = self.trial.elevation_deg
-        finite = elev[np.isfinite(elev)]
+        values = self._raw_signal_values()
+        finite = values[np.isfinite(values)]
         if finite.size == 0:
             return 0.0
         return float(finite[0])
 
+    def _elevation_zero_offset(self) -> float:
+        """Backward-compatible alias used by older call sites."""
+        return self._signal_zero_offset()
+
     def _signal_plot_label(self) -> str:
+        base = "Azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "Elevation"
         if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
-            return "Elevation (zeroed)"
-        return "Elevation"
+            return f"{base} (zeroed)"
+        return base
 
     def _signal_y_label(self) -> str:
+        base = "Azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "Elevation"
         if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
-            return "Elevation (deg, zeroed at start)"
-        return "Elevation (deg)"
+            return f"{base} (deg, zeroed at start)"
+        return f"{base} (deg)"
 
     def _signal_slope_unit(self) -> str:
         return "deg/s"
@@ -332,6 +359,24 @@ class AnnotatorApp:
             self._active_times(), self.analysis_t0, t_end=self.analysis_t1
         )
 
+    def _on_signal_selected(self, _event=None) -> None:
+        if self._signal_mode() == self.SIGNAL_AZIMUTH:
+            if self.trial is None or self.trial.azimuth_deg is None:
+                self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
+                messagebox.showwarning(
+                    "Azimuth unavailable",
+                    "This trial has no azimuth data. Load a rotated-gaze trial first.",
+                )
+                return
+        if self.pending_start_idx is not None or self.pending_fit is not None:
+            self._clear_pending(redraw=False)
+            self._set_status("Cleared pending segment after signal change.")
+        self._refit_all_segments()
+        self._update_signal_ylim()
+        self._redraw()
+        mode = "azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "elevation"
+        self._set_status(f"Signal: {mode}. Segments refit on this trace.")
+
     def _on_zero_elevation_toggled(self) -> None:
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
@@ -340,10 +385,10 @@ class AnnotatorApp:
         self._redraw()
         if self.zero_elevation_var.get():
             self._set_status(
-                "Elevation zeroed at first valid sample (display + fits; slopes/gains unchanged)."
+                "Zeroed at first valid sample (display + fits; slopes/gains unchanged)."
             )
         else:
-            self._set_status("Showing absolute elevation.")
+            self._set_status("Showing absolute angle.")
 
     def _refit_all_segments(self) -> None:
         if self.trial is None:
@@ -528,6 +573,9 @@ class AnnotatorApp:
         )
         self.okr_log_file_label = ttk.Label(step4, text="None (optional)")
         self.okr_log_file_label.grid(row=0, column=1, sticky=tk.W)
+        ttk.Button(step4, text="Clear OKR log", command=self._clear_okr_log).grid(
+            row=0, column=2, sticky=tk.E, padx=(10, 0)
+        )
 
         # ── Load ─────────────────────────────────────────────────────
         load_row = ttk.Frame(top)
@@ -583,10 +631,22 @@ class AnnotatorApp:
             foreground="#333333",
         ).pack(side=tk.LEFT, padx=(0, 12))
 
+        ttk.Label(toolbar, text="Signal:").pack(side=tk.LEFT)
+        self.signal_var = tk.StringVar(value=self.SIGNAL_CHOICES[0][0])
+        self.signal_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.signal_var,
+            values=[label for label, _ in self.SIGNAL_CHOICES],
+            state="readonly",
+            width=26,
+        )
+        self.signal_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.signal_combo.bind("<<ComboboxSelected>>", self._on_signal_selected)
+
         self.zero_elevation_var = tk.BooleanVar(value=True)
         self.zero_elevation_chk = ttk.Checkbutton(
             toolbar,
-            text="Zero elev at start",
+            text="Zero at start",
             variable=self.zero_elevation_var,
             command=self._on_zero_elevation_toggled,
         )
@@ -1041,7 +1101,7 @@ class AnnotatorApp:
         t = float(self._active_times()[idx])
         self._update_condition_display(t)
         value = float(self._active_values()[idx])
-        value_label = f"elevation = {value:.2f}°"
+        value_label = f"{self._signal_plot_label().lower()} = {value:.2f}°"
         if self.pending_fit is not None:
             self.hover_var.set(
                 f"t = {t:.3f} s, {value_label} — "
@@ -1201,6 +1261,20 @@ class AnnotatorApp:
                 if self.okr_log.block_markers
                 else None
             )
+
+    def _clear_okr_log(self) -> None:
+        if self.okr_log_path is None and self.okr_log is None:
+            self._set_status("No OKR log to clear.")
+            return
+        self.okr_log_path = None
+        self.okr_log = None
+        self.detect_dir_var.set("Up")
+        self.detect_blocks_var.set(False)
+        self._update_files_label()
+        self.condition_var.set("")
+        if self.trial is not None:
+            self._redraw()
+        self._set_status("Cleared OKR log markers and condition readout.")
 
     def _parse_okr_log(self, show_error: bool = False) -> bool:
         if not self.okr_log_path:
@@ -1569,7 +1643,23 @@ class AnnotatorApp:
             self.stim_vel_var.set(str(vel))
             self._applied_stimulus_velocity = float(vel)
             self._set_velocity_status(f"Applied: {float(vel):g} deg/s", kind="ok")
-        # Always use elevation; ignore any legacy pupil signal_mode in JSON.
+        # Restore signal mode when valid for this trial.
+        signal_mode = data.get("signal_mode")
+        if (
+            isinstance(signal_mode, str)
+            and signal_mode in self._signal_label_map
+            and (
+                signal_mode == self.SIGNAL_ELEVATION
+                or (
+                    signal_mode == self.SIGNAL_AZIMUTH
+                    and self.trial is not None
+                    and self.trial.azimuth_deg is not None
+                )
+            )
+        ):
+            self.signal_var.set(self._signal_label_map[signal_mode])
+        else:
+            self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
         if restored:
             self._refit_all_segments()
             self._update_signal_ylim()

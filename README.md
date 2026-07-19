@@ -200,8 +200,8 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | Feature | Description |
 |---------|-------------|
 | **Analysis window** | Full trial — first timestamp to last timestamp |
-| **Signal** | Elevation from rotated gaze (deg) |
-| **Zero elev at start** | Optional (on by default). Subtracts elevation at the first valid sample so the trace starts at 0° — removes headset pose offset. Slopes and gains are unchanged. |
+| **Signal** | Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze |
+| **Zero at start** | Optional (on by default). Subtracts the angle at the first valid sample so the trace starts at 0° — removes headset pose offset. Slopes and gains are unchanged. |
 | **Fixed y-axis** | Signal scale stays fixed to the full trial while you pan in time |
 | **Segment list** | Shows proposed (`?`) and accepted (`✓`) segments sorted by time |
 | **Segment labels** | `#N` on accepted (green), `?N` on proposed (blue) segments in the plot |
@@ -210,7 +210,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Stimulus velocity** | Required before Load trial (empty until you enter it). Confirmed in a dialog on load. Gain = slope ÷ velocity. |
 | **JSON markings** | **Annotations folder** is required (personal folder only). Press **Save segments** to write JSON. If that filename already exists, you must pick a new name. Use **Load markings…** to reopen. |
 | **Reload guard** | Confirms before discarding accepted or proposed segments |
-| **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray) |
+| **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray). Clear OKR log removes markers for the next patient. |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
 | **Invalid gaze samples** | `(NaN, NaN, NaN)` lines stay aligned but are skipped for clicking and fitting |
 | **Parameter tooltips** | Hover auto-detect settings in the app for plain-language help |
@@ -260,7 +260,7 @@ Hover any setting in the **Auto-detect** panel for a tooltip. Summary:
 
 | Parameter | Default | What it does |
 |-----------|---------|--------------|
-| **Direction** | Auto | **Auto:** Up/Down from each OKR contrast block. **Up/Down:** force one direction for the whole search. Auto requires OKR log + contrast-block checkbox. |
+| **Direction** | Auto | **Auto:** Up/Down/Left/Right from each OKR contrast block (Left→negative slope, Right→positive). **Up/Down:** force one slope sign for the whole search. Auto requires OKR log + contrast-block checkbox. |
 | **Max saccade velocity** | 100 deg/s | Reject candidates with a speed spike above this inside the segment (filters saccades). Lower = stricter. |
 | **Min duration** | 50 ms | Shortest segment to keep. Shorter = more proposals. |
 | **Min R²** | 0.75 | Minimum straightness of the line fit (0–1). Lower = accept noisier traces. |
@@ -286,7 +286,7 @@ This is the format the app loads.
 
 **Example filenames** (from our Vive Pro Eye / Tobii + Unity setup): `rotatedGaze.txt` and `gazeTime.txt`, or raw SRanipal exports like `sranipalGazeSpace.txt` and `sranipalGazeTime.txt`. Your lab may use different names — that is fine as long as the content matches.
 
-This tool was developed for our lab to support gaze data recorded with a **HTC Vive Pro Eye** headset (Tobii eye tracking). The gaze file holds direction vectors in the experiment’s rotated coordinate frame. The app converts `(x, y, z)` to elevation (`azimuth = atan2(x,z)`, `elevation = asin(y/r)`).
+This tool was developed for our lab to support gaze data recorded with a **HTC Vive Pro Eye** headset (Tobii eye tracking). The gaze file holds direction vectors in the experiment’s rotated coordinate frame. The app converts `(x, y, z)` to elevation and azimuth (`azimuth = atan2(x,z)`, `elevation = asin(y/r)`). Use **Elevation** for vertical OKR and **Azimuth** for left/right OKR.
 
 **Requirements**
 
@@ -317,9 +317,9 @@ Older stimulus versions did not write this file. If your session includes an OKR
 | `fixation` (case-insensitive) | Gray dotted line — fixation cross / ITI start (`F`) |
 | Anything else | Purple dashed line — contrast block start (label e.g. `B2↓`) |
 
-Block labels use `contrastBlockIndex` and direction when available. New block event names are detected automatically without updating the app.
+Block labels use `contrastBlockIndex` and direction when available (`↑↓` for Up/Down, `←→` for Left/Right). New block event names are detected automatically without updating the app.
 
-**Condition readout:** With an OKR log loaded, a line under the plot shows the condition at the hovered time (or the center of the current view): contrast level, direction, flicker vs persistent, and session tags from `StimulusName` (e.g. Increment / Decrement, White / Black dots).
+**Condition readout:** With an OKR log loaded, a line under the plot shows the condition at the hovered time (or the center of the current view): contrast level, direction, flicker vs persistent, and session tags from `StimulusName` (e.g. Increment / Decrement, White / Black dots). Use **Clear OKR log** on the Load trial tab to remove markers and the condition line before the next patient.
 
 **Example filenames:** `OKR_Log_Patient_Testing.txt` or similar in the same folder as gaze/time files.
 
