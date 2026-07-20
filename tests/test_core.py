@@ -11,7 +11,10 @@ from slowphase_okr.gaze import (
     attach_sranipal_pupil,
     discover_pupil_files,
     infer_viewing_eye,
+    is_tobii_glasses3_gazedata,
+    load_gaze_trial,
     load_sranipal_pupil,
+    load_tobii_glasses3_trial,
     load_ush2a_trial,
     unity_gaze_direction,
 )
@@ -101,6 +104,113 @@ def test_load_ush2a_trial_with_nan_gaze(tmp_path: Path):
     assert np.isfinite(trial.azimuth_deg[2:]).all()
 
 
+def test_load_tobii_glasses3_trial(tmp_path: Path):
+    import json
+
+    path = tmp_path / "recording" / "gazedata.json"
+    path.parent.mkdir()
+    rows = [
+        {
+            "type": "gaze",
+            "timestamp": 0.0,
+            "data": {
+                "gaze2d": [0.5, 0.5],
+                "gaze3d": [0.0, 0.0, 500.0],
+                "eyeleft": {
+                    "gazedirection": [0.0, 0.0, 1.0],
+                    "pupildiameter": 3.0,
+                },
+                "eyeright": {
+                    "gazedirection": [0.0, 0.0, 1.0],
+                    "pupildiameter": 3.0,
+                },
+            },
+        },
+        {"type": "gaze", "timestamp": 0.02, "data": {}},  # tracking lost
+        {
+            "type": "gaze",
+            "timestamp": 0.04,
+            "data": {
+                "eyeleft": {"gazedirection": [0.0, np.sin(np.radians(10)), np.cos(np.radians(10))]},
+                "eyeright": {"gazedirection": [0.0, np.sin(np.radians(10)), np.cos(np.radians(10))]},
+            },
+        },
+        {
+            "type": "gaze",
+            "timestamp": 0.06,
+            "data": {
+                # only gaze3d
+                "gaze3d": [0.0, 100.0, 100.0],
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    assert is_tobii_glasses3_gazedata(path)
+    trial = load_tobii_glasses3_trial(path)
+    assert trial.source_format == "tobii_glasses3"
+    assert trial.source_time == trial.source_gaze
+    assert len(trial.times) == 3  # empty data skipped
+    assert trial.times[0] == pytest.approx(0.0)
+    assert trial.elevation_deg[0] == pytest.approx(0.0, abs=1e-6)
+    assert trial.elevation_deg[1] == pytest.approx(10.0, abs=1e-3)
+    assert trial.azimuth_deg is not None
+    assert np.isfinite(trial.elevation_deg[2])
+    assert trial.has_per_eye_gaze()
+    assert trial.elevation_left_deg is not None
+    assert trial.elevation_right_deg is not None
+    assert trial.elevation_left_deg[1] == pytest.approx(10.0, abs=1e-3)
+    assert trial.elevation_right_deg[1] == pytest.approx(10.0, abs=1e-3)
+    # gaze3d-only sample: binocular finite, per-eye NaN
+    assert np.isfinite(trial.elevation_deg[2])
+    assert np.isnan(trial.elevation_left_deg[2])
+    assert np.isnan(trial.elevation_right_deg[2])
+
+    via_dispatch = load_gaze_trial(path, trial_id="g3")
+    assert via_dispatch.source_format == "tobii_glasses3"
+    assert via_dispatch.trial_id == "g3"
+
+
+def test_tobii_left_right_differ(tmp_path: Path):
+    import json
+
+    path = tmp_path / "gazedata.json"
+    elev_l, elev_r = 5.0, -3.0
+    row = {
+        "type": "gaze",
+        "timestamp": 1.0,
+        "data": {
+            "eyeleft": {
+                "gazedirection": [
+                    0.0,
+                    float(np.sin(np.radians(elev_l))),
+                    float(np.cos(np.radians(elev_l))),
+                ]
+            },
+            "eyeright": {
+                "gazedirection": [
+                    0.0,
+                    float(np.sin(np.radians(elev_r))),
+                    float(np.cos(np.radians(elev_r))),
+                ]
+            },
+        },
+    }
+    path.write_text(json.dumps(row) + "\n")
+    trial = load_tobii_glasses3_trial(path)
+    assert trial.elevation_left_deg is not None
+    assert trial.elevation_right_deg is not None
+    assert trial.elevation_left_deg[0] == pytest.approx(elev_l, abs=1e-3)
+    assert trial.elevation_right_deg[0] == pytest.approx(elev_r, abs=1e-3)
+    assert trial.elevation_deg[0] == pytest.approx(0.5 * (elev_l + elev_r), abs=1e-3)
+
+
+def test_is_tobii_rejects_unity_gaze(tmp_path: Path):
+    gaze = tmp_path / "rotatedGaze.txt"
+    gaze.write_text("(0.0, 0.1, 1.0)\n(0.0, 0.2, 1.0)\n")
+    assert not is_tobii_glasses3_gazedata(gaze)
+
+
 def test_load_okr_log(tmp_path: Path):
     log = tmp_path / "OKR_Log_test.txt"
     log.write_text(
@@ -154,7 +264,7 @@ def test_condition_at_time(tmp_path: Path):
     )
     okr = load_okr_log(log)
     text = condition_at_time(okr, 75.0)
-    assert "Session: Increment · White dots" in text
+    assert "Session: Dots → Right eye · Increment · White dots" in text
     assert "B0" in text
     assert "Up" in text
     assert "Persistent" in text
@@ -171,6 +281,7 @@ def test_condition_at_time(tmp_path: Path):
     assert "B3" in text_flicker
 
     text_fix = condition_at_time(okr, 68.0)
+    assert "Dots → Right eye" in text_fix
     assert "Initial fixation" in text_fix
 
 
@@ -202,6 +313,56 @@ def test_median_gain():
         SegmentFit(2, 2, 3, 1, 2, 2, 30, 0, 30 / 31, 0.98, True, 31),
     ]
     assert trial_summary_median_gain(segs) == pytest.approx((20 / 31 + 30 / 31) / 2)
+
+
+def test_summarize_gains_by_block(tmp_path: Path):
+    from slowphase_okr.export import export_to_excel
+    from slowphase_okr.fit import SegmentFit, summarize_gains_by_block
+    from slowphase_okr.okr_log import load_okr_log
+
+    log = tmp_path / "OKR_Log_test.txt"
+    log.write_text(
+        "# OKR Condition Log\n"
+        "# StimulusName: Comb4 Block3 RE Increment White Dots\n"
+        "eventIndex\teventType\teyePatch\tcontrastBlockIndex\tdotColor\t"
+        "direction\tcontrastLevel\tdotStartSize\temissionRate\tusePersistentDots\t"
+        "sessionContrastThreshold\tthresholdMultiplier\tisAnchor100\tstartTime\tendTime\n"
+        "2\tContrastBlock\tLeft\t0\tWhite\tUp\t0.5\t0.7\t20000\t0\t0.1\t2\t0\t10.0\t20.0\n"
+        "4\tContrastBlock\tLeft\t1\tWhite\tDown\t0.25\t0.7\t20000\t0\t0.1\t4\t0\t30.0\t40.0\n"
+    )
+    okr = load_okr_log(log)
+    segs = [
+        SegmentFit(1, 0, 1, 12.0, 13.0, 10, 8.0, 0.0, 0.80, 0.95, True, 10.0),
+        SegmentFit(2, 2, 3, 14.0, 15.0, 10, 9.0, 0.0, 0.90, 0.96, True, 10.0),
+        SegmentFit(3, 4, 5, 32.0, 33.0, 10, -7.0, 0.0, -0.70, 0.94, False, 10.0),
+        SegmentFit(4, 6, 7, 50.0, 51.0, 10, 5.0, 0.0, 0.50, 0.90, True, 10.0),
+    ]
+    summaries = summarize_gains_by_block(segs, okr)
+    assert len(summaries) == 3
+    by_label = {s.block_label: s for s in summaries}
+    assert by_label["B0↑"].n_segments == 2
+    assert by_label["B0↑"].median_gain == pytest.approx(0.85)
+    assert by_label["B0↑"].direction == "Up"
+    assert by_label["B0↑"].contrast_level == pytest.approx(0.5)
+    assert by_label["B1↓"].n_segments == 1
+    assert by_label["B1↓"].median_gain == pytest.approx(-0.70)
+    assert by_label["Outside blocks"].n_segments == 1
+    assert "Increment" in by_label["B0↑"].session_tags
+
+    out = export_to_excel(
+        segs,
+        trial_id="t",
+        software_version="0.0",
+        output_path=tmp_path / "out.xlsx",
+        okr_log=okr,
+    )
+    import pandas as pd
+
+    by_block = pd.read_excel(out, sheet_name="by_block")
+    segments = pd.read_excel(out, sheet_name="segments")
+    assert "median_gain" in by_block.columns
+    assert "block_label" in segments.columns
+    assert len(by_block) == 3
 
 
 def test_detect_upward_slow_phases():

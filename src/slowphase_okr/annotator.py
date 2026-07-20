@@ -33,14 +33,21 @@ from slowphase_okr.fit import (
     fit_segment,
     refit_segment_by_time,
     snap_index,
+    summarize_gains_by_block,
     trial_summary_median_gain,
 )
 from slowphase_okr.gaze import (
     GazeTrial,
     analysis_window_mask,
-    load_ush2a_trial,
+    is_tobii_glasses3_gazedata,
+    load_gaze_trial,
 )
-from slowphase_okr.okr_log import OkrLog, condition_at_time, load_okr_log
+from slowphase_okr.okr_log import (
+    OkrLog,
+    condition_at_time,
+    load_okr_log,
+    segment_condition_fields,
+)
 
 
 HELP_TEXT = """Keyboard shortcuts
@@ -68,18 +75,24 @@ Other
 Notes
   • Use tab “1. Load trial” for files/velocity, then “2. Annotate” for the plot and table.
   • Analysis window spans the full trial (first to last timestamp).
+  • Gaze: Vive/Unity rotatedGaze.txt + gazeTime.txt, or Tobii Glasses 3 gazedata.json
+    (timestamps embedded — no separate time file).
+  • Tobii Eye menu: Binocular / Left / Right (per-eye gaze direction).
   • Signal: Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze.
+  • Connect points: optional line through successive samples (helps manual marking).
   • Zero at start: subtract angle at the first valid sample so the trace starts at 0°
     (removes headset pose offset; slopes and gains are unchanged).
   • R² is logged and exported but segments are not auto-rejected.
   • On Load trial: choose a personal annotations folder (not shared Box data), then files + velocity.
     Press Save segments to write JSON; use Load markings… to reopen a prior file.
-  • If that JSON name already exists, you will be asked to save under a new name.
+  • If that JSON name already exists, you will be asked whether to overwrite or save under a new name.
   • Trial ID is set from the gaze file’s parent folder name.
   • Optional OKR log marks contrast-block and fixation-cross start times on the plot.
     Use Clear OKR log on the Load trial tab to remove markers for the next patient.
-  • With an OKR log loaded, the condition line under the plot shows contrast, direction,
-    flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time.
+  • With an OKR log loaded, the condition line under the plot shows which eye saw the dots
+    (Dots → Left/Right), contrast, direction, flicker/persistent, and Increment/Decrement.
+  • Accepted segments are grouped by OKR log block for separate median/mean gain summaries
+    (panel + Excel ``by_block`` sheet).
   • Auto-detect proposes segments (blue); review, nudge, accept (A), or delete.
 
 Auto-detect review
@@ -217,6 +230,14 @@ class AnnotatorApp:
         ("Elevation (vertical OKR)", SIGNAL_ELEVATION),
         ("Azimuth (left/right OKR)", SIGNAL_AZIMUTH),
     )
+    EYE_BINOCULAR = "binocular"
+    EYE_LEFT = "left"
+    EYE_RIGHT = "right"
+    EYE_CHOICES = (
+        ("Binocular", EYE_BINOCULAR),
+        ("Left eye", EYE_LEFT),
+        ("Right eye", EYE_RIGHT),
+    )
 
     DEFAULT_VIEW_DURATION = 2.0
     VIEW_PRESET_LABELS = ("1 s", "2 s", "5 s", "10 s", "Full trial")
@@ -265,6 +286,8 @@ class AnnotatorApp:
         self.annotations_dir: Path | None = get_annotations_dir()
         self._signal_mode_map = {label: mode for label, mode in self.SIGNAL_CHOICES}
         self._signal_label_map = {mode: label for label, mode in self.SIGNAL_CHOICES}
+        self._eye_mode_map = {label: mode for label, mode in self.EYE_CHOICES}
+        self._eye_label_map = {mode: label for label, mode in self.EYE_CHOICES}
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4, 0))
@@ -305,13 +328,38 @@ class AnnotatorApp:
             self.signal_var.get(), self.SIGNAL_ELEVATION
         )
 
+    def _eye_mode(self) -> str:
+        if not hasattr(self, "eye_var"):
+            return self.EYE_BINOCULAR
+        return self._eye_mode_map.get(self.eye_var.get(), self.EYE_BINOCULAR)
+
     def _active_times(self) -> np.ndarray:
         assert self.trial is not None
         return self.trial.times
 
     def _raw_signal_values(self) -> np.ndarray:
         assert self.trial is not None
-        if self._signal_mode() == self.SIGNAL_AZIMUTH:
+        want_az = self._signal_mode() == self.SIGNAL_AZIMUTH
+        eye = self._eye_mode()
+        if (
+            eye != self.EYE_BINOCULAR
+            and self.trial.has_per_eye_gaze()
+        ):
+            if want_az:
+                if eye == self.EYE_LEFT:
+                    az = self.trial.azimuth_left_deg
+                else:
+                    az = self.trial.azimuth_right_deg
+                if az is None:
+                    return np.full_like(self.trial.elevation_deg, np.nan)
+                return az
+            if eye == self.EYE_LEFT:
+                assert self.trial.elevation_left_deg is not None
+                return self.trial.elevation_left_deg
+            assert self.trial.elevation_right_deg is not None
+            return self.trial.elevation_right_deg
+
+        if want_az:
             az = self.trial.azimuth_deg
             if az is None:
                 return np.full_like(self.trial.elevation_deg, np.nan)
@@ -339,12 +387,22 @@ class AnnotatorApp:
 
     def _signal_plot_label(self) -> str:
         base = "Azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "Elevation"
+        eye = self._eye_mode()
+        if eye == self.EYE_LEFT:
+            base = f"{base} L"
+        elif eye == self.EYE_RIGHT:
+            base = f"{base} R"
         if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
             return f"{base} (zeroed)"
         return base
 
     def _signal_y_label(self) -> str:
         base = "Azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "Elevation"
+        eye = self._eye_mode()
+        if eye == self.EYE_LEFT:
+            base = f"Left {base.lower()}"
+        elif eye == self.EYE_RIGHT:
+            base = f"Right {base.lower()}"
         if getattr(self, "zero_elevation_var", None) and self.zero_elevation_var.get():
             return f"{base} (deg, zeroed at start)"
         return f"{base} (deg)"
@@ -377,6 +435,35 @@ class AnnotatorApp:
         mode = "azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "elevation"
         self._set_status(f"Signal: {mode}. Segments refit on this trace.")
 
+    def _on_eye_selected(self, _event=None) -> None:
+        if self._eye_mode() != self.EYE_BINOCULAR:
+            if self.trial is None or not self.trial.has_per_eye_gaze():
+                self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
+                messagebox.showwarning(
+                    "Per-eye gaze unavailable",
+                    "Left/right eye traces are only available for Tobii Glasses 3 "
+                    "gazedata.json trials.",
+                )
+                return
+        if self.pending_start_idx is not None or self.pending_fit is not None:
+            self._clear_pending(redraw=False)
+            self._set_status("Cleared pending segment after eye change.")
+        self._refit_all_segments()
+        self._update_signal_ylim()
+        self._redraw()
+        self._set_status(
+            f"Eye: {self.eye_var.get()}. Segments refit on this trace."
+        )
+
+    def _update_eye_combo_state(self) -> None:
+        if not hasattr(self, "eye_combo"):
+            return
+        if self.trial is not None and self.trial.has_per_eye_gaze():
+            self.eye_combo.configure(state="readonly")
+        else:
+            self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
+            self.eye_combo.configure(state="disabled")
+
     def _on_zero_elevation_toggled(self) -> None:
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
@@ -389,6 +476,13 @@ class AnnotatorApp:
             )
         else:
             self._set_status("Showing absolute angle.")
+
+    def _on_connect_points_toggled(self) -> None:
+        self._redraw()
+        if self.connect_points_var.get():
+            self._set_status("Connect points on — samples joined with a line.")
+        else:
+            self._set_status("Connect points off — markers only.")
 
     def _refit_all_segments(self) -> None:
         if self.trial is None:
@@ -517,6 +611,14 @@ class AnnotatorApp:
         self.time_file_label = ttk.Label(step2, text="Not selected")
         self.time_file_label.grid(row=1, column=1, sticky=tk.W, pady=(0, 4))
 
+        ttk.Label(
+            step2,
+            text="Vive/Unity: rotatedGaze.txt + gazeTime.txt.  "
+            "Tobii Glasses 3: gazedata.json alone (timestamps embedded).",
+            foreground="#666666",
+            wraplength=900,
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+
         self.trial_id_var = tk.StringVar(value="")
         self.trial_id_label = ttk.Label(
             step2,
@@ -525,7 +627,7 @@ class AnnotatorApp:
             wraplength=900,
         )
         self.trial_id_label.grid(
-            row=2, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
         )
         self.trial_id_var.trace_add("write", self._on_trial_id_changed)
 
@@ -615,9 +717,13 @@ class AnnotatorApp:
 
         toolbar = ttk.Frame(self.annotate_tab, padding=(4, 4))
         toolbar.pack(side=tk.TOP, fill=tk.X)
+        nav_row = ttk.Frame(toolbar)
+        nav_row.pack(side=tk.TOP, fill=tk.X)
+        controls_row = ttk.Frame(toolbar)
+        controls_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
         ttk.Button(
-            toolbar,
+            nav_row,
             text="← Load trial",
             command=lambda: self.notebook.select(self.setup_tab),
         ).pack(side=tk.LEFT, padx=(0, 8))
@@ -626,15 +732,18 @@ class AnnotatorApp:
             value="No trial loaded — use the Load trial tab first."
         )
         ttk.Label(
-            toolbar,
+            nav_row,
             textvariable=self.annotate_summary_var,
             foreground="#333333",
         ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(nav_row, text="Help", command=self._show_help).pack(
+            side=tk.RIGHT, padx=4
+        )
 
-        ttk.Label(toolbar, text="Signal:").pack(side=tk.LEFT)
+        ttk.Label(controls_row, text="Signal:").pack(side=tk.LEFT)
         self.signal_var = tk.StringVar(value=self.SIGNAL_CHOICES[0][0])
         self.signal_combo = ttk.Combobox(
-            toolbar,
+            controls_row,
             textvariable=self.signal_var,
             values=[label for label, _ in self.SIGNAL_CHOICES],
             state="readonly",
@@ -643,19 +752,50 @@ class AnnotatorApp:
         self.signal_combo.pack(side=tk.LEFT, padx=(4, 8))
         self.signal_combo.bind("<<ComboboxSelected>>", self._on_signal_selected)
 
+        ttk.Label(controls_row, text="Eye:").pack(side=tk.LEFT)
+        self.eye_var = tk.StringVar(value=self.EYE_CHOICES[0][0])
+        self.eye_combo = ttk.Combobox(
+            controls_row,
+            textvariable=self.eye_var,
+            values=[label for label, _ in self.EYE_CHOICES],
+            state="disabled",
+            width=12,
+        )
+        self.eye_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.eye_combo.bind("<<ComboboxSelected>>", self._on_eye_selected)
+        _bind_tooltip(
+            self.eye_combo,
+            "Tobii Glasses 3 only: plot left, right, or binocular-average gaze.\n"
+            "Changing eye refits accepted/proposed segments on that trace.",
+        )
+
         self.zero_elevation_var = tk.BooleanVar(value=True)
         self.zero_elevation_chk = ttk.Checkbutton(
-            toolbar,
+            controls_row,
             text="Zero at start",
             variable=self.zero_elevation_var,
             command=self._on_zero_elevation_toggled,
         )
         self.zero_elevation_chk.pack(side=tk.LEFT, padx=(0, 8))
 
-        ttk.Label(toolbar, text="Window:").pack(side=tk.LEFT)
+        self.connect_points_var = tk.BooleanVar(value=False)
+        self.connect_points_chk = ttk.Checkbutton(
+            controls_row,
+            text="Connect points",
+            variable=self.connect_points_var,
+            command=self._on_connect_points_toggled,
+        )
+        self.connect_points_chk.pack(side=tk.LEFT, padx=(0, 8))
+        _bind_tooltip(
+            self.connect_points_chk,
+            "Draw a line through successive samples.\n"
+            "Useful when manually placing start/end marks.",
+        )
+
+        ttk.Label(controls_row, text="Window:").pack(side=tk.LEFT)
         self.view_var = tk.StringVar(value="2 s")
         self.view_combo = ttk.Combobox(
-            toolbar,
+            controls_row,
             textvariable=self.view_var,
             values=self.VIEW_PRESET_LABELS,
             state="readonly",
@@ -663,11 +803,8 @@ class AnnotatorApp:
         )
         self.view_combo.pack(side=tk.LEFT, padx=2)
         self.view_combo.bind("<<ComboboxSelected>>", self._on_view_selected)
-        ttk.Button(toolbar, text="Reset", width=6, command=self._reset_view).pack(
+        ttk.Button(controls_row, text="Reset", width=6, command=self._reset_view).pack(
             side=tk.LEFT, padx=2
-        )
-        ttk.Button(toolbar, text="Help", command=self._show_help).pack(
-            side=tk.RIGHT, padx=4
         )
 
         self.main_pane = ttk.PanedWindow(self.annotate_tab, orient=tk.HORIZONTAL)
@@ -729,7 +866,17 @@ class AnnotatorApp:
         detect_panel = ttk.LabelFrame(scroll_inner, text="Auto-detect", padding=4)
         detect_panel.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
 
-        dir_row = ttk.Frame(detect_panel)
+        self.detect_params_visible = False
+        self.detect_params_toggle = ttk.Button(
+            detect_panel,
+            text="Show parameters ▸",
+            command=self._toggle_detect_params,
+        )
+        self.detect_params_toggle.pack(side=tk.TOP, fill=tk.X, pady=(0, 3))
+
+        self.detect_params_frame = ttk.Frame(detect_panel)
+
+        dir_row = ttk.Frame(self.detect_params_frame)
         dir_row.pack(fill=tk.X, pady=1)
         dir_label = ttk.Label(dir_row, text="Direction:")
         dir_label.pack(side=tk.LEFT)
@@ -744,7 +891,7 @@ class AnnotatorApp:
         dir_combo.pack(side=tk.LEFT, padx=(4, 0))
         _bind_tooltip(dir_row, DETECT_TOOLTIPS["direction"])
 
-        vel_row = ttk.Frame(detect_panel)
+        vel_row = ttk.Frame(self.detect_params_frame)
         vel_row.pack(fill=tk.X, pady=1)
         saccade_label = ttk.Label(vel_row, text="Max saccade velocity (deg/s):")
         saccade_label.pack(side=tk.LEFT)
@@ -753,7 +900,7 @@ class AnnotatorApp:
         saccade_entry.pack(side=tk.LEFT, padx=(4, 0))
         _bind_tooltip(vel_row, DETECT_TOOLTIPS["saccade"])
 
-        dur_row = ttk.Frame(detect_panel)
+        dur_row = ttk.Frame(self.detect_params_frame)
         dur_row.pack(fill=tk.X, pady=1)
         dur_label = ttk.Label(dur_row, text="Min duration (ms):")
         dur_label.pack(side=tk.LEFT)
@@ -762,7 +909,7 @@ class AnnotatorApp:
         dur_entry.pack(side=tk.LEFT, padx=(4, 0))
         _bind_tooltip(dur_row, DETECT_TOOLTIPS["duration"])
 
-        r2_row = ttk.Frame(detect_panel)
+        r2_row = ttk.Frame(self.detect_params_frame)
         r2_row.pack(fill=tk.X, pady=1)
         r2_label = ttk.Label(r2_row, text="Min R²:")
         r2_label.pack(side=tk.LEFT)
@@ -771,7 +918,7 @@ class AnnotatorApp:
         r2_entry.pack(side=tk.LEFT, padx=(4, 0))
         _bind_tooltip(r2_row, DETECT_TOOLTIPS["r2"])
 
-        win_row = ttk.Frame(detect_panel)
+        win_row = ttk.Frame(self.detect_params_frame)
         win_row.pack(fill=tk.X, pady=1)
         win_label = ttk.Label(win_row, text="Window (ms):")
         win_label.pack(side=tk.LEFT)
@@ -780,7 +927,7 @@ class AnnotatorApp:
         win_entry.pack(side=tk.LEFT, padx=(4, 0))
         _bind_tooltip(win_row, DETECT_TOOLTIPS["window"])
 
-        gap_row = ttk.Frame(detect_panel)
+        gap_row = ttk.Frame(self.detect_params_frame)
         gap_row.pack(fill=tk.X, pady=1)
         gap_label = ttk.Label(gap_row, text="Merge gap (ms):")
         gap_label.pack(side=tk.LEFT)
@@ -791,7 +938,7 @@ class AnnotatorApp:
 
         self.detect_refine_var = tk.BooleanVar(value=True)
         refine_chk = ttk.Checkbutton(
-            detect_panel,
+            self.detect_params_frame,
             text="Refine boundaries (maximize R²)",
             variable=self.detect_refine_var,
         )
@@ -800,21 +947,21 @@ class AnnotatorApp:
 
         self.detect_blocks_var = tk.BooleanVar(value=False)
         blocks_chk = ttk.Checkbutton(
-            detect_panel,
+            self.detect_params_frame,
             text="Only inside contrast blocks (OKR log)",
             variable=self.detect_blocks_var,
         )
         blocks_chk.pack(anchor=tk.W, pady=(2, 0))
         _bind_tooltip(blocks_chk, DETECT_TOOLTIPS["blocks"])
 
-        detect_btns = ttk.Frame(detect_panel)
-        detect_btns.pack(fill=tk.X, pady=(4, 0))
+        self.detect_btns = ttk.Frame(detect_panel)
+        self.detect_btns.pack(fill=tk.X)
         propose_btn = ttk.Button(
-            detect_btns, text="Propose segments", command=self._propose_segments
+            self.detect_btns, text="Propose segments", command=self._propose_segments
         )
         propose_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
         clear_btn = ttk.Button(
-            detect_btns, text="Clear proposed", command=self._clear_proposed
+            self.detect_btns, text="Clear proposed", command=self._clear_proposed
         )
         clear_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
         _bind_tooltip(propose_btn, DETECT_TOOLTIPS["propose"])
@@ -823,28 +970,70 @@ class AnnotatorApp:
         tree_frame = ttk.Frame(scroll_inner)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        columns = ("stat", "id", "start", "end", "gain", "r2")
+        columns = ("stat", "id", "block", "start", "end", "gain", "r2")
         self.seg_tree = ttk.Treeview(
             tree_frame, columns=columns, show="headings", height=8, selectmode="browse"
         )
         self.seg_tree.heading("stat", text="")
         self.seg_tree.heading("id", text="#")
+        self.seg_tree.heading("block", text="Block")
         self.seg_tree.heading("start", text="Start (s)")
         self.seg_tree.heading("end", text="End (s)")
         self.seg_tree.heading("gain", text="Gain")
         self.seg_tree.heading("r2", text="R²")
-        self.seg_tree.column("stat", width=34, anchor=tk.CENTER)
-        self.seg_tree.column("id", width=28, anchor=tk.CENTER)
-        self.seg_tree.column("start", width=62, anchor=tk.E)
-        self.seg_tree.column("end", width=62, anchor=tk.E)
-        self.seg_tree.column("gain", width=48, anchor=tk.E)
-        self.seg_tree.column("r2", width=40, anchor=tk.E)
+        self.seg_tree.column("stat", width=28, anchor=tk.CENTER)
+        self.seg_tree.column("id", width=26, anchor=tk.CENTER)
+        self.seg_tree.column("block", width=44, anchor=tk.CENTER)
+        self.seg_tree.column("start", width=56, anchor=tk.E)
+        self.seg_tree.column("end", width=56, anchor=tk.E)
+        self.seg_tree.column("gain", width=46, anchor=tk.E)
+        self.seg_tree.column("r2", width=38, anchor=tk.E)
         seg_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.seg_tree.yview)
         self.seg_tree.configure(yscrollcommand=seg_scroll.set)
         self.seg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         seg_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.seg_tree.bind("<<TreeviewSelect>>", self._on_segment_select)
         self.seg_tree.bind("<Double-1>", self._on_segment_double_click)
+
+        block_panel = ttk.LabelFrame(scroll_inner, text="Gain by OKR block", padding=4)
+        block_panel.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        block_cols = ("block", "n", "med_gain", "condition")
+        self.block_tree = ttk.Treeview(
+            block_panel,
+            columns=block_cols,
+            show="headings",
+            height=5,
+            selectmode="browse",
+        )
+        self.block_tree.heading("block", text="Block")
+        self.block_tree.heading("n", text="n")
+        self.block_tree.heading("med_gain", text="Med gain")
+        self.block_tree.heading("condition", text="Condition")
+        self.block_tree.column("block", width=44, anchor=tk.CENTER)
+        self.block_tree.column("n", width=28, anchor=tk.CENTER)
+        self.block_tree.column("med_gain", width=64, anchor=tk.E)
+        self.block_tree.column("condition", width=220, anchor=tk.W)
+        self.block_tree.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(
+            block_panel,
+            text="Accepted segments only. Requires OKR log for block assignment.",
+            foreground="#666666",
+            wraplength=240,
+        ).pack(side=tk.TOP, anchor=tk.W, pady=(2, 0))
+
+    def _toggle_detect_params(self) -> None:
+        self.detect_params_visible = not self.detect_params_visible
+        if self.detect_params_visible:
+            self.detect_params_frame.pack(
+                side=tk.TOP,
+                fill=tk.X,
+                pady=(0, 4),
+                before=self.detect_btns,
+            )
+            self.detect_params_toggle.configure(text="Hide parameters ▾")
+        else:
+            self.detect_params_frame.pack_forget()
+            self.detect_params_toggle.configure(text="Show parameters ▸")
 
     def _build_plot(self) -> None:
         self.fig, self.ax = plt.subplots(figsize=(10, 4))
@@ -1187,13 +1376,21 @@ class AnnotatorApp:
                 text="Trial ID: (set automatically from folder names)"
             )
 
+    def _is_tobii_gaze(self) -> bool:
+        return self.gaze_path is not None and is_tobii_glasses3_gazedata(self.gaze_path)
+
     def _update_files_label(self) -> None:
         self.gaze_file_label.config(
             text=self.gaze_path.name if self.gaze_path else "Not selected"
         )
-        self.time_file_label.config(
-            text=self.time_path.name if self.time_path else "Not selected"
-        )
+        if self._is_tobii_gaze():
+            self.time_file_label.config(
+                text="Embedded in gazedata.json (Tobii Glasses 3)"
+            )
+        else:
+            self.time_file_label.config(
+                text=self.time_path.name if self.time_path else "Not selected"
+            )
         if self.okr_log_path and self.okr_log is not None:
             n_blocks = len(self.okr_log.block_markers)
             n_fix = len(self.okr_log.fixation_markers)
@@ -1207,6 +1404,7 @@ class AnnotatorApp:
             self.okr_log_file_label.config(text="Selected (not loaded)")
         else:
             self.okr_log_file_label.config(text="None (optional)")
+
     def _pan_step_sec(self) -> float:
         if self.view_xmin is None or self.view_xmax is None:
             return self.DEFAULT_VIEW_DURATION * self.SCROLL_PAN_FRACTION
@@ -1214,20 +1412,31 @@ class AnnotatorApp:
 
     def _browse_gaze(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select gaze file",
+            title="Select gaze file (rotatedGaze.txt or Tobii gazedata.json)",
             filetypes=[
-                ("Gaze files", "*.txt *.csv"),
+                ("Gaze files", "*.txt *.json"),
+                ("Text", "*.txt"),
+                ("Tobii Glasses 3 JSON", "*.json"),
                 ("All files", "*.*"),
             ],
         )
         if path:
             self.gaze_path = Path(path)
+            if is_tobii_glasses3_gazedata(self.gaze_path):
+                self.time_path = self.gaze_path
             self._update_files_label()
             self.trial_id_var.set(markings_id_from_gaze_path(self.gaze_path))
 
     def _browse_time(self) -> None:
+        if self._is_tobii_gaze():
+            messagebox.showinfo(
+                "Time file not needed",
+                "Tobii Glasses 3 gazedata.json already includes timestamps.\n"
+                "You can load the trial without selecting a separate time file.",
+            )
+            return
         path = filedialog.askopenfilename(
-            title="Select time file",
+            title="Select time file (gazeTime.txt)",
             filetypes=[
                 ("Time files", "*.txt *.csv"),
                 ("All files", "*.*"),
@@ -1254,6 +1463,7 @@ class AnnotatorApp:
         self._update_files_label()
         if self.trial is not None:
             self._update_condition_display()
+            self._refresh_segment_list()
             self._redraw()
         elif self.okr_log is not None:
             self._update_condition_display(
@@ -1272,6 +1482,7 @@ class AnnotatorApp:
         self.detect_blocks_var.set(False)
         self._update_files_label()
         self.condition_var.set("")
+        self._refresh_segment_list()
         if self.trial is not None:
             self._redraw()
         self._set_status("Cleared OKR log markers and condition readout.")
@@ -1463,16 +1674,20 @@ class AnnotatorApp:
         return f"{stem}_new{suffix}"
 
     def _resolve_save_path(self, preferred: Path) -> Path | None:
-        """If preferred JSON exists, notify and ask for a different name."""
+        """If preferred JSON exists, ask whether to overwrite or save as another name."""
         path = preferred
         if path.is_file():
-            messagebox.showwarning(
-                "Markings file already exists",
+            overwrite = messagebox.askyesno(
+                "Overwrite existing file?",
                 f"A file named:\n  {path.name}\n"
                 f"already exists in:\n  {path.parent}\n\n"
-                "Choose a different name so you don’t overwrite it "
-                "(e.g. add your initials, a date, or _v2).",
+                "Overwrite it?\n\n"
+                "Yes — replace the existing file\n"
+                "No — choose a different name",
+                icon="warning",
             )
+            if overwrite:
+                return path
             suggested = self._unique_markings_suggestion(path)
             chosen = filedialog.asksaveasfilename(
                 title="Save segments under a new name",
@@ -1534,6 +1749,7 @@ class AnnotatorApp:
             segments=self.segments,
             software_version=__version__,
             signal_mode=self._signal_mode(),
+            eye_mode=self._eye_mode(),
         )
         n = len(self.segments)
         messagebox.showinfo("Segments saved", f"Saved {n} segment(s) to:\n{path}")
@@ -1660,6 +1876,20 @@ class AnnotatorApp:
             self.signal_var.set(self._signal_label_map[signal_mode])
         else:
             self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
+        # Restore eye mode for Tobii per-eye traces.
+        eye_mode = data.get("eye_mode")
+        if (
+            isinstance(eye_mode, str)
+            and eye_mode in self._eye_label_map
+            and (
+                eye_mode == self.EYE_BINOCULAR
+                or (self.trial is not None and self.trial.has_per_eye_gaze())
+            )
+        ):
+            self.eye_var.set(self._eye_label_map[eye_mode])
+        else:
+            self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
+        self._update_eye_combo_state()
         if restored:
             self._refit_all_segments()
             self._update_signal_ylim()
@@ -1723,12 +1953,22 @@ class AnnotatorApp:
         if self.annotations_dir is None:
             if self._prompt_annotations_folder_if_needed(on_load=True) is None:
                 return
-        if not self.gaze_path or not self.time_path:
+        if not self.gaze_path:
+            messagebox.showwarning(
+                "Missing trial files",
+                "Select a gaze file in section 2.\n\n"
+                "Vive/Unity needs gaze + time files.\n"
+                "Tobii Glasses 3 needs only gazedata.json.",
+            )
+            return
+        if not self._is_tobii_gaze() and not self.time_path:
             messagebox.showwarning(
                 "Missing trial files",
                 "Select both a gaze file and a time file in section 2.",
             )
             return
+        if self._is_tobii_gaze():
+            self.time_path = self.gaze_path
         if not self.stim_vel_var.get().strip():
             messagebox.showwarning(
                 "Stimulus velocity required",
@@ -1763,8 +2003,10 @@ class AnnotatorApp:
         try:
             trial_id = self._default_markings_id()
             self.trial_id_var.set(trial_id)
-            self.trial = load_ush2a_trial(
-                self.gaze_path, self.time_path, trial_id=trial_id
+            self.trial = load_gaze_trial(
+                self.gaze_path,
+                None if self._is_tobii_gaze() else self.time_path,
+                trial_id=trial_id,
             )
             t0 = float(self.trial.times[0])
             t1 = float(self.trial.times[-1])
@@ -1776,10 +2018,13 @@ class AnnotatorApp:
             self.selected_segment_key = None
             self._clear_pending(redraw=False)
             self._clear_interaction_state()
+            self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
+            self._update_eye_combo_state()
             self._update_signal_ylim()
             self.view_var.set("2 s")
             self._reset_view()
             self._try_restore_autosave(trial_id)
+            self._update_eye_combo_state()
             self._update_signal_ylim()
             self._refresh_segment_list()
             if self.okr_log_path and not self._parse_okr_log(show_error=True):
@@ -1794,6 +2039,8 @@ class AnnotatorApp:
                 f"Loaded {trial_id}: {len(self.trial.times)} gaze samples, "
                 f"analysis {t0:.2f}–{t1:.2f} s ({duration:.1f} s)"
             )
+            if self.trial.has_per_eye_gaze():
+                status += "; Eye: Binocular/Left/Right available"
             if self.okr_log is not None:
                 status += (
                     f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
@@ -2315,6 +2562,10 @@ class AnnotatorApp:
         for kind, seg in self._segments_sorted_by_time():
             stat = "✓" if kind == "accepted" else "?"
             r2 = f"{seg.r2:.2f}" if seg.r2 == seg.r2 else "—"
+            fields = segment_condition_fields(self.okr_log, seg.t_start, seg.t_end)
+            block = str(fields.get("block_label") or "—")
+            if block in {"Outside blocks", "No OKR log"}:
+                block = "—"
             iid = self._segment_tree_iid(kind, seg.segment_id)
             self.seg_tree.insert(
                 "",
@@ -2323,6 +2574,7 @@ class AnnotatorApp:
                 values=(
                     stat,
                     display_id,
+                    block,
                     f"{seg.t_start:.2f}",
                     f"{seg.t_end:.2f}",
                     f"{seg.gain:.3f}",
@@ -2333,6 +2585,25 @@ class AnnotatorApp:
             if self.selected_segment_key == (kind, seg.segment_id):
                 self.seg_tree.selection_set(iid)
                 self.seg_tree.see(iid)
+        self._refresh_block_gain_summary()
+
+    def _refresh_block_gain_summary(self) -> None:
+        if not hasattr(self, "block_tree"):
+            return
+        for item in self.block_tree.get_children():
+            self.block_tree.delete(item)
+        summaries = summarize_gains_by_block(self.segments, self.okr_log)
+        for summary in summaries:
+            self.block_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    summary.block_label,
+                    summary.n_segments,
+                    f"{summary.median_gain:.3f}",
+                    summary.condition,
+                ),
+            )
 
     def _replace_segment(self, kind: str, updated: SegmentFit) -> None:
         target = self.segments if kind == "accepted" else self.proposed_segments
@@ -2532,6 +2803,19 @@ class AnnotatorApp:
             & (times >= vx0)
             & (times <= vx1)
         )
+        if self.connect_points_var.get():
+            # Keep NaNs so the polyline breaks across missing/out-of-window samples.
+            line_vals = np.asarray(values, dtype=float).copy()
+            line_vals[~plot_mask] = np.nan
+            self.ax.plot(
+                times,
+                line_vals,
+                linestyle="-",
+                linewidth=0.9,
+                color="0.35",
+                alpha=0.85,
+                zorder=1,
+            )
         self.ax.plot(
             times[plot_mask],
             values[plot_mask],
@@ -2540,6 +2824,7 @@ class AnnotatorApp:
             markersize=4,
             color="0.25",
             label=self._signal_plot_label(),
+            zorder=2,
         )
 
         self.ax.axvspan(t0, t1, color="steelblue", alpha=0.04)
@@ -2809,9 +3094,18 @@ class AnnotatorApp:
                 output_path=path,
                 gaze_source=str(self.gaze_path) if self.gaze_path else "",
                 time_source=str(self.time_path) if self.time_path else "",
+                okr_log=self.okr_log,
             )
-            messagebox.showinfo("Exported", f"Saved:\n{out}")
-            self._set_status(f"Exported {len(self.segments)} segment(s) to {out}")
+            n_blocks = len(summarize_gains_by_block(self.segments, self.okr_log))
+            messagebox.showinfo(
+                "Exported",
+                f"Saved:\n{out}\n\n"
+                f"{len(self.segments)} segment(s), {n_blocks} block group(s).",
+            )
+            self._set_status(
+                f"Exported {len(self.segments)} segment(s) "
+                f"({n_blocks} block group(s)) to {out}"
+            )
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc))
 

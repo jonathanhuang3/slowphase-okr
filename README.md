@@ -180,7 +180,7 @@ ZIP installs do not update automatically — prefer cloning with Git if you anno
 3. On **Annotate**, **click twice** on the trace: start and end of each upward slow phase (snaps to nearest sample)
 4. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
 5. Press **Accept segment** (`A`) to keep the fit
-6. **Save segments** for JSON (if that filename already exists, you’ll be asked to choose a new name), then **Export Excel** when done
+6. **Save segments** for JSON (if that filename already exists, you’ll be asked whether to overwrite or save under a new name), then **Export Excel** when done
 
 ### Semi-automatic annotation (recommended with OKR log)
 
@@ -202,16 +202,18 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Analysis window** | Full trial — first timestamp to last timestamp |
 | **Signal** | Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze |
 | **Zero at start** | Optional (on by default). Subtracts the angle at the first valid sample so the trace starts at 0° — removes headset pose offset. Slopes and gains are unchanged. |
+| **Connect points** | Optional (off by default). Draws a line through successive samples; markers stay visible. Useful for manual start/end marking. |
 | **Fixed y-axis** | Signal scale stays fixed to the full trial while you pan in time |
 | **Segment list** | Shows proposed (`?`) and accepted (`✓`) segments sorted by time |
 | **Segment labels** | `#N` on accepted (green), `?N` on proposed (blue) segments in the plot |
 | **Edit segments** | Delete selected (`Del`), undo last (`U`), drag edges on plot, nudge boundaries (`[ ]` start, `, .` end) |
 | **Auto-detect** | Sliding-window detector proposes slow phases for manual review (see below) |
 | **Stimulus velocity** | Required before Load trial (empty until you enter it). Confirmed in a dialog on load. Gain = slope ÷ velocity. |
-| **JSON markings** | **Annotations folder** is required (personal folder only). Press **Save segments** to write JSON. If that filename already exists, you must pick a new name. Use **Load markings…** to reopen. |
+| **JSON markings** | **Annotations folder** is required (personal folder only). Press **Save segments** to write JSON. If that filename already exists, you’ll be asked whether to overwrite or pick a new name. Use **Load markings…** to reopen. |
 | **Reload guard** | Confirms before discarding accepted or proposed segments |
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray). Clear OKR log removes markers for the next patient. |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
+| **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …) with separate median/mean gain in the side panel and Excel `by_block` sheet |
 | **Invalid gaze samples** | `(NaN, NaN, NaN)` lines stay aligned but are skipped for clicking and fitting |
 | **Parameter tooltips** | Hover auto-detect settings in the app for plain-language help |
 
@@ -224,7 +226,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 When several people annotate the same trial folders on Box, keep markings out of the shared trial folder:
 
 1. **Annotations folder** is required (step 1). Create a **personal** directory only you use (e.g. `Desktop/okr_annotations_YourName`). Never point this at the shared Box trial folder.
-2. Mark segments as usual, then click **Save segments** to write JSON there (default name `{subject}_{condition}_slowphase_okr_markings.json`). Accepting or editing segments does **not** write a file. If that name already exists, the app warns you and asks you to **save under a different name**.
+2. Mark segments as usual, then click **Save segments** to write JSON there (default name `{subject}_{condition}_slowphase_okr_markings.json`). Accepting or editing segments does **not** write a file. If that name already exists, the app asks whether to **overwrite** or **save under a different name**.
 3. Later, **Load trial** then either accept the restore prompt (if a matching file is in your folder) or click **Load markings…** to pick any JSON.
 4. Without loading JSON, the trial shows **no marked segments**.
 
@@ -273,11 +275,9 @@ Hover any setting in the **Auto-detect** panel for a tooltip. Summary:
 
 ## Data format
 
-The GUI expects **two text files per trial**: one with gaze direction and one with timestamps. Filenames do not matter — use whatever your pipeline exports.
+The GUI accepts **Vive/Unity** gaze+time text files, or a single **Tobii Pro Glasses 3** `gazedata.json`.
 
-### Gaze + timestamp files (GUI)
-
-This is the format the app loads.
+### Gaze + timestamp files (Vive / Unity)
 
 | File | What it contains |
 |------|------------------|
@@ -297,6 +297,18 @@ This tool was developed for our lab to support gaze data recorded with a **HTC V
 **Duplicate timestamps:** Unity `gazeTime.txt` often repeats the same time for several gaze samples (one Unity frame, multiple eye samples). That is normal. Auto-detect averages elevation at each unique time before searching.
 
 **Pair the right files:** `rotatedGaze.txt` + `gazeTime.txt` (same line count). Do not mix `rotatedGaze.txt` with `sranipalGazeTime.txt`.
+
+### Tobii Pro Glasses 3 (`gazedata.json`)
+
+Export from a Glasses 3 recording (NDJSON: one JSON object per line). Select **Gaze file…** and choose `gazedata.json` — **no separate time file** (timestamps are in each row).
+
+| Field used | Role |
+|------------|------|
+| `timestamp` | Time in seconds |
+| `eyeleft` / `eyeright` `gazedirection` | Per-eye elevation / azimuth; **Eye** menu chooses Left, Right, or Binocular average |
+| `gaze3d` | Fallback for binocular when both eye directions are missing |
+
+Empty `data` rows (tracking lost) are skipped. Use **Elevation** for upward OKR marking. On Tobii trials, the Annotate toolbar **Eye** combo switches Left / Right / Binocular (default Binocular). Changing eye refits segments on that trace. Enter stimulus velocity (deg/s) as usual before loading.
 
 ### OKR log (optional)
 
@@ -319,7 +331,7 @@ Older stimulus versions did not write this file. If your session includes an OKR
 
 Block labels use `contrastBlockIndex` and direction when available (`↑↓` for Up/Down, `←→` for Left/Right). New block event names are detected automatically without updating the app.
 
-**Condition readout:** With an OKR log loaded, a line under the plot shows the condition at the hovered time (or the center of the current view): contrast level, direction, flicker vs persistent, and session tags from `StimulusName` (e.g. Increment / Decrement, White / Black dots). Use **Clear OKR log** on the Load trial tab to remove markers and the condition line before the next patient.
+**Condition readout:** With an OKR log loaded, a line under the plot shows the condition at the hovered time (or the center of the current view): which eye was shown the dots (`Dots → Left/Right eye`, from `StimulusEyePatch` / `eyePatch`, or `LE`/`RE` in `StimulusName`), contrast level, direction, flicker vs persistent, and session tags (e.g. Increment / Decrement, White / Black dots). Use **Clear OKR log** on the Load trial tab to remove markers and the condition line before the next patient.
 
 **Example filenames:** `OKR_Log_Patient_Testing.txt` or similar in the same folder as gaze/time files.
 
@@ -327,8 +339,11 @@ Block labels use `contrastBlockIndex` and direction when available (`↑↓` for
 
 | Sheet | Contents |
 |-------|----------|
-| `segments` | One row per accepted segment: indices, times, slope, gain, R², `direction_upward`, stimulus velocity |
-| `trial_summary` | `median_gain`, segment count, source file paths, software version |
+| `segments` | One row per accepted segment: indices, times, slope, gain, R², `direction_upward`, stimulus velocity, plus OKR block/condition columns when a log is loaded |
+| `by_block` | One row per OKR block group: `n_segments`, `median_gain`, `mean_gain`, contrast, direction, flicker/persistent, etc. |
+| `trial_summary` | Overall `median_gain`, segment count, source file paths, software version |
+
+Segments are assigned to blocks by midpoint time. Without an OKR log, all segments go into a single `No OKR log` group.
 
 ## Development
 

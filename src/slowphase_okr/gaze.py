@@ -1,7 +1,8 @@
-"""Load gaze traces from gaze direction + timestamp text files."""
+"""Load gaze traces from Unity text exports or Tobii Glasses 3 JSON."""
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,12 +27,24 @@ class GazeTrial:
     """Eye position time series for one trial."""
 
     times: np.ndarray  # seconds
-    elevation_deg: np.ndarray  # degrees
+    elevation_deg: np.ndarray  # degrees (binocular / primary)
     azimuth_deg: np.ndarray | None = None  # degrees (horizontal)
     trial_id: str = ""
     source_gaze: str = ""
     source_time: str = ""
     pupil: PupilTrace | None = None
+    source_format: str = "ush2a"  # "ush2a" | "tobii_glasses3"
+    # Per-eye traces (Tobii Glasses 3); None for Unity/Vive exports.
+    elevation_left_deg: np.ndarray | None = None
+    elevation_right_deg: np.ndarray | None = None
+    azimuth_left_deg: np.ndarray | None = None
+    azimuth_right_deg: np.ndarray | None = None
+
+    def has_per_eye_gaze(self) -> bool:
+        return (
+            self.elevation_left_deg is not None
+            and self.elevation_right_deg is not None
+        )
 
 
 def unity_gaze_direction(
@@ -135,6 +148,204 @@ def load_ush2a_trial(
         trial_id=trial_id,
         source_gaze=str(gaze_path.resolve()),
         source_time=str(time_path.resolve()),
+        source_format="ush2a",
+    )
+
+
+def _xyz_to_elev_az_deg(x: float, y: float, z: float) -> tuple[float, float]:
+    """Elevation / azimuth (deg) from a 3D vector (Y-up, Z-forward)."""
+    r = float(np.sqrt(x * x + y * y + z * z))
+    if r == 0.0 or not np.isfinite(r):
+        return float("nan"), float("nan")
+    elev = float(np.degrees(np.arcsin(np.clip(y / r, -1.0, 1.0))))
+    az = float(np.degrees(np.arctan2(x, z)))
+    return elev, az
+
+
+def _tobii_eye_elev_az(data: dict, eye_key: str) -> tuple[float, float]:
+    eye = data.get(eye_key) or {}
+    direction = eye.get("gazedirection")
+    if (
+        isinstance(direction, (list, tuple))
+        and len(direction) >= 3
+        and all(v is not None for v in direction[:3])
+    ):
+        return _xyz_to_elev_az_deg(
+            float(direction[0]), float(direction[1]), float(direction[2])
+        )
+    return float("nan"), float("nan")
+
+
+def _tobii_gaze3d_elev_az(data: dict) -> tuple[float, float]:
+    gaze3d = data.get("gaze3d")
+    if (
+        isinstance(gaze3d, (list, tuple))
+        and len(gaze3d) >= 3
+        and all(v is not None for v in gaze3d[:3])
+    ):
+        return _xyz_to_elev_az_deg(
+            float(gaze3d[0]), float(gaze3d[1]), float(gaze3d[2])
+        )
+    return float("nan"), float("nan")
+
+
+def _tobii_sample_eyes(
+    data: dict,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Return (left, right, binocular) elevation/azimuth pairs for one sample.
+
+    Binocular is the mean of available eyes; if neither eye has a direction,
+    falls back to ``gaze3d``.
+    """
+    left = _tobii_eye_elev_az(data, "eyeleft")
+    right = _tobii_eye_elev_az(data, "eyeright")
+    elevs = [e for e, a in (left, right) if np.isfinite(e) and np.isfinite(a)]
+    azs = [a for e, a in (left, right) if np.isfinite(e) and np.isfinite(a)]
+    if elevs:
+        binocular = (float(np.mean(elevs)), float(np.mean(azs)))
+    else:
+        binocular = _tobii_gaze3d_elev_az(data)
+    return left, right, binocular
+
+
+def is_tobii_glasses3_gazedata(path: str | Path) -> bool:
+    """True if ``path`` looks like Tobii Glasses 3 NDJSON ``gazedata``."""
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _ in range(40):
+                line = handle.readline()
+                if not line:
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                obj = json.loads(stripped)
+                if not isinstance(obj, dict):
+                    return False
+                if obj.get("type") == "gaze" and "timestamp" in obj:
+                    return True
+                # Non-gaze event lines are common; keep scanning.
+                if "timestamp" in obj and "data" in obj:
+                    continue
+                return False
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    return False
+
+
+def load_tobii_glasses3_trial(
+    gaze_path: str | Path,
+    trial_id: str = "",
+) -> GazeTrial:
+    """Load Tobii Pro Glasses 3 ``gazedata.json`` (NDJSON, one object per line).
+
+    Timestamps are embedded (seconds). Stores left, right, and binocular
+    elevation/azimuth from gaze direction (scene-camera CS: Y up).
+    """
+    gaze_path = Path(gaze_path)
+    if not gaze_path.is_file():
+        raise FileNotFoundError(gaze_path)
+
+    times_list: list[float] = []
+    elev_b_list: list[float] = []
+    az_b_list: list[float] = []
+    elev_l_list: list[float] = []
+    az_l_list: list[float] = []
+    elev_r_list: list[float] = []
+    az_r_list: list[float] = []
+    n_gaze = 0
+
+    with gaze_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON on line {line_no} of {gaze_path.name}: {exc}"
+                ) from exc
+            if not isinstance(obj, dict) or obj.get("type") != "gaze":
+                continue
+            n_gaze += 1
+            data = obj.get("data")
+            if not isinstance(data, dict) or not data:
+                # Glasses 3 emits empty ``data`` when tracking is lost.
+                continue
+            try:
+                t = float(obj["timestamp"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Missing/invalid timestamp on line {line_no} of {gaze_path.name}"
+                ) from exc
+            left, right, binocular = _tobii_sample_eyes(data)
+            times_list.append(t)
+            elev_l_list.append(left[0])
+            az_l_list.append(left[1])
+            elev_r_list.append(right[0])
+            az_r_list.append(right[1])
+            elev_b_list.append(binocular[0])
+            az_b_list.append(binocular[1])
+
+    if not times_list:
+        if n_gaze == 0:
+            raise ValueError(
+                f"No gaze samples found in {gaze_path}. "
+                "Expected Tobii Glasses 3 NDJSON (type=gaze per line)."
+            )
+        raise ValueError(
+            f"No valid gaze directions in {gaze_path} "
+            f"({n_gaze} gaze rows, all empty or missing direction)."
+        )
+
+    times = np.asarray(times_list, dtype=float)
+    elevation_deg = np.asarray(elev_b_list, dtype=float)
+    azimuth_deg = np.asarray(az_b_list, dtype=float)
+    elevation_left = np.asarray(elev_l_list, dtype=float)
+    elevation_right = np.asarray(elev_r_list, dtype=float)
+    azimuth_left = np.asarray(az_l_list, dtype=float)
+    azimuth_right = np.asarray(az_r_list, dtype=float)
+
+    if not trial_id:
+        trial_id = gaze_path.parent.name or gaze_path.stem
+
+    resolved = str(gaze_path.resolve())
+    return GazeTrial(
+        times=times,
+        elevation_deg=elevation_deg,
+        azimuth_deg=azimuth_deg,
+        trial_id=trial_id,
+        source_gaze=resolved,
+        source_time=resolved,
+        source_format="tobii_glasses3",
+        elevation_left_deg=elevation_left,
+        elevation_right_deg=elevation_right,
+        azimuth_left_deg=azimuth_left,
+        azimuth_right_deg=azimuth_right,
+    )
+
+
+def load_gaze_trial(
+    gaze_path: str | Path,
+    time_path: str | Path | None = None,
+    trial_id: str = "",
+    padding_frames: int = 0,
+) -> GazeTrial:
+    """Load a trial from Unity gaze+time files or Tobii Glasses 3 JSON."""
+    gaze_path = Path(gaze_path)
+    if is_tobii_glasses3_gazedata(gaze_path):
+        return load_tobii_glasses3_trial(gaze_path, trial_id=trial_id)
+    if time_path is None:
+        raise ValueError(
+            "Time file is required for Unity/Vive gaze exports "
+            "(rotatedGaze.txt + gazeTime.txt)."
+        )
+    return load_ush2a_trial(
+        gaze_path, time_path, trial_id=trial_id, padding_frames=padding_frames
     )
 
 

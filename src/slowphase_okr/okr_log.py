@@ -102,12 +102,52 @@ def _parse_header_metadata(lines: list[str]) -> dict[str, str]:
     return meta
 
 
-def _session_tags_from_stimulus_name(stimulus_name: str | None) -> list[str]:
-    """Extract Increment/Decrement, White/Black, etc. from StimulusName."""
-    if not stimulus_name:
-        return []
-    upper = stimulus_name.upper()
+def resolve_viewing_eye(
+    *,
+    eye_patch: str | None = None,
+    stimulus_name: str | None = None,
+) -> str | None:
+    """Which eye was shown the dots (unpatched / viewing), or None if unknown.
+
+    Prefers StimulusEyePatch / eyePatch (patched side → opposite viewing eye).
+    Falls back to LE/RE tokens in StimulusName.
+    """
+    if eye_patch:
+        patch = eye_patch.strip().lower()
+        if patch == "left":
+            return "right"
+        if patch == "right":
+            return "left"
+
+    if stimulus_name:
+        normalized = f" {stimulus_name.replace('_', ' ').upper()} "
+        if " LE " in normalized:
+            return "left"
+        if " RE " in normalized:
+            return "right"
+    return None
+
+
+def format_viewing_eye_label(eye: str | None) -> str | None:
+    if not eye:
+        return None
+    return f"Dots → {eye.capitalize()} eye"
+
+
+def _session_tags(okr_log: OkrLog) -> list[str]:
+    """Session-level tags for the condition readout (eye, Increment/Decrement, etc.)."""
     tags: list[str] = []
+    viewing = resolve_viewing_eye(
+        eye_patch=okr_log.stimulus_eye_patch,
+        stimulus_name=okr_log.stimulus_name,
+    )
+    eye_label = format_viewing_eye_label(viewing)
+    if eye_label:
+        tags.append(eye_label)
+
+    if not okr_log.stimulus_name:
+        return tags
+    upper = okr_log.stimulus_name.upper()
     if "INCREMENT" in upper:
         tags.append("Increment")
     elif "DECREMENT" in upper:
@@ -175,9 +215,75 @@ def format_fixation_condition(marker: OkrLogFixationMarker) -> str:
     return marker.event_type
 
 
+def block_at_time(okr_log: OkrLog, t: float) -> OkrLogBlockMarker | None:
+    """Return the stimulus block covering time ``t``, if any."""
+    for marker in okr_log.block_markers:
+        end = marker.end_time if marker.end_time is not None else float("inf")
+        if marker.start_time <= t <= end:
+            return marker
+    return None
+
+
+def segment_condition_fields(
+    okr_log: OkrLog | None,
+    t_start: float,
+    t_end: float,
+) -> dict[str, object]:
+    """Condition metadata for a segment using its midpoint time."""
+    fields: dict[str, object] = {
+        "block_label": "Outside blocks",
+        "block_index": None,
+        "event_type": None,
+        "direction": None,
+        "contrast_level": None,
+        "threshold_multiplier": None,
+        "is_anchor100": None,
+        "flicker_mode": None,
+        "dot_color": None,
+        "eye_patch": None,
+        "viewing_eye": None,
+        "condition": "Outside blocks",
+        "session_tags": "",
+    }
+    if okr_log is None:
+        fields["block_label"] = "No OKR log"
+        fields["condition"] = "No OKR log"
+        return fields
+
+    viewing = resolve_viewing_eye(
+        eye_patch=okr_log.stimulus_eye_patch,
+        stimulus_name=okr_log.stimulus_name,
+    )
+    session = _session_tags(okr_log)
+    fields["session_tags"] = " · ".join(session)
+    fields["eye_patch"] = okr_log.stimulus_eye_patch
+    fields["viewing_eye"] = viewing
+    t_mid = (t_start + t_end) / 2.0
+    marker = block_at_time(okr_log, t_mid)
+    if marker is None:
+        return fields
+
+    flicker = _flicker_label(marker)
+    fields.update(
+        {
+            "block_label": marker.label,
+            "block_index": marker.block_index,
+            "event_type": marker.event_type,
+            "direction": marker.direction,
+            "contrast_level": marker.contrast_level,
+            "threshold_multiplier": marker.threshold_multiplier,
+            "is_anchor100": marker.is_anchor100,
+            "flicker_mode": flicker,
+            "dot_color": marker.dot_color,
+            "condition": format_block_condition(marker),
+        }
+    )
+    return fields
+
+
 def condition_at_time(okr_log: OkrLog, t: float) -> str:
     """Describe the stimulus/fixation condition covering time ``t``."""
-    session = _session_tags_from_stimulus_name(okr_log.stimulus_name)
+    session = _session_tags(okr_log)
     session_prefix = f"Session: {' · '.join(session)} | " if session else ""
 
     for marker in okr_log.block_markers:

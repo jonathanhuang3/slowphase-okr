@@ -87,6 +87,98 @@ def trial_summary_median_gain(segments: list[SegmentFit]) -> float:
     return float(np.median([s.gain for s in segments]))
 
 
+@dataclass(frozen=True)
+class BlockGainSummary:
+    """OKR gain summary for one stimulus block / outside-blocks group."""
+
+    block_label: str
+    block_index: int | None
+    condition: str
+    direction: str | None
+    contrast_level: float | None
+    threshold_multiplier: float | None
+    is_anchor100: bool | None
+    flicker_mode: str | None
+    dot_color: str | None
+    eye_patch: str | None
+    viewing_eye: str | None
+    session_tags: str
+    n_segments: int
+    median_gain: float
+    mean_gain: float
+    median_r2: float
+    median_slope_deg_s: float
+    n_upward: int
+    n_not_upward: int
+
+    def to_row(self, trial_id: str, software_version: str) -> dict[str, Any]:
+        row = asdict(self)
+        row["trial_id"] = trial_id
+        row["software_version"] = software_version
+        return row
+
+
+def summarize_gains_by_block(
+    segments: list[SegmentFit],
+    okr_log: Any | None = None,
+) -> list[BlockGainSummary]:
+    """Group accepted segments by OKR log block and compute gain summaries.
+
+    Segments are assigned using midpoint time. Without an OKR log, all segments
+    fall into a single ``No OKR log`` group.
+    """
+    from slowphase_okr.okr_log import segment_condition_fields
+
+    if not segments:
+        return []
+
+    groups: dict[str, list[SegmentFit]] = {}
+    meta: dict[str, dict[str, Any]] = {}
+    for seg in segments:
+        fields = segment_condition_fields(okr_log, seg.t_start, seg.t_end)
+        key = str(fields["block_label"])
+        groups.setdefault(key, []).append(seg)
+        meta[key] = fields
+
+    summaries: list[BlockGainSummary] = []
+    for key, segs in groups.items():
+        fields = meta[key]
+        gains = np.array([s.gain for s in segs], dtype=float)
+        r2s = np.array([s.r2 for s in segs], dtype=float)
+        slopes = np.array([s.slope_deg_s for s in segs], dtype=float)
+        n_up = sum(1 for s in segs if s.direction_upward)
+        summaries.append(
+            BlockGainSummary(
+                block_label=key,
+                block_index=fields.get("block_index"),  # type: ignore[arg-type]
+                condition=str(fields.get("condition") or key),
+                direction=fields.get("direction"),  # type: ignore[arg-type]
+                contrast_level=fields.get("contrast_level"),  # type: ignore[arg-type]
+                threshold_multiplier=fields.get("threshold_multiplier"),  # type: ignore[arg-type]
+                is_anchor100=fields.get("is_anchor100"),  # type: ignore[arg-type]
+                flicker_mode=fields.get("flicker_mode"),  # type: ignore[arg-type]
+                dot_color=fields.get("dot_color"),  # type: ignore[arg-type]
+                eye_patch=fields.get("eye_patch"),  # type: ignore[arg-type]
+                viewing_eye=fields.get("viewing_eye"),  # type: ignore[arg-type]
+                session_tags=str(fields.get("session_tags") or ""),
+                n_segments=len(segs),
+                median_gain=float(np.median(gains)),
+                mean_gain=float(np.mean(gains)),
+                median_r2=float(np.nanmedian(r2s)),
+                median_slope_deg_s=float(np.median(slopes)),
+                n_upward=n_up,
+                n_not_upward=len(segs) - n_up,
+            )
+        )
+
+    def sort_key(item: BlockGainSummary) -> tuple[int, int, str]:
+        if item.block_index is None:
+            return (1, 0, item.block_label)
+        return (0, int(item.block_index), item.block_label)
+
+    return sorted(summaries, key=sort_key)
+
+
 def refit_segment_by_time(
     times: np.ndarray,
     values: np.ndarray,

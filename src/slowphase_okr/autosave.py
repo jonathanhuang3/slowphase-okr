@@ -56,6 +56,7 @@ def save_autosave(
     segments: list[SegmentFit],
     software_version: str,
     signal_mode: str = "elevation",
+    eye_mode: str = "binocular",
 ) -> Path:
     """Write annotation state to JSON."""
     path = Path(path)
@@ -65,6 +66,7 @@ def save_autosave(
         "time_source": time_source,
         "stimulus_velocity": stimulus_velocity,
         "signal_mode": signal_mode,
+        "eye_mode": eye_mode,
         "software_version": software_version,
         "segments": [segment_to_dict(s) for s in segments],
     }
