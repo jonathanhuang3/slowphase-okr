@@ -34,11 +34,12 @@ from slowphase_okr.fit import (
     refit_segment_by_time,
     snap_index,
     summarize_gains_by_block,
-    trial_summary_median_gain,
+    trial_summary_gain,
 )
 from slowphase_okr.gaze import (
     GazeTrial,
     analysis_window_mask,
+    attach_eye_openness,
     is_tobii_glasses3_gazedata,
     load_gaze_trial,
 )
@@ -59,8 +60,10 @@ Marking
 
 Navigation
   Scroll wheel     Pan time forward / backward (vertical scroll only)
+  Shift+scroll     Pan Y when Y span is not Auto
   ← / →            Pan view by 20% of visible window
   View menu        1 s, 2 s, 5 s, 10 s, or Full trial window (Annotate tab)
+  Y menu           Auto (full range), or fixed 5° / 10° / 20° / 40° span
 
 Segments (select one in the list first)
   Del              Delete selected segment
@@ -73,7 +76,8 @@ Other
   ?                Show this help
 
 Notes
-  • Use tab “1. Load trial” for files/velocity, then “2. Annotate” for the plot and table.
+  • Eye openness: toggle on Annotate to show left/right SRanipal openness under the gaze
+    plot (auto-loaded from sranipalLeft/RightEyeOpenness.txt + *Times.txt in the gaze folder).
   • Analysis window spans the full trial (first to last timestamp).
   • Gaze: Vive/Unity rotatedGaze.txt + gazeTime.txt, or Tobii Glasses 3 gazedata.json
     (timestamps embedded — no separate time file).
@@ -82,7 +86,8 @@ Notes
   • Connect points: optional line through successive samples (helps manual marking).
   • Zero at start: subtract angle at the first valid sample so the trace starts at 0°
     (removes headset pose offset; slopes and gains are unchanged).
-  • R² is logged and exported but segments are not auto-rejected.
+  • R² and RMSE (deg) are logged and exported but segments are not auto-rejected.
+    Low RMSE means the slow phase stays close to a straight line.
   • On Load trial: choose a personal annotations folder (not shared Box data), then files + velocity.
     Press Save segments to write JSON; use Load markings… to reopen a prior file.
   • If that JSON name already exists, you will be asked whether to overwrite or save under a new name.
@@ -92,7 +97,7 @@ Notes
   • With an OKR log loaded, the condition line under the plot shows which eye saw the dots
     (Dots → Left/Right), contrast, direction, flicker/persistent, and Increment/Decrement.
   • Accepted segments are grouped by OKR log block for separate median/mean gain summaries
-    (panel + Excel ``by_block`` sheet).
+    (panel + Excel ``by_block`` sheet). Use Show: Median/Mean to switch the panel display.
   • Auto-detect proposes segments (blue); review, nudge, accept (A), or delete.
 
 Auto-detect review
@@ -249,6 +254,13 @@ class AnnotatorApp:
     }
     MIN_VIEW_DURATION = 0.5
     SCROLL_PAN_FRACTION = 0.2  # fraction of visible window per pan step
+    Y_SPAN_LABELS = ("Auto", "5°", "10°", "20°", "40°")
+    Y_SPAN_DEGREES = {
+        "5°": 5.0,
+        "10°": 10.0,
+        "20°": 20.0,
+        "40°": 40.0,
+    }
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -281,6 +293,8 @@ class AnnotatorApp:
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
         self.signal_ylim: tuple[float, float] | None = None
+        self.signal_ylim_full: tuple[float, float] | None = None
+        self.view_ycenter: float | None = None
         self.view_xmin: float | None = None
         self.view_xmax: float | None = None
         self.annotations_dir: Path | None = get_annotations_dir()
@@ -310,9 +324,8 @@ class AnnotatorApp:
 
     def _on_notebook_tab_changed(self, _event=None) -> None:
         try:
-            if self.notebook.select() == str(self.annotate_tab) and hasattr(
-                self, "canvas"
-            ):
+            selected = self.notebook.select()
+            if selected == str(self.annotate_tab) and hasattr(self, "canvas"):
                 self.root.after_idle(self.canvas.draw_idle)
         except tk.TclError:
             pass
@@ -483,6 +496,20 @@ class AnnotatorApp:
             self._set_status("Connect points on — samples joined with a line.")
         else:
             self._set_status("Connect points off — markers only.")
+
+    def _on_show_openness_toggled(self) -> None:
+        if self.show_openness_var.get():
+            if self.trial is not None and not self.trial.has_eye_openness():
+                self._set_status(
+                    "Eye openness on — no sranipal*EyeOpenness files in this gaze folder."
+                )
+            else:
+                self._set_status(
+                    "Eye openness shown under gaze (L blue / R red). Mark on the top plot."
+                )
+        else:
+            self._set_status("Eye openness panel hidden.")
+        self._redraw()
 
     def _refit_all_segments(self) -> None:
         if self.trial is None:
@@ -792,6 +819,20 @@ class AnnotatorApp:
             "Useful when manually placing start/end marks.",
         )
 
+        self.show_openness_var = tk.BooleanVar(value=False)
+        self.show_openness_chk = ttk.Checkbutton(
+            controls_row,
+            text="Eye openness",
+            variable=self.show_openness_var,
+            command=self._on_show_openness_toggled,
+        )
+        self.show_openness_chk.pack(side=tk.LEFT, padx=(0, 8))
+        _bind_tooltip(
+            self.show_openness_chk,
+            "Show left/right SRanipal eye openness under the gaze plot\n"
+            "(auto-loaded from the gaze folder when available).",
+        )
+
         ttk.Label(controls_row, text="Window:").pack(side=tk.LEFT)
         self.view_var = tk.StringVar(value="2 s")
         self.view_combo = ttk.Combobox(
@@ -806,6 +847,29 @@ class AnnotatorApp:
         ttk.Button(controls_row, text="Reset", width=6, command=self._reset_view).pack(
             side=tk.LEFT, padx=2
         )
+
+        ttk.Label(controls_row, text="Y:").pack(side=tk.LEFT, padx=(10, 0))
+        self.y_span_var = tk.StringVar(value="Auto")
+        self.y_span_combo = ttk.Combobox(
+            controls_row,
+            textvariable=self.y_span_var,
+            values=self.Y_SPAN_LABELS,
+            state="readonly",
+            width=6,
+        )
+        self.y_span_combo.pack(side=tk.LEFT, padx=2)
+        self.y_span_combo.bind("<<ComboboxSelected>>", self._on_y_span_selected)
+        _bind_tooltip(
+            self.y_span_combo,
+            "Y-axis span for the gaze plot.\n"
+            "Auto = full trial range (default).\n"
+            "Fixed ° = zoomed window; Shift+scroll to pan Y.\n"
+            "Recenter Y = put 0° in the middle when Zero at start is on\n"
+            "(otherwise mid of samples in the current time window).",
+        )
+        ttk.Button(
+            controls_row, text="Recenter Y", width=10, command=self._recenter_y_view
+        ).pack(side=tk.LEFT, padx=2)
 
         self.main_pane = ttk.PanedWindow(self.annotate_tab, orient=tk.HORIZONTAL)
         self.main_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -970,7 +1034,7 @@ class AnnotatorApp:
         tree_frame = ttk.Frame(scroll_inner)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        columns = ("stat", "id", "block", "start", "end", "gain", "r2")
+        columns = ("stat", "id", "block", "start", "end", "gain", "r2", "rmse")
         self.seg_tree = ttk.Treeview(
             tree_frame, columns=columns, show="headings", height=8, selectmode="browse"
         )
@@ -981,6 +1045,7 @@ class AnnotatorApp:
         self.seg_tree.heading("end", text="End (s)")
         self.seg_tree.heading("gain", text="Gain")
         self.seg_tree.heading("r2", text="R²")
+        self.seg_tree.heading("rmse", text="RMSE")
         self.seg_tree.column("stat", width=28, anchor=tk.CENTER)
         self.seg_tree.column("id", width=26, anchor=tk.CENTER)
         self.seg_tree.column("block", width=44, anchor=tk.CENTER)
@@ -988,6 +1053,7 @@ class AnnotatorApp:
         self.seg_tree.column("end", width=56, anchor=tk.E)
         self.seg_tree.column("gain", width=46, anchor=tk.E)
         self.seg_tree.column("r2", width=38, anchor=tk.E)
+        self.seg_tree.column("rmse", width=46, anchor=tk.E)
         seg_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.seg_tree.yview)
         self.seg_tree.configure(yscrollcommand=seg_scroll.set)
         self.seg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -997,7 +1063,29 @@ class AnnotatorApp:
 
         block_panel = ttk.LabelFrame(scroll_inner, text="Gain by OKR block", padding=4)
         block_panel.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
-        block_cols = ("block", "n", "med_gain", "condition")
+
+        summary_row = ttk.Frame(block_panel)
+        summary_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 3))
+        ttk.Label(summary_row, text="Show:").pack(side=tk.LEFT)
+        self.gain_summary_var = tk.StringVar(value="Median")
+        self.gain_summary_combo = ttk.Combobox(
+            summary_row,
+            textvariable=self.gain_summary_var,
+            values=("Median", "Mean"),
+            state="readonly",
+            width=8,
+        )
+        self.gain_summary_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self.gain_summary_combo.bind(
+            "<<ComboboxSelected>>", self._on_gain_summary_selected
+        )
+        _bind_tooltip(
+            self.gain_summary_combo,
+            "Choose median or mean for gain and RMSE in the block table,\n"
+            "and for trial gain in the plot title / status. Excel still exports both.",
+        )
+
+        block_cols = ("block", "n", "summary_gain", "summary_rmse", "condition")
         self.block_tree = ttk.Treeview(
             block_panel,
             columns=block_cols,
@@ -1007,12 +1095,14 @@ class AnnotatorApp:
         )
         self.block_tree.heading("block", text="Block")
         self.block_tree.heading("n", text="n")
-        self.block_tree.heading("med_gain", text="Med gain")
+        self.block_tree.heading("summary_gain", text="Med gain")
+        self.block_tree.heading("summary_rmse", text="Med RMSE")
         self.block_tree.heading("condition", text="Condition")
         self.block_tree.column("block", width=44, anchor=tk.CENTER)
         self.block_tree.column("n", width=28, anchor=tk.CENTER)
-        self.block_tree.column("med_gain", width=64, anchor=tk.E)
-        self.block_tree.column("condition", width=220, anchor=tk.W)
+        self.block_tree.column("summary_gain", width=58, anchor=tk.E)
+        self.block_tree.column("summary_rmse", width=62, anchor=tk.E)
+        self.block_tree.column("condition", width=180, anchor=tk.W)
         self.block_tree.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(
             block_panel,
@@ -1036,7 +1126,9 @@ class AnnotatorApp:
             self.detect_params_toggle.configure(text="Show parameters ▸")
 
     def _build_plot(self) -> None:
-        self.fig, self.ax = plt.subplots(figsize=(10, 4))
+        self.fig = plt.figure(figsize=(10, 4))
+        self.ax = self.fig.add_subplot(111)
+        self.openness_ax = None
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Elevation (deg)")
         self.ax.set_title("Elevation — mark slow-phase start and end")
@@ -1065,9 +1157,148 @@ class AnnotatorApp:
         ).pack(side=tk.BOTTOM, fill=tk.X)
 
         self.canvas.mpl_connect("button_press_event", self._on_click)
+
         self.canvas.mpl_connect("button_release_event", self._on_release)
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+
+    def _eye_openness_visible(self) -> bool:
+        return bool(
+            hasattr(self, "show_openness_var") and self.show_openness_var.get()
+        )
+
+    def _sync_plot_layout(self) -> None:
+        """Rebuild axes when the eye-openness panel is shown or hidden."""
+        want = self._eye_openness_visible()
+        have = getattr(self, "openness_ax", None) is not None
+        if want == have and hasattr(self, "ax") and self.ax is not None:
+            return
+        self.fig.clf()
+        if want:
+            gs = self.fig.add_gridspec(2, 1, height_ratios=[2.4, 1.0], hspace=0.06)
+            self.ax = self.fig.add_subplot(gs[0])
+            self.openness_ax = self.fig.add_subplot(gs[1], sharex=self.ax)
+            plt.setp(self.ax.get_xticklabels(), visible=False)
+        else:
+            self.ax = self.fig.add_subplot(111)
+            self.openness_ax = None
+
+    def _draw_openness_panel(self, vx0: float, vx1: float) -> None:
+        ax = getattr(self, "openness_ax", None)
+        if ax is None or self.trial is None:
+            return
+
+        ax.set_ylabel("Openness")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xlim(vx0, vx1)
+        ax.axhline(0.0, color="0.85", linewidth=0.6)
+        ax.axhline(1.0, color="0.85", linewidth=0.6)
+
+        # Align segment regions with the gaze plot above.
+        for kind, seg in self._segments_sorted_by_time():
+            if seg.t_end < vx0 or seg.t_start > vx1:
+                continue
+            selected = self.selected_segment_key == (kind, seg.segment_id)
+            if kind == "accepted":
+                color = "limegreen" if selected else "green"
+                alpha = 0.28 if selected else 0.14
+            else:
+                color = "cornflowerblue" if selected else "steelblue"
+                alpha = 0.24 if selected else 0.12
+            ax.axvspan(seg.t_start, seg.t_end, color=color, alpha=alpha, zorder=0)
+
+        if self.pending_fit is not None:
+            ax.axvspan(
+                self.pending_fit.t_start,
+                self.pending_fit.t_end,
+                color="orange",
+                alpha=0.12,
+                zorder=0,
+            )
+        elif self.pending_start_idx is not None:
+            times = self._active_times()
+            t_start = float(times[self.pending_start_idx])
+            ax.axvline(t_start, color="orange", linestyle=":", linewidth=1.0, zorder=3)
+            if self.pending_end_idx is not None:
+                ax.axvline(
+                    float(times[self.pending_end_idx]),
+                    color="darkorange",
+                    linestyle=":",
+                    linewidth=1.0,
+                    zorder=3,
+                )
+
+        plotted = False
+        for trace, color, label in (
+            (self.trial.openness_left, "#1f77b4", "L"),
+            (self.trial.openness_right, "#d62728", "R"),
+        ):
+            if trace is None:
+                continue
+            mask = (
+                (trace.times >= vx0)
+                & (trace.times <= vx1)
+                & np.isfinite(trace.openness)
+            )
+            if not np.any(mask):
+                continue
+            if self.connect_points_var.get():
+                line_vals = np.asarray(trace.openness, dtype=float).copy()
+                line_mask = (
+                    (trace.times >= vx0)
+                    & (trace.times <= vx1)
+                    & np.isfinite(trace.openness)
+                )
+                line_vals[~line_mask] = np.nan
+                ax.plot(
+                    trace.times,
+                    line_vals,
+                    linestyle="-",
+                    linewidth=0.8,
+                    color=color,
+                    alpha=0.75,
+                    zorder=1,
+                )
+            ax.plot(
+                trace.times[mask],
+                trace.openness[mask],
+                linestyle="none",
+                marker=".",
+                markersize=3,
+                color=color,
+                label=label,
+                zorder=2,
+            )
+            plotted = True
+
+        if plotted:
+            ax.legend(loc="lower right", fontsize=8, framealpha=0.85)
+        elif self.trial.has_eye_openness():
+            ax.text(
+                0.5,
+                0.5,
+                "No openness samples in this window",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="#666666",
+            )
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No sranipal*EyeOpenness files in gaze folder",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="#666666",
+            )
+
+        if self.okr_log is not None:
+            self._draw_okr_log_markers(vx0, vx1, ax=ax, labels=False)
 
     def _show_help(self) -> None:
         dlg = tk.Toplevel(self.root)
@@ -1898,11 +2129,11 @@ class AnnotatorApp:
         self._refresh_segment_list()
         self._redraw()
         n = len(restored)
-        med = trial_summary_median_gain(self.segments) if restored else float("nan")
         if restored:
+            gain = self._trial_display_gain()
             self._set_status(
                 f"Loaded {n} segment(s) from {source_label}. "
-                f"Trial median gain={med:.3f}"
+                f"Trial {self._gain_summary_label()}={gain:.3f}"
             )
         else:
             self._set_status(f"Loaded {source_label}: no segments in file.")
@@ -1942,9 +2173,9 @@ class AnnotatorApp:
             if n_proposed:
                 parts.append(f"{n_proposed} proposed")
             status += f" Recalculated gain for {', '.join(parts)} segment(s)."
-            med = trial_summary_median_gain(self.segments)
             if n_accepted:
-                status += f" Trial median gain={med:.3f}."
+                gain = self._trial_display_gain()
+                status += f" Trial {self._gain_summary_label()}={gain:.3f}."
         else:
             status += " Will be used for new segments and export."
         self._set_status(status)
@@ -2008,11 +2239,23 @@ class AnnotatorApp:
                 None if self._is_tobii_gaze() else self.time_path,
                 trial_id=trial_id,
             )
+            if self.gaze_path is not None and not self._is_tobii_gaze():
+                attach_eye_openness(self.trial, self.gaze_path.parent)
+            else:
+                self.trial.openness_left = None
+                self.trial.openness_right = None
             t0 = float(self.trial.times[0])
             t1 = float(self.trial.times[-1])
+            for openness in (self.trial.openness_left, self.trial.openness_right):
+                if openness is None or len(openness.times) == 0:
+                    continue
+                t0 = min(t0, float(openness.times[0]))
+                t1 = max(t1, float(openness.times[-1]))
             self.analysis_t0 = t0
             self.analysis_t1 = t1
-            self.window_mask = analysis_window_mask(self.trial.times, t0, t_end=t1)
+            self.window_mask = analysis_window_mask(
+                self.trial.times, float(self.trial.times[0]), t_end=float(self.trial.times[-1])
+            )
             self.segments.clear()
             self.proposed_segments.clear()
             self.selected_segment_key = None
@@ -2041,6 +2284,13 @@ class AnnotatorApp:
             )
             if self.trial.has_per_eye_gaze():
                 status += "; Eye: Binocular/Left/Right available"
+            if self.trial.has_eye_openness():
+                n_eyes = sum(
+                    1
+                    for tr in (self.trial.openness_left, self.trial.openness_right)
+                    if tr is not None
+                )
+                status += f"; eye openness: {n_eyes} eye(s)"
             if self.okr_log is not None:
                 status += (
                     f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
@@ -2159,17 +2409,45 @@ class AnnotatorApp:
             return False
         return True
 
+    def _scroll_delta_positive(self, event) -> bool:
+        return bool(
+            event.step > 0 if getattr(event, "step", 0) else event.button == "up"
+        )
+
+    def _is_shift_scroll(self, event) -> bool:
+        if getattr(event, "key", None) == "shift":
+            return True
+        gui = getattr(event, "guiEvent", None)
+        if gui is None:
+            return False
+        state = getattr(gui, "state", 0) or 0
+        return bool(state & 0x0001)
+
     def _on_scroll(self, event) -> None:
-        if event.inaxes != self.ax or self.trial is None:
+        allowed_axes = {self.ax}
+        if getattr(self, "openness_ax", None) is not None:
+            allowed_axes.add(self.openness_ax)
+        allowed_axes.discard(None)
+        if event.inaxes not in allowed_axes or self.trial is None:
             return
         if self.view_xmin is None or self.view_xmax is None:
             return
+
+        # Shift+scroll pans Y when a fixed Y span is selected.
+        if self._is_shift_scroll(event) and self._y_span_degrees() is not None:
+            if event.inaxes != self.ax:
+                return
+            delta = self._y_pan_step_deg()
+            if not self._scroll_delta_positive(event):
+                delta = -delta
+            self._pan_y_view(delta)
+            return
+
         if not self._is_vertical_scroll(event):
             return
 
-        scroll_forward = event.step > 0 if getattr(event, "step", 0) else event.button == "up"
         delta = self._pan_step_sec()
-        if not scroll_forward:
+        if not self._scroll_delta_positive(event):
             delta = -delta
         self._pan_view(delta)
 
@@ -2179,12 +2457,15 @@ class AnnotatorApp:
         return self._analysis_mask() & ~np.isnan(self._active_values())
 
     def _update_signal_ylim(self) -> None:
-        """Fix y-axis to full-trial signal range so panning time does not rescale."""
+        """Compute full-trial signal range, then apply the selected Y span."""
         if self.trial is None:
+            self.signal_ylim_full = None
             self.signal_ylim = None
+            self.view_ycenter = None
             return
         valid = self._valid_click_mask()
         if not np.any(valid):
+            self.signal_ylim_full = None
             self.signal_ylim = None
             return
         values = self._active_values()
@@ -2192,9 +2473,128 @@ class AnnotatorApp:
         ymin = float(np.nanmin(values[valid])) - pad
         ymax = float(np.nanmax(values[valid])) + pad
         if ymin < ymax:
-            self.signal_ylim = (ymin, ymax)
+            self.signal_ylim_full = (ymin, ymax)
+            if self.view_ycenter is None:
+                self.view_ycenter = 0.5 * (ymin + ymax)
+            self._apply_y_span(recenter=False)
         else:
+            self.signal_ylim_full = None
             self.signal_ylim = None
+
+    def _y_span_degrees(self) -> float | None:
+        if not hasattr(self, "y_span_var"):
+            return None
+        return self.Y_SPAN_DEGREES.get(self.y_span_var.get())
+
+    def _default_y_center(self) -> float | None:
+        """Preferred Y-window center: 0 when zeroed, else mid of samples in view."""
+        if self.signal_ylim_full is None or self.trial is None:
+            return None
+        full_lo, full_hi = self.signal_ylim_full
+        if hasattr(self, "zero_elevation_var") and self.zero_elevation_var.get():
+            return 0.0
+
+        vx0 = self.view_xmin if self.view_xmin is not None else self.analysis_t0
+        vx1 = self.view_xmax if self.view_xmax is not None else self.analysis_t1
+        times = self._active_times()
+        values = self._active_values()
+        mask = (
+            self._valid_click_mask()
+            & (times >= vx0)
+            & (times <= vx1)
+        )
+        if np.any(mask):
+            lo = float(np.nanmin(values[mask]))
+            hi = float(np.nanmax(values[mask]))
+            if lo < hi:
+                return 0.5 * (lo + hi)
+            if np.isfinite(lo):
+                return lo
+        return 0.5 * (full_lo + full_hi)
+
+    def _apply_y_span(self, *, recenter: bool = False) -> None:
+        if self.signal_ylim_full is None:
+            self.signal_ylim = None
+            return
+        full_lo, full_hi = self.signal_ylim_full
+        span = self._y_span_degrees()
+        if span is None:
+            self.signal_ylim = self.signal_ylim_full
+            self.view_ycenter = self._default_y_center()
+            return
+        if recenter or self.view_ycenter is None:
+            center = self._default_y_center()
+            self.view_ycenter = (
+                0.5 * (full_lo + full_hi) if center is None else float(center)
+            )
+        half = span / 2.0
+        center = float(self.view_ycenter)
+        # Keep the window overlapping the data range when possible.
+        if center + half < full_lo:
+            center = full_lo - half + 0.01 * span
+        elif center - half > full_hi:
+            center = full_hi + half - 0.01 * span
+        self.view_ycenter = center
+        self.signal_ylim = (center - half, center + half)
+
+    def _on_y_span_selected(self, _event=None) -> None:
+        span = self._y_span_degrees()
+        self._apply_y_span(recenter=True)
+        self._redraw()
+        if span is None:
+            self._set_status("Y axis: Auto (full trial range).")
+        else:
+            self._set_status(
+                f"Y axis: {span:g}° window (Shift+scroll to pan, Recenter Y to reset)."
+            )
+
+    def _recenter_y_view(self) -> None:
+        if self.trial is None:
+            return
+        if self.signal_ylim_full is None:
+            self._update_signal_ylim()
+        if self._y_span_degrees() is None:
+            self._set_status(
+                "Y axis is Auto (full range). Choose a ° span first, then Recenter Y."
+            )
+            return
+        before = self.signal_ylim
+        self._apply_y_span(recenter=True)
+        self._redraw()
+        span = self._y_span_degrees()
+        center = self.view_ycenter
+        after = self.signal_ylim
+        if before == after:
+            self._set_status(
+                f"Y already centered"
+                + (f" at {center:.1f}°" if center is not None else "")
+                + f" ({span:g}° window)."
+            )
+        else:
+            zeroed = (
+                hasattr(self, "zero_elevation_var") and self.zero_elevation_var.get()
+            )
+            where = "0°" if zeroed else "data in view"
+            self._set_status(
+                f"Y recentered on {where} ({span:g}° window"
+                + (f", center={center:.1f}°" if center is not None else "")
+                + ")."
+            )
+    def _pan_y_view(self, delta_deg: float) -> None:
+        if self.trial is None or self._y_span_degrees() is None:
+            return
+        if self.view_ycenter is None:
+            self._apply_y_span(recenter=True)
+        assert self.view_ycenter is not None
+        self.view_ycenter += delta_deg
+        self._apply_y_span(recenter=False)
+        self._redraw()
+
+    def _y_pan_step_deg(self) -> float:
+        span = self._y_span_degrees()
+        if span is None:
+            return 1.0
+        return span * self.SCROLL_PAN_FRACTION
 
     def _valid_indices(self) -> np.ndarray:
         return np.where(self._valid_click_mask())[0]
@@ -2259,7 +2659,8 @@ class AnnotatorApp:
                 return
             self._set_status(
                 f"Pending segment: gain={self.pending_fit.gain:.3f}, "
-                f"R²={self.pending_fit.r2:.3f} — press A to accept"
+                f"R²={self.pending_fit.r2:.3f}, "
+                f"RMSE={self._format_rmse(self.pending_fit)} — press A to accept"
             )
 
         self._redraw()
@@ -2329,7 +2730,39 @@ class AnnotatorApp:
         label = self._segment_display_label(kind, updated)
         self._set_status(
             f"{label} {boundary} → {t:.3f} s "
-            f"(gain={updated.gain:.3f}, R²={updated.r2:.3f})"
+            f"(gain={updated.gain:.3f}, R²={updated.r2:.3f}, "
+            f"RMSE={self._format_rmse(updated)})"
+        )
+
+    def _format_rmse(self, seg: SegmentFit) -> str:
+        if seg.rmse_deg != seg.rmse_deg:
+            return "—"
+        return f"{seg.rmse_deg:.3f}°"
+
+    def _gain_summary_statistic(self) -> str:
+        if getattr(self, "gain_summary_var", None) is None:
+            return "median"
+        return "mean" if self.gain_summary_var.get() == "Mean" else "median"
+
+    def _gain_summary_label(self, *, short: bool = False) -> str:
+        if self._gain_summary_statistic() == "mean":
+            return "Mean gain" if short else "mean gain"
+        return "Med gain" if short else "median gain"
+
+    def _rmse_summary_label(self, *, short: bool = False) -> str:
+        if self._gain_summary_statistic() == "mean":
+            return "Mean RMSE" if short else "mean RMSE"
+        return "Med RMSE" if short else "median RMSE"
+
+    def _trial_display_gain(self) -> float:
+        return trial_summary_gain(self.segments, self._gain_summary_statistic())
+
+    def _on_gain_summary_selected(self, _event=None) -> None:
+        self._refresh_block_gain_summary()
+        self._redraw()
+        self._set_status(
+            f"Showing {self._gain_summary_label()} / {self._rmse_summary_label()} "
+            "in block table and trial summary."
         )
 
     def _segment_display_map(self) -> dict[tuple[str, int], int]:
@@ -2521,7 +2954,8 @@ class AnnotatorApp:
         self._set_status(
             f"Proposed {self._segment_display_label('proposed', seg)} "
             f"({new_idx + 1}/{len(proposed)}): "
-            f"{seg.t_start:.2f}–{seg.t_end:.2f} s, gain={seg.gain:.3f}, R²={seg.r2:.2f}"
+            f"{seg.t_start:.2f}–{seg.t_end:.2f} s, gain={seg.gain:.3f}, "
+            f"R²={seg.r2:.2f}, RMSE={self._format_rmse(seg)}"
         )
 
     def _on_segment_select(self, _event=None) -> None:
@@ -2562,6 +2996,7 @@ class AnnotatorApp:
         for kind, seg in self._segments_sorted_by_time():
             stat = "✓" if kind == "accepted" else "?"
             r2 = f"{seg.r2:.2f}" if seg.r2 == seg.r2 else "—"
+            rmse = f"{seg.rmse_deg:.3f}" if seg.rmse_deg == seg.rmse_deg else "—"
             fields = segment_condition_fields(self.okr_log, seg.t_start, seg.t_end)
             block = str(fields.get("block_label") or "—")
             if block in {"Outside blocks", "No OKR log"}:
@@ -2579,6 +3014,7 @@ class AnnotatorApp:
                     f"{seg.t_end:.2f}",
                     f"{seg.gain:.3f}",
                     r2,
+                    rmse,
                 ),
             )
             display_id += 1
@@ -2592,15 +3028,26 @@ class AnnotatorApp:
             return
         for item in self.block_tree.get_children():
             self.block_tree.delete(item)
+        self.block_tree.heading(
+            "summary_gain", text=self._gain_summary_label(short=True)
+        )
+        self.block_tree.heading(
+            "summary_rmse", text=self._rmse_summary_label(short=True)
+        )
+        use_mean = self._gain_summary_statistic() == "mean"
         summaries = summarize_gains_by_block(self.segments, self.okr_log)
         for summary in summaries:
+            gain = summary.mean_gain if use_mean else summary.median_gain
+            rmse = summary.mean_rmse_deg if use_mean else summary.median_rmse_deg
+            rmse_txt = f"{rmse:.3f}" if rmse == rmse else "—"
             self.block_tree.insert(
                 "",
                 tk.END,
                 values=(
                     summary.block_label,
                     summary.n_segments,
-                    f"{summary.median_gain:.3f}",
+                    f"{gain:.3f}",
+                    rmse_txt,
                     summary.condition,
                 ),
             )
@@ -2656,11 +3103,11 @@ class AnnotatorApp:
         self._refresh_segment_list()
         self._redraw()
         if kind == "accepted":
-            med = trial_summary_median_gain(self.segments)
             n = len(self.segments)
             status = f"Deleted accepted segment. {n} remaining."
             if n:
-                status += f" Trial median gain={med:.3f}"
+                gain = self._trial_display_gain()
+                status += f" Trial {self._gain_summary_label()}={gain:.3f}"
         else:
             status = f"Deleted proposed segment. {len(self.proposed_segments)} proposed remaining."
         self._set_status(status)
@@ -2690,12 +3137,13 @@ class AnnotatorApp:
         self._hover_proposed_key = None
         self._refresh_segment_list()
         self._redraw()
-        med = trial_summary_median_gain(self.segments)
+        gain = self._trial_display_gain()
         accepted_label = self._segment_display_label("accepted", accepted)
         self._set_status(
             f"Accepted {proposed_label} as {accepted_label}: "
             f"gain={accepted.gain:.3f}, R²={accepted.r2:.3f}, "
-            f"trial median gain={med:.3f} (n={len(self.segments)})"
+            f"RMSE={self._format_rmse(accepted)}, "
+            f"trial {self._gain_summary_label()}={gain:.3f} (n={len(self.segments)})"
         )
         return True
 
@@ -2720,11 +3168,12 @@ class AnnotatorApp:
             self.selected_segment_key = ("accepted", accepted.segment_id)
             self._refresh_segment_list()
             self._redraw()
-            med = trial_summary_median_gain(self.segments)
+            gain = self._trial_display_gain()
             self._set_status(
                 f"Accepted {self._segment_display_label('accepted', accepted)}: "
                 f"gain={accepted.gain:.3f}, R²={accepted.r2:.3f}, "
-                f"trial median gain={med:.3f} (n={len(self.segments)})"
+                f"RMSE={self._format_rmse(accepted)}, "
+                f"trial {self._gain_summary_label()}={gain:.3f} (n={len(self.segments)})"
             )
             return
 
@@ -2749,9 +3198,10 @@ class AnnotatorApp:
             self._renumber_segments()
             self._refresh_segment_list()
             self._redraw()
-            med = trial_summary_median_gain(self.segments)
+            gain = self._trial_display_gain()
             self._set_status(
-                f"Removed last segment. Trial median gain={med:.3f} (n={len(self.segments)})"
+                f"Removed last segment. Trial {self._gain_summary_label()}={gain:.3f} "
+                f"(n={len(self.segments)})"
             )
         else:
             self._set_status("No segments to undo.")
@@ -2764,7 +3214,11 @@ class AnnotatorApp:
             self._redraw()
 
     def _redraw(self) -> None:
+        self._sync_plot_layout()
         self.ax.clear()
+        if self.openness_ax is not None:
+            self.openness_ax.clear()
+            plt.setp(self.ax.get_xticklabels(), visible=False)
         self._click_markers.clear()
         self._hover_artists.clear()
 
@@ -2967,7 +3421,8 @@ class AnnotatorApp:
             self.ax.set_title(
                 f"Pending: slope={self.pending_fit.slope_deg_s:.2f} "
                 f"{self._signal_slope_unit()}, "
-                f"gain={self.pending_fit.gain:.3f}, R²={self.pending_fit.r2:.3f} ({upward})"
+                f"gain={self.pending_fit.gain:.3f}, R²={self.pending_fit.r2:.3f}, "
+                f"RMSE={self._format_rmse(self.pending_fit)} ({upward})"
             )
         elif self.pending_start_idx is not None and self.pending_end_idx is None:
             t_start = times[self.pending_start_idx]
@@ -2975,7 +3430,7 @@ class AnnotatorApp:
                 f"Click end of slow phase (start at {t_start:.3f} s)"
             )
         else:
-            med = trial_summary_median_gain(self.segments)
+            gain = self._trial_display_gain()
             n = len(self.segments)
             p = len(self.proposed_segments)
             duration = t1 - t0
@@ -2984,10 +3439,10 @@ class AnnotatorApp:
                 title += f", {p} proposed"
             title += f", {duration:.1f} s trial"
             if n:
-                title += f", median gain={med:.3f}"
+                title += f", {self._gain_summary_label()}={gain:.3f}"
             self.ax.set_title(title)
 
-        self.ax.set_xlabel("Time (s)")
+        self.ax.set_xlabel("" if self.openness_ax is not None else "Time (s)")
         self.ax.set_ylabel(self._signal_y_label())
         self.ax.set_xlim(vx0, vx1)
 
@@ -2995,6 +3450,9 @@ class AnnotatorApp:
             ymin, ymax = self.signal_ylim
             if ymin < ymax:
                 self.ax.set_ylim(ymin, ymax)
+
+        if self.openness_ax is not None:
+            self._draw_openness_panel(vx0, vx1)
 
         if self._hover_idx is not None:
             self._draw_hover_highlight(self._hover_idx)
@@ -3004,17 +3462,20 @@ class AnnotatorApp:
             self.hover_var.set(self._hover_hint())
             self._update_condition_display()
 
-    def _draw_okr_log_markers(self, vx0: float, vx1: float) -> None:
+    def _draw_okr_log_markers(
+        self, vx0: float, vx1: float, ax=None, *, labels: bool = True
+    ) -> None:
         if self.okr_log is None:
             return
+        ax = self.ax if ax is None else ax
 
-        label_trans = blended_transform_factory(self.ax.transData, self.ax.transAxes)
+        label_trans = blended_transform_factory(ax.transData, ax.transAxes)
 
         for marker in self.okr_log.fixation_markers:
             t = marker.start_time
             if t < vx0 or t > vx1:
                 continue
-            self.ax.axvline(
+            ax.axvline(
                 t,
                 color="#5c6b73",
                 linestyle=(0, (1, 2)),
@@ -3022,24 +3483,24 @@ class AnnotatorApp:
                 alpha=0.75,
                 zorder=1,
             )
-            label = "F"
-            self.ax.text(
-                t,
-                0.97,
-                label,
-                transform=label_trans,
-                color="#5c6b73",
-                fontsize=7,
-                ha="center",
-                va="top",
-                clip_on=True,
-            )
+            if labels:
+                ax.text(
+                    t,
+                    0.97,
+                    "F",
+                    transform=label_trans,
+                    color="#5c6b73",
+                    fontsize=7,
+                    ha="center",
+                    va="top",
+                    clip_on=True,
+                )
 
         for marker in self.okr_log.block_markers:
             t = marker.start_time
             if t < vx0 or t > vx1:
                 continue
-            self.ax.axvline(
+            ax.axvline(
                 t,
                 color="#7b2cbf",
                 linestyle=(0, (4, 2)),
@@ -3047,19 +3508,20 @@ class AnnotatorApp:
                 alpha=0.85,
                 zorder=1,
             )
-            self.ax.text(
-                t,
-                0.88,
-                marker.label,
-                transform=label_trans,
-                color="#7b2cbf",
-                fontsize=7,
-                fontweight="bold",
-                ha="center",
-                va="top",
-                rotation=90,
-                clip_on=True,
-            )
+            if labels:
+                ax.text(
+                    t,
+                    0.88,
+                    marker.label,
+                    transform=label_trans,
+                    color="#7b2cbf",
+                    fontsize=7,
+                    fontweight="bold",
+                    ha="center",
+                    va="top",
+                    rotation=90,
+                    clip_on=True,
+                )
 
     def _export(self) -> None:
         if not self.segments:

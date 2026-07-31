@@ -22,14 +22,24 @@ class SegmentFit:
     intercept_deg: float
     gain: float
     r2: float
+    rmse_deg: float
     direction_upward: bool
     stimulus_velocity: float
 
     def to_row(self, trial_id: str, software_version: str) -> dict[str, Any]:
         row = asdict(self)
-        row["trial_id"] = trial_id
-        row["software_version"] = software_version
-        return row
+        # Derived Excel columns: duration and eye velocity of the slow phase.
+        # velocity_deg_s is the fitted slope (deg/s); same value as slope_deg_s.
+        ordered: dict[str, Any] = {}
+        for key, value in row.items():
+            ordered[key] = value
+            if key == "t_end":
+                ordered["duration_s"] = float(self.t_end - self.t_start)
+            if key == "slope_deg_s":
+                ordered["velocity_deg_s"] = float(self.slope_deg_s)
+        ordered["trial_id"] = trial_id
+        ordered["software_version"] = software_version
+        return ordered
 
 
 def fit_segment(
@@ -58,11 +68,14 @@ def fit_segment(
 
     slope, intercept = np.polyfit(seg_times, seg_elev, 1)
     predicted = slope * seg_times + intercept
+    residuals = seg_elev - predicted
+    ss_res = float(np.sum(residuals**2))
     ss_tot = np.sum((seg_elev - np.mean(seg_elev)) ** 2)
     if ss_tot <= 0:
         r2 = float("nan")
     else:
-        r2 = float(1.0 - np.sum((seg_elev - predicted) ** 2) / ss_tot)
+        r2 = float(1.0 - ss_res / ss_tot)
+    rmse_deg = float(np.sqrt(ss_res / len(seg_elev)))
 
     return SegmentFit(
         segment_id=segment_id,
@@ -75,6 +88,7 @@ def fit_segment(
         intercept_deg=float(intercept),
         gain=float(slope / stimulus_velocity),
         r2=r2,
+        rmse_deg=rmse_deg,
         direction_upward=bool(slope > 0),
         stimulus_velocity=float(stimulus_velocity),
     )
@@ -85,6 +99,23 @@ def trial_summary_median_gain(segments: list[SegmentFit]) -> float:
     if not segments:
         return float("nan")
     return float(np.median([s.gain for s in segments]))
+
+
+def trial_summary_mean_gain(segments: list[SegmentFit]) -> float:
+    """Mean gain across accepted segments."""
+    if not segments:
+        return float("nan")
+    return float(np.mean([s.gain for s in segments]))
+
+
+def trial_summary_gain(
+    segments: list[SegmentFit],
+    statistic: str = "median",
+) -> float:
+    """Trial-level gain summary using ``median`` or ``mean``."""
+    if statistic == "mean":
+        return trial_summary_mean_gain(segments)
+    return trial_summary_median_gain(segments)
 
 
 @dataclass(frozen=True)
@@ -107,6 +138,8 @@ class BlockGainSummary:
     median_gain: float
     mean_gain: float
     median_r2: float
+    median_rmse_deg: float
+    mean_rmse_deg: float
     median_slope_deg_s: float
     n_upward: int
     n_not_upward: int
@@ -145,6 +178,7 @@ def summarize_gains_by_block(
         fields = meta[key]
         gains = np.array([s.gain for s in segs], dtype=float)
         r2s = np.array([s.r2 for s in segs], dtype=float)
+        rmses = np.array([s.rmse_deg for s in segs], dtype=float)
         slopes = np.array([s.slope_deg_s for s in segs], dtype=float)
         n_up = sum(1 for s in segs if s.direction_upward)
         summaries.append(
@@ -165,6 +199,8 @@ def summarize_gains_by_block(
                 median_gain=float(np.median(gains)),
                 mean_gain=float(np.mean(gains)),
                 median_r2=float(np.nanmedian(r2s)),
+                median_rmse_deg=float(np.nanmedian(rmses)),
+                mean_rmse_deg=float(np.nanmean(rmses)),
                 median_slope_deg_s=float(np.median(slopes)),
                 n_upward=n_up,
                 n_not_upward=len(segs) - n_up,

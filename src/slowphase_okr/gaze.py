@@ -23,6 +23,17 @@ class PupilTrace:
 
 
 @dataclass
+class EyeOpennessTrace:
+    """SRanipal eye openness (typically 0=closed … 1=open)."""
+
+    times: np.ndarray
+    openness: np.ndarray
+    eye: str  # "left" or "right"
+    source_values: str = ""
+    source_time: str = ""
+
+
+@dataclass
 class GazeTrial:
     """Eye position time series for one trial."""
 
@@ -39,12 +50,17 @@ class GazeTrial:
     elevation_right_deg: np.ndarray | None = None
     azimuth_left_deg: np.ndarray | None = None
     azimuth_right_deg: np.ndarray | None = None
+    openness_left: EyeOpennessTrace | None = None
+    openness_right: EyeOpennessTrace | None = None
 
     def has_per_eye_gaze(self) -> bool:
         return (
             self.elevation_left_deg is not None
             and self.elevation_right_deg is not None
         )
+
+    def has_eye_openness(self) -> bool:
+        return self.openness_left is not None or self.openness_right is not None
 
 
 def unity_gaze_direction(
@@ -394,6 +410,82 @@ def discover_pupil_files(
         if time_path.is_file():
             return pos_path, time_path
     return None
+
+
+def discover_eye_openness_files(
+    trial_dir: str | Path,
+    eye: str,
+) -> tuple[Path, Path] | None:
+    """Return SRanipal eye-openness value + time files for one eye, if present."""
+    trial_dir = Path(trial_dir)
+    eye_norm = eye.strip().lower()
+    if eye_norm not in {"left", "right"}:
+        raise ValueError(f"eye must be 'left' or 'right', got {eye!r}")
+
+    prefix = "sranipalRight" if eye_norm == "right" else "sranipalLeft"
+    values_path = trial_dir / f"{prefix}EyeOpenness.txt"
+    if not values_path.is_file():
+        return None
+    time_path = trial_dir / f"{prefix}EyeOpennessTimes.txt"
+    if not time_path.is_file():
+        return None
+    return values_path, time_path
+
+
+def load_sranipal_eye_openness(
+    values_path: str | Path,
+    time_path: str | Path,
+    *,
+    eye: str,
+) -> EyeOpennessTrace:
+    """Load ``sranipal*EyeOpenness.txt`` + matching ``*Times.txt``."""
+    values_path = Path(values_path)
+    time_path = Path(time_path)
+    if not values_path.is_file():
+        raise FileNotFoundError(values_path)
+    if not time_path.is_file():
+        raise FileNotFoundError(time_path)
+
+    openness = np.atleast_1d(np.loadtxt(values_path, dtype=float)).ravel()
+    times = _parse_gaze_times(time_path)
+    if len(openness) != len(times):
+        raise ValueError(
+            f"Length mismatch: {len(openness)} openness samples vs {len(times)} timestamps"
+        )
+
+    eye_norm = eye.strip().lower()
+    if eye_norm not in {"left", "right"}:
+        raise ValueError(f"eye must be 'left' or 'right', got {eye!r}")
+
+    return EyeOpennessTrace(
+        times=times.astype(float),
+        openness=openness.astype(float),
+        eye=eye_norm,
+        source_values=str(values_path.resolve()),
+        source_time=str(time_path.resolve()),
+    )
+
+
+def attach_eye_openness(
+    trial: GazeTrial,
+    trial_dir: str | Path,
+) -> tuple[EyeOpennessTrace | None, EyeOpennessTrace | None]:
+    """Discover and attach left/right SRanipal eye-openness traces, if present."""
+    trial_dir = Path(trial_dir)
+    left: EyeOpennessTrace | None = None
+    right: EyeOpennessTrace | None = None
+
+    left_files = discover_eye_openness_files(trial_dir, "left")
+    if left_files is not None:
+        left = load_sranipal_eye_openness(left_files[0], left_files[1], eye="left")
+
+    right_files = discover_eye_openness_files(trial_dir, "right")
+    if right_files is not None:
+        right = load_sranipal_eye_openness(right_files[0], right_files[1], eye="right")
+
+    trial.openness_left = left
+    trial.openness_right = right
+    return left, right
 
 
 def infer_viewing_eye(

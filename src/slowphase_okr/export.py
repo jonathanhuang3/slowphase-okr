@@ -42,11 +42,14 @@ def export_to_excel(
                 "idx_end",
                 "t_start",
                 "t_end",
+                "duration_s",
                 "n_samples",
                 "slope_deg_s",
+                "velocity_deg_s",
                 "intercept_deg",
                 "gain",
                 "r2",
+                "rmse_deg",
                 "direction_upward",
                 "stimulus_velocity",
                 "trial_id",
@@ -79,6 +82,7 @@ def export_to_excel(
     }
     if segments:
         summary["median_r2"] = float(seg_df["r2"].median())
+        summary["median_rmse_deg"] = float(seg_df["rmse_deg"].median())
         summary["median_slope_deg_s"] = float(seg_df["slope_deg_s"].median())
         summary["n_upward"] = int(seg_df["direction_upward"].sum())
         summary["n_not_upward"] = int((~seg_df["direction_upward"]).sum())
@@ -109,6 +113,8 @@ def export_to_excel(
                 "median_gain",
                 "mean_gain",
                 "median_r2",
+                "median_rmse_deg",
+                "mean_rmse_deg",
                 "median_slope_deg_s",
                 "n_upward",
                 "n_not_upward",

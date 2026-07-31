@@ -181,6 +181,7 @@ ZIP installs do not update automatically — prefer cloning with Git if you anno
 4. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
 5. Press **Accept segment** (`A`) to keep the fit
 6. **Save segments** for JSON (if that filename already exists, you’ll be asked whether to overwrite or save under a new name), then **Export Excel** when done
+7. Optional: enable **Eye openness** on Annotate to show left/right SRanipal openness under the gaze plot while marking (auto-loaded from the gaze folder when those files exist)
 
 ### Semi-automatic annotation (recommended with OKR log)
 
@@ -203,7 +204,9 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Signal** | Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze |
 | **Zero at start** | Optional (on by default). Subtracts the angle at the first valid sample so the trace starts at 0° — removes headset pose offset. Slopes and gains are unchanged. |
 | **Connect points** | Optional (off by default). Draws a line through successive samples; markers stay visible. Useful for manual start/end marking. |
-| **Fixed y-axis** | Signal scale stays fixed to the full trial while you pan in time |
+| **Eye openness** | Optional (off by default). Shows left/right SRanipal openness under the gaze plot (auto-loaded from the gaze folder) so you can compare while marking. |
+| **Y span** | Optional. Auto = full trial range (default). Choose 5° / 10° / 20° / 40° to zoom; Shift+scroll pans Y; Recenter Y resets the window. |
+| **Fixed y-axis** | With Auto, signal scale stays fixed to the full trial while you pan in time |
 | **Segment list** | Shows proposed (`?`) and accepted (`✓`) segments sorted by time |
 | **Segment labels** | `#N` on accepted (green), `?N` on proposed (blue) segments in the plot |
 | **Edit segments** | Delete selected (`Del`), undo last (`U`), drag edges on plot, nudge boundaries (`[ ]` start, `, .` end) |
@@ -213,11 +216,11 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Reload guard** | Confirms before discarding accepted or proposed segments |
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray). Clear OKR log removes markers for the next patient. |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
-| **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …) with separate median/mean gain in the side panel and Excel `by_block` sheet |
+| **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …) with separate median/mean gain in the side panel and Excel `by_block` sheet. Use **Show: Median / Mean** to switch the panel (and plot/status trial summary). Excel still exports both. |
 | **Invalid gaze samples** | `(NaN, NaN, NaN)` lines stay aligned but are skipped for clicking and fitting |
 | **Parameter tooltips** | Hover auto-detect settings in the app for plain-language help |
 
-**R²** is displayed and written to Excel but segments are **not** auto-rejected.
+**R²** and **RMSE** (degrees; residual scatter around the best-fit line) are displayed and written to Excel but segments are **not** auto-rejected. Lower RMSE means a cleaner, more linear slow phase.
 
 **Upward OKR:** negative slopes are flagged (`direction_upward = false`) but still exportable.
 
@@ -298,6 +301,17 @@ This tool was developed for our lab to support gaze data recorded with a **HTC V
 
 **Pair the right files:** `rotatedGaze.txt` + `gazeTime.txt` (same line count). Do not mix `rotatedGaze.txt` with `sranipalGazeTime.txt`.
 
+**Eye openness (optional):** When loading a Vive/Unity trial, the app looks in the **same folder as the gaze file** for SRanipal openness exports. On Annotate, turn on **Eye openness** to show them in a panel under the gaze plot (shared time window; segment highlights align):
+
+| File | Role |
+|------|------|
+| `sranipalLeftEyeOpenness.txt` | Left-eye openness values (typically 0=closed … 1=open) |
+| `sranipalLeftEyeOpennessTimes.txt` | Matching timestamps |
+| `sranipalRightEyeOpenness.txt` | Right-eye openness values |
+| `sranipalRightEyeOpennessTimes.txt` | Matching timestamps |
+
+Tobii `gazedata.json` loads do not attach these files.
+
 ### Tobii Pro Glasses 3 (`gazedata.json`)
 
 Export from a Glasses 3 recording (NDJSON: one JSON object per line). Select **Gaze file…** and choose `gazedata.json` — **no separate time file** (timestamps are in each row).
@@ -339,9 +353,9 @@ Block labels use `contrastBlockIndex` and direction when available (`↑↓` for
 
 | Sheet | Contents |
 |-------|----------|
-| `segments` | One row per accepted segment: indices, times, slope, gain, R², `direction_upward`, stimulus velocity, plus OKR block/condition columns when a log is loaded |
-| `by_block` | One row per OKR block group: `n_segments`, `median_gain`, `mean_gain`, contrast, direction, flicker/persistent, etc. |
-| `trial_summary` | Overall `median_gain`, segment count, source file paths, software version |
+| `segments` | One row per accepted segment: indices, times, slope, gain, R², RMSE (deg), `direction_upward`, stimulus velocity, plus OKR block/condition columns when a log is loaded |
+| `by_block` | One row per OKR block group: `n_segments`, `median_gain`, `mean_gain`, `median_r2`, `median_rmse_deg`, `mean_rmse_deg`, contrast, direction, flicker/persistent, etc. |
+| `trial_summary` | Overall `median_gain`, `median_rmse_deg`, segment count, source file paths, software version |
 
 Segments are assigned to blocks by midpoint time. Without an OKR log, all segments go into a single `No OKR log` group.
 

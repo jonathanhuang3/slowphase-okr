@@ -38,7 +38,20 @@ def test_fit_segment_upward():
     assert seg.slope_deg_s == pytest.approx(25.0, rel=1e-2)
     assert seg.gain == pytest.approx(25.0 / 31.0, rel=1e-2)
     assert seg.r2 == pytest.approx(1.0, abs=1e-6)
+    assert seg.rmse_deg == pytest.approx(0.0, abs=1e-9)
     assert seg.direction_upward is True
+
+
+def test_fit_segment_rmse_increases_with_noise():
+    rng = np.random.default_rng(0)
+    times = np.linspace(0, 1, 200)
+    elev_clean = 20.0 * times
+    elev_noisy = elev_clean + rng.normal(0.0, 0.5, size=times.shape)
+    clean = fit_segment(times, elev_clean, 0, 199, stimulus_velocity=20.0, segment_id=1)
+    noisy = fit_segment(times, elev_noisy, 0, 199, stimulus_velocity=20.0, segment_id=2)
+    assert clean.rmse_deg == pytest.approx(0.0, abs=1e-9)
+    assert noisy.rmse_deg > 0.3
+    assert noisy.r2 < clean.r2
 
 
 def test_snap_index():
@@ -309,8 +322,8 @@ def test_median_gain():
     from slowphase_okr.fit import SegmentFit
 
     segs = [
-        SegmentFit(1, 0, 1, 0, 1, 2, 20, 0, 20 / 31, 0.99, True, 31),
-        SegmentFit(2, 2, 3, 1, 2, 2, 30, 0, 30 / 31, 0.98, True, 31),
+        SegmentFit(1, 0, 1, 0, 1, 2, 20, 0, 20 / 31, 0.99, 0.01, True, 31),
+        SegmentFit(2, 2, 3, 1, 2, 2, 30, 0, 30 / 31, 0.98, 0.02, True, 31),
     ]
     assert trial_summary_median_gain(segs) == pytest.approx((20 / 31 + 30 / 31) / 2)
 
@@ -332,10 +345,10 @@ def test_summarize_gains_by_block(tmp_path: Path):
     )
     okr = load_okr_log(log)
     segs = [
-        SegmentFit(1, 0, 1, 12.0, 13.0, 10, 8.0, 0.0, 0.80, 0.95, True, 10.0),
-        SegmentFit(2, 2, 3, 14.0, 15.0, 10, 9.0, 0.0, 0.90, 0.96, True, 10.0),
-        SegmentFit(3, 4, 5, 32.0, 33.0, 10, -7.0, 0.0, -0.70, 0.94, False, 10.0),
-        SegmentFit(4, 6, 7, 50.0, 51.0, 10, 5.0, 0.0, 0.50, 0.90, True, 10.0),
+        SegmentFit(1, 0, 1, 12.0, 13.0, 10, 8.0, 0.0, 0.80, 0.95, 0.05, True, 10.0),
+        SegmentFit(2, 2, 3, 14.0, 15.0, 10, 9.0, 0.0, 0.90, 0.96, 0.04, True, 10.0),
+        SegmentFit(3, 4, 5, 32.0, 33.0, 10, -7.0, 0.0, -0.70, 0.94, 0.06, False, 10.0),
+        SegmentFit(4, 6, 7, 50.0, 51.0, 10, 5.0, 0.0, 0.50, 0.90, 0.08, True, 10.0),
     ]
     summaries = summarize_gains_by_block(segs, okr)
     assert len(summaries) == 3
@@ -362,6 +375,12 @@ def test_summarize_gains_by_block(tmp_path: Path):
     segments = pd.read_excel(out, sheet_name="segments")
     assert "median_gain" in by_block.columns
     assert "block_label" in segments.columns
+    assert "duration_s" in segments.columns
+    assert "velocity_deg_s" in segments.columns
+    assert segments["duration_s"].tolist() == pytest.approx([1.0, 1.0, 1.0, 1.0])
+    assert segments["velocity_deg_s"].tolist() == pytest.approx(
+        segments["slope_deg_s"].tolist()
+    )
     assert len(by_block) == 3
 
 
@@ -403,7 +422,7 @@ def test_detect_respects_exclude():
         window_sec=0.05,
     )
     exclude = [
-        SegmentFit(1, 0, 150, times[0], times[150], 151, 25.0, 0.0, 25 / 31, 0.99, True, 31.0),
+        SegmentFit(1, 0, 150, times[0], times[150], 151, 25.0, 0.0, 25 / 31, 0.99, 0.01, True, 31.0),
     ]
     found = detect_slow_phases(times, elev, valid, 31.0, params, exclude=exclude)
     assert not any(seg.t_start <= times[150] <= seg.t_end for seg in found)
@@ -489,6 +508,48 @@ def test_gain_rescales_when_stimulus_velocity_changes():
     assert abs(rescaled_gain - seg.gain * (31.0 / 10.0)) < 1e-9
 
 
+def test_load_sranipal_eye_openness(tmp_path: Path):
+    from slowphase_okr.gaze import (
+        attach_eye_openness,
+        discover_eye_openness_files,
+        load_sranipal_eye_openness,
+        load_ush2a_trial,
+    )
+
+    left_vals = tmp_path / "sranipalLeftEyeOpenness.txt"
+    left_times = tmp_path / "sranipalLeftEyeOpennessTimes.txt"
+    right_vals = tmp_path / "sranipalRightEyeOpenness.txt"
+    right_times = tmp_path / "sranipalRightEyeOpennessTimes.txt"
+    left_vals.write_text("1.0\n0.5\n0.2\n")
+    left_times.write_text("0.0\n0.1\n0.2\n")
+    right_vals.write_text("0.9\n0.8\n0.7\n")
+    right_times.write_text("0.0\n0.1\n0.2\n")
+
+    found = discover_eye_openness_files(tmp_path, "left")
+    assert found is not None
+    left = load_sranipal_eye_openness(found[0], found[1], eye="left")
+    assert left.eye == "left"
+    assert left.openness[1] == pytest.approx(0.5)
+    assert discover_eye_openness_files(tmp_path, "right") is not None
+
+    gaze = tmp_path / "rotatedGaze.txt"
+    gaze.write_text("(0,0,1)\n(0,0.1,1)\n(0,0.2,1)\n")
+    timef = tmp_path / "gazeTime.txt"
+    timef.write_text("0.0\n0.1\n0.2\n")
+    trial = load_ush2a_trial(gaze, timef, trial_id="open_test")
+    left_tr, right_tr = attach_eye_openness(trial, tmp_path)
+    assert left_tr is not None and right_tr is not None
+    assert trial.has_eye_openness()
+    assert trial.openness_left is not None
+    assert trial.openness_right.openness[0] == pytest.approx(0.9)
+
+
+def test_discover_eye_openness_missing(tmp_path: Path):
+    from slowphase_okr.gaze import discover_eye_openness_files
+
+    assert discover_eye_openness_files(tmp_path, "left") is None
+
+
 def test_load_sranipal_pupil(tmp_path: Path):
     pos = tmp_path / "sranipalRightPupilPositions.txt"
     pos.write_text("(0.5, 0.4)\n(0.51, 0.41)\n(0.52, 0.42)\n")
@@ -560,7 +621,7 @@ def test_autosave_roundtrip(tmp_path: Path):
     gaze = tmp_path / "rotatedGaze.txt"
     timef = tmp_path / "gazeTime.txt"
     segments = [
-        SegmentFit(1, 0, 1, 0.0, 0.1, 2, 20.0, 0.0, 20.0 / 31.0, 0.99, True, 31.0),
+        SegmentFit(1, 0, 1, 0.0, 0.1, 2, 20.0, 0.0, 20.0 / 31.0, 0.99, 0.01, True, 31.0),
     ]
     out = save_autosave(
         tmp_path / "trial_slowphase_okr_markings.json",

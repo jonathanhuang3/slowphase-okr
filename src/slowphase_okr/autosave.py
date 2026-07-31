@@ -43,7 +43,10 @@ def segment_to_dict(segment: SegmentFit) -> dict[str, Any]:
 
 
 def segment_from_dict(data: dict[str, Any]) -> SegmentFit:
-    return SegmentFit(**data)
+    payload = dict(data)
+    # Older markings JSON lacked RMSE; keep loadable and leave blank until refit.
+    payload.setdefault("rmse_deg", float("nan"))
+    return SegmentFit(**payload)
 
 
 def save_autosave(
