@@ -32,6 +32,7 @@ from slowphase_okr.fit import (
     SegmentFit,
     fit_segment,
     refit_segment_by_time,
+    segments_meeting_min_r2,
     snap_index,
     summarize_gains_by_block,
     trial_summary_gain,
@@ -98,6 +99,8 @@ Notes
     (Dots → Left/Right), contrast, direction, flicker/persistent, and Increment/Decrement.
   • Accepted segments are grouped by OKR log block for separate median/mean gain summaries
     (panel + Excel ``by_block`` sheet). Use Show: Median/Mean to switch the panel display.
+  • Optional Min R² filter recalculates trial/block OKR summaries using only accepted
+    segments at or above that R² (blank = include all). Segments themselves are not deleted.
   • Auto-detect proposes segments (blue); review, nudge, accept (A), or delete.
 
 Auto-detect review
@@ -1084,6 +1087,19 @@ class AnnotatorApp:
             "Choose median or mean for gain and RMSE in the block table,\n"
             "and for trial gain in the plot title / status. Excel still exports both.",
         )
+        ttk.Label(summary_row, text="Min R²:").pack(side=tk.LEFT, padx=(10, 0))
+        self.min_r2_var = tk.StringVar(value="")
+        self.min_r2_entry = ttk.Entry(summary_row, textvariable=self.min_r2_var, width=5)
+        self.min_r2_entry.pack(side=tk.LEFT, padx=(4, 0))
+        self.min_r2_entry.bind("<Return>", self._on_min_r2_changed)
+        self.min_r2_entry.bind("<FocusOut>", self._on_min_r2_changed)
+        _bind_tooltip(
+            self.min_r2_entry,
+            "Optional R² threshold for OKR summaries (trial + by block).\n"
+            "Blank = include all accepted segments (default).\n"
+            "Example: 0.9 keeps only segments with R² ≥ 0.9.\n"
+            "Does not delete segments; Excel still exports all accepted.",
+        )
 
         block_cols = ("block", "n", "summary_gain", "summary_rmse", "condition")
         self.block_tree = ttk.Treeview(
@@ -1106,7 +1122,8 @@ class AnnotatorApp:
         self.block_tree.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(
             block_panel,
-            text="Accepted segments only. Requires OKR log for block assignment.",
+            text="Accepted segments only (optional Min R² filter). "
+            "Requires OKR log for block assignment.",
             foreground="#666666",
             wraplength=240,
         ).pack(side=tk.TOP, anchor=tk.W, pady=(2, 0))
@@ -2754,8 +2771,45 @@ class AnnotatorApp:
             return "Mean RMSE" if short else "mean RMSE"
         return "Med RMSE" if short else "median RMSE"
 
+    def _min_r2_threshold(self) -> float | None:
+        """Optional Min R² for summary recalculation. Blank → include all."""
+        if getattr(self, "min_r2_var", None) is None:
+            return None
+        raw = self.min_r2_var.get().strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError("Min R² must be a number (e.g. 0.9), or blank for all.") from exc
+        if not (0.0 <= value <= 1.0):
+            raise ValueError("Min R² must be between 0 and 1 (inclusive), or blank.")
+        return value
+
+    def _summary_segments(self) -> list[SegmentFit]:
+        """Accepted segments used for trial/block OKR summaries (after Min R² filter)."""
+        try:
+            min_r2 = self._min_r2_threshold()
+        except ValueError:
+            return list(self.segments)
+        return segments_meeting_min_r2(self.segments, min_r2)
+
+    def _trial_n_label(self) -> str:
+        """Compact n=… label for status/title, including Min R² keep/total when active."""
+        n_keep = len(self._summary_segments())
+        n_all = len(self.segments)
+        try:
+            min_r2 = self._min_r2_threshold()
+        except ValueError:
+            min_r2 = None
+        if min_r2 is None:
+            return f"n={n_all}"
+        return f"n={n_keep}/{n_all}, R²≥{min_r2:g}"
+
     def _trial_display_gain(self) -> float:
-        return trial_summary_gain(self.segments, self._gain_summary_statistic())
+        return trial_summary_gain(
+            self._summary_segments(), self._gain_summary_statistic()
+        )
 
     def _on_gain_summary_selected(self, _event=None) -> None:
         self._refresh_block_gain_summary()
@@ -2764,6 +2818,33 @@ class AnnotatorApp:
             f"Showing {self._gain_summary_label()} / {self._rmse_summary_label()} "
             "in block table and trial summary."
         )
+
+    def _on_min_r2_changed(self, _event=None) -> None:
+        try:
+            min_r2 = self._min_r2_threshold()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid Min R²", str(exc))
+            return
+        self._refresh_block_gain_summary()
+        self._redraw()
+        kept = self._summary_segments()
+        if min_r2 is None:
+            self._set_status(
+                f"Min R² filter off — using all {len(self.segments)} accepted "
+                f"segment(s). Trial {self._gain_summary_label()}="
+                f"{self._trial_display_gain():.3f}"
+                if self.segments
+                else "Min R² filter off — no accepted segments yet."
+            )
+        else:
+            gain = self._trial_display_gain()
+            self._set_status(
+                f"Min R² ≥ {min_r2:g}: {len(kept)}/{len(self.segments)} accepted "
+                f"segment(s) in OKR summary. Trial {self._gain_summary_label()}="
+                f"{gain:.3f}"
+                if kept
+                else f"Min R² ≥ {min_r2:g}: no accepted segments meet the threshold."
+            )
 
     def _segment_display_map(self) -> dict[tuple[str, int], int]:
         return {
@@ -3035,7 +3116,7 @@ class AnnotatorApp:
             "summary_rmse", text=self._rmse_summary_label(short=True)
         )
         use_mean = self._gain_summary_statistic() == "mean"
-        summaries = summarize_gains_by_block(self.segments, self.okr_log)
+        summaries = summarize_gains_by_block(self._summary_segments(), self.okr_log)
         for summary in summaries:
             gain = summary.mean_gain if use_mean else summary.median_gain
             rmse = summary.mean_rmse_deg if use_mean else summary.median_rmse_deg
@@ -3143,7 +3224,8 @@ class AnnotatorApp:
             f"Accepted {proposed_label} as {accepted_label}: "
             f"gain={accepted.gain:.3f}, R²={accepted.r2:.3f}, "
             f"RMSE={self._format_rmse(accepted)}, "
-            f"trial {self._gain_summary_label()}={gain:.3f} (n={len(self.segments)})"
+            f"trial {self._gain_summary_label()}={gain:.3f} "
+            f"({self._trial_n_label()})"
         )
         return True
 
@@ -3173,7 +3255,8 @@ class AnnotatorApp:
                 f"Accepted {self._segment_display_label('accepted', accepted)}: "
                 f"gain={accepted.gain:.3f}, R²={accepted.r2:.3f}, "
                 f"RMSE={self._format_rmse(accepted)}, "
-                f"trial {self._gain_summary_label()}={gain:.3f} (n={len(self.segments)})"
+                f"trial {self._gain_summary_label()}={gain:.3f} "
+                f"({self._trial_n_label()})"
             )
             return
 
@@ -3201,7 +3284,7 @@ class AnnotatorApp:
             gain = self._trial_display_gain()
             self._set_status(
                 f"Removed last segment. Trial {self._gain_summary_label()}={gain:.3f} "
-                f"(n={len(self.segments)})"
+                f"({self._trial_n_label()})"
             )
         else:
             self._set_status("No segments to undo.")
@@ -3432,6 +3515,7 @@ class AnnotatorApp:
         else:
             gain = self._trial_display_gain()
             n = len(self.segments)
+            n_sum = len(self._summary_segments())
             p = len(self.proposed_segments)
             duration = t1 - t0
             title = f"{self.trial.trial_id} — {n} accepted"
@@ -3440,6 +3524,14 @@ class AnnotatorApp:
             title += f", {duration:.1f} s trial"
             if n:
                 title += f", {self._gain_summary_label()}={gain:.3f}"
+                try:
+                    r2_filter_on = self._min_r2_threshold() is not None
+                except ValueError:
+                    r2_filter_on = False
+                if r2_filter_on:
+                    title += f" ({self._trial_n_label()})"
+                    if n_sum == 0:
+                        title += " — none pass"
             self.ax.set_title(title)
 
         self.ax.set_xlabel("" if self.openness_ax is not None else "Time (s)")

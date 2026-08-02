@@ -118,6 +118,20 @@ def trial_summary_gain(
     return trial_summary_median_gain(segments)
 
 
+def segments_meeting_min_r2(
+    segments: list[SegmentFit],
+    min_r2: float | None,
+) -> list[SegmentFit]:
+    """Return segments with R² >= ``min_r2``. ``None`` keeps all segments."""
+    if min_r2 is None:
+        return list(segments)
+    kept: list[SegmentFit] = []
+    for seg in segments:
+        if seg.r2 == seg.r2 and float(seg.r2) >= float(min_r2):
+            kept.append(seg)
+    return kept
+
+
 @dataclass(frozen=True)
 class BlockGainSummary:
     """OKR gain summary for one stimulus block / outside-blocks group."""

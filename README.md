@@ -216,7 +216,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Reload guard** | Confirms before discarding accepted or proposed segments |
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray). Clear OKR log removes markers for the next patient. |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
-| **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …) with separate median/mean gain in the side panel and Excel `by_block` sheet. Use **Show: Median / Mean** to switch the panel (and plot/status trial summary). Excel still exports both. |
+| **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …) with separate median/mean gain in the side panel and Excel `by_block` sheet. Use **Show: Median / Mean** to switch the panel (and plot/status trial summary). Optional **Min R²** (blank = all) recalculates those summaries using only segments at or above that R²; segments are not deleted and Excel still exports all accepted. |
 | **Invalid gaze samples** | `(NaN, NaN, NaN)` lines stay aligned but are skipped for clicking and fitting |
 | **Parameter tooltips** | Hover auto-detect settings in the app for plain-language help |
 

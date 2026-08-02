@@ -328,6 +328,21 @@ def test_median_gain():
     assert trial_summary_median_gain(segs) == pytest.approx((20 / 31 + 30 / 31) / 2)
 
 
+def test_segments_meeting_min_r2():
+    from slowphase_okr.fit import SegmentFit, segments_meeting_min_r2, trial_summary_gain
+
+    segs = [
+        SegmentFit(1, 0, 1, 0.0, 1.0, 2, 10.0, 0.0, 1.0, 0.95, 0.01, True, 10.0),
+        SegmentFit(2, 2, 3, 1.0, 2.0, 2, 20.0, 0.0, 2.0, 0.80, 0.02, True, 10.0),
+        SegmentFit(3, 4, 5, 2.0, 3.0, 2, 30.0, 0.0, 3.0, float("nan"), 0.03, True, 10.0),
+    ]
+    assert len(segments_meeting_min_r2(segs, None)) == 3
+    kept = segments_meeting_min_r2(segs, 0.9)
+    assert [s.segment_id for s in kept] == [1]
+    assert trial_summary_gain(kept, "median") == pytest.approx(1.0)
+    assert segments_meeting_min_r2(segs, 0.99) == []
+
+
 def test_summarize_gains_by_block(tmp_path: Path):
     from slowphase_okr.export import export_to_excel
     from slowphase_okr.fit import SegmentFit, summarize_gains_by_block
