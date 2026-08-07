@@ -20,6 +20,8 @@ class OkrLogBlockMarker:
     is_anchor100: bool | None
     threshold_multiplier: float | None
     label: str
+    dot_start_size: float | None = None
+    emission_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,11 @@ def resolve_viewing_eye(
             return "left"
         if " RE " in normalized:
             return "right"
+        # Older stimulus names used bare Left/Right (e.g. "... Left Dot Size Testing")
+        if " LEFT " in normalized:
+            return "left"
+        if " RIGHT " in normalized:
+            return "right"
     return None
 
 
@@ -179,6 +186,14 @@ def format_block_condition(marker: OkrLogBlockMarker) -> str:
         parts.append(f"B{marker.block_index}")
     else:
         parts.append(marker.event_type)
+
+    # Legacy TrialIndex logs vary size/rate at fixed contrast — lead with those.
+    legacy_trial = marker.event_type == "TrialBlock"
+    if legacy_trial:
+        if marker.dot_start_size is not None:
+            parts.append(f"size {marker.dot_start_size:g}")
+        if marker.emission_rate is not None:
+            parts.append(f"rate {marker.emission_rate:g}")
 
     if marker.contrast_level is not None:
         if marker.is_anchor100:
@@ -240,6 +255,8 @@ def segment_condition_fields(
         "is_anchor100": None,
         "flicker_mode": None,
         "dot_color": None,
+        "dot_start_size": None,
+        "emission_rate": None,
         "eye_patch": None,
         "viewing_eye": None,
         "condition": "Outside blocks",
@@ -275,6 +292,8 @@ def segment_condition_fields(
             "is_anchor100": marker.is_anchor100,
             "flicker_mode": flicker,
             "dot_color": marker.dot_color,
+            "dot_start_size": marker.dot_start_size,
+            "emission_rate": marker.emission_rate,
             "condition": format_block_condition(marker),
         }
     )
@@ -315,20 +334,9 @@ def condition_at_time(okr_log: OkrLog, t: float) -> str:
     return "No OKR condition at this time"
 
 
-def load_okr_log(path: str | Path) -> OkrLog:
-    """Load OKR_Log_*.txt (tab-separated Unity stimulus event log)."""
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(path)
-
-    raw_lines = path.read_text().splitlines()
-    meta = _parse_header_metadata(raw_lines)
-    stimulus_name = meta.get("StimulusName") or None
-    header_eye_patch = meta.get("StimulusEyePatch") or None
-
+def _read_okr_table(raw_lines: list[str]) -> tuple[list[str], list[dict[str, str]]]:
     header: list[str] | None = None
     rows: list[dict[str, str]] = []
-
     for line in raw_lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -340,9 +348,117 @@ def load_okr_log(path: str | Path) -> OkrLog:
         if len(parts) < len(header):
             parts.extend([""] * (len(header) - len(parts)))
         rows.append(dict(zip(header, parts)))
-
     if header is None:
-        raise ValueError(f"No event table found in {path}")
+        raise ValueError("No event table found")
+    return header, rows
+
+
+def _direction_or_none(text: str | None) -> str | None:
+    if not text:
+        return None
+    direction = text.strip()
+    if not direction or direction.upper() == "NA":
+        return None
+    return direction
+
+
+def _dot_color_or_none(text: str | None) -> str | None:
+    if not text:
+        return None
+    color = text.strip()
+    if not color or color.upper() == "NA":
+        return None
+    return color
+
+
+def _load_legacy_trial_okr_log(
+    path: Path,
+    *,
+    stimulus_name: str | None,
+    header_eye_patch: str | None,
+    header: list[str],
+    rows: list[dict[str, str]],
+) -> OkrLog:
+    """Parse older TrialIndex logs (dot-size / emission-rate schedules).
+
+    Columns look like:
+    TrialIndex, dotColor, direction, contrastLevel, dotStartSize, emissionRate,
+    startTime, endTime
+    """
+    required = {"TrialIndex", "startTime"}
+    missing = required - set(header)
+    if missing:
+        raise ValueError(
+            f"Legacy OKR log missing columns: {', '.join(sorted(missing))}"
+        )
+
+    block_markers: list[OkrLogBlockMarker] = []
+    for row in rows:
+        trial_index = int(row["TrialIndex"])
+        block_index = trial_index - 1
+        direction = _direction_or_none(row.get("direction"))
+        event_type = "TrialBlock"
+        block_markers.append(
+            OkrLogBlockMarker(
+                event_index=trial_index,
+                event_type=event_type,
+                block_index=block_index,
+                start_time=float(row["startTime"]),
+                end_time=_parse_optional_float(row.get("endTime", "")),
+                contrast_level=_parse_optional_float(row.get("contrastLevel", "")),
+                direction=direction,
+                dot_color=_dot_color_or_none(row.get("dotColor")),
+                use_persistent_dots=None,
+                is_anchor100=None,
+                threshold_multiplier=None,
+                label=_block_label(block_index, direction, event_type),
+                dot_start_size=_parse_optional_float(row.get("dotStartSize", "")),
+                emission_rate=_parse_optional_float(row.get("emissionRate", "")),
+            )
+        )
+
+    if not block_markers:
+        raise ValueError(f"No trial blocks found in {path}")
+
+    return OkrLog(
+        source_path=str(path.resolve()),
+        block_markers=block_markers,
+        fixation_markers=[],
+        stimulus_eye_patch=header_eye_patch,
+        stimulus_name=stimulus_name,
+    )
+
+
+def load_okr_log(path: str | Path) -> OkrLog:
+    """Load OKR_Log_*.txt (tab-separated Unity stimulus event log).
+
+    Supports:
+    - Current event logs (``eventIndex`` / ``eventType`` / fixation + contrast blocks)
+    - Older trial logs (``TrialIndex`` rows with ``dotStartSize`` / ``emissionRate``)
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    raw_lines = path.read_text().splitlines()
+    meta = _parse_header_metadata(raw_lines)
+    stimulus_name = meta.get("StimulusName") or None
+    header_eye_patch = meta.get("StimulusEyePatch") or None
+
+    try:
+        header, rows = _read_okr_table(raw_lines)
+    except ValueError as exc:
+        raise ValueError(f"No event table found in {path}") from exc
+
+    # Older format: one row per trial, no eventType column
+    if "TrialIndex" in header and "eventType" not in header:
+        return _load_legacy_trial_okr_log(
+            path,
+            stimulus_name=stimulus_name,
+            header_eye_patch=header_eye_patch,
+            header=header,
+            rows=rows,
+        )
 
     required = {"eventIndex", "eventType", "contrastBlockIndex", "startTime"}
     missing = required - set(header)
@@ -363,16 +479,14 @@ def load_okr_log(path: str | Path) -> OkrLog:
         block_index = _parse_optional_int(row.get("contrastBlockIndex", ""))
         start_time = float(row["startTime"])
         end_time = _parse_optional_float(row.get("endTime", ""))
-        direction = row.get("direction", "").strip() or None
-        if direction == "NA":
-            direction = None
+        direction = _direction_or_none(row.get("direction"))
         contrast_level = _parse_optional_float(row.get("contrastLevel", ""))
-        dot_color = row.get("dotColor", "").strip() or None
-        if dot_color == "NA":
-            dot_color = None
+        dot_color = _dot_color_or_none(row.get("dotColor"))
         use_persistent_dots = _parse_optional_bool01(row.get("usePersistentDots", ""))
         is_anchor100 = _parse_optional_bool01(row.get("isAnchor100", ""))
         threshold_multiplier = _parse_optional_float(row.get("thresholdMultiplier", ""))
+        dot_start_size = _parse_optional_float(row.get("dotStartSize", ""))
+        emission_rate = _parse_optional_float(row.get("emissionRate", ""))
 
         if _is_fixation_event(event_type):
             fixation_markers.append(
@@ -399,6 +513,8 @@ def load_okr_log(path: str | Path) -> OkrLog:
                     is_anchor100=is_anchor100,
                     threshold_multiplier=threshold_multiplier,
                     label=_block_label(block_index, direction, event_type),
+                    dot_start_size=dot_start_size,
+                    emission_rate=emission_rate,
                 )
             )
 

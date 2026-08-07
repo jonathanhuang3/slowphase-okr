@@ -145,6 +145,8 @@ class BlockGainSummary:
     is_anchor100: bool | None
     flicker_mode: str | None
     dot_color: str | None
+    dot_start_size: float | None
+    emission_rate: float | None
     eye_patch: str | None
     viewing_eye: str | None
     session_tags: str
@@ -206,6 +208,8 @@ def summarize_gains_by_block(
                 is_anchor100=fields.get("is_anchor100"),  # type: ignore[arg-type]
                 flicker_mode=fields.get("flicker_mode"),  # type: ignore[arg-type]
                 dot_color=fields.get("dot_color"),  # type: ignore[arg-type]
+                dot_start_size=fields.get("dot_start_size"),  # type: ignore[arg-type]
+                emission_rate=fields.get("emission_rate"),  # type: ignore[arg-type]
                 eye_patch=fields.get("eye_patch"),  # type: ignore[arg-type]
                 viewing_eye=fields.get("viewing_eye"),  # type: ignore[arg-type]
                 session_tags=str(fields.get("session_tags") or ""),

@@ -250,6 +250,8 @@ def test_load_okr_log(tmp_path: Path):
     assert okr.block_markers[0].label == "B0↑"
     assert okr.block_markers[0].use_persistent_dots is True
     assert okr.block_markers[0].is_anchor100 is True
+    assert okr.block_markers[0].dot_start_size == pytest.approx(0.7)
+    assert okr.block_markers[0].emission_rate == pytest.approx(3000)
     assert okr.block_markers[1].label == "B2↓"
     assert okr.block_markers[1].threshold_multiplier == pytest.approx(2.0)
     assert okr.block_markers[2].event_type == "CustomStimulusBlock"
@@ -258,6 +260,51 @@ def test_load_okr_log(tmp_path: Path):
     assert okr.block_markers[3].use_persistent_dots is False
     assert okr.fixation_markers[0].event_type == "InitialFixation"
     assert okr.fixation_markers[1].start_time == pytest.approx(85.41)
+
+
+def test_load_legacy_trial_okr_log(tmp_path: Path):
+    """Older TrialIndex logs (dot-size / emission-rate schedules)."""
+    from slowphase_okr.okr_log import condition_at_time, segment_condition_fields
+
+    log = tmp_path / "OKR_Log_legacy.txt"
+    log.write_text(
+        "# OKR Condition Log\n"
+        "# PatientName: June162026 Test 2\n"
+        "# StimulusName: White Dots Up 100% Contrast Left Dot Size Testing\n"
+        "# TimeBase: Unity Time.time (seconds since Play; matches gazeTimes.txt)\n"
+        "TrialIndex\tdotColor\tdirection\tcontrastLevel\tdotStartSize\t"
+        "emissionRate\tstartTime\tendTime\n"
+        "1\tWhite\tUp\t1.000000\t2.800000\t7500.00\t10.883830\t30.888290\n"
+        "2\tWhite\tUp\t1.000000\t0.700000\t10000.00\t34.908240\t54.911190\n"
+        "3\tWhite\tUp\t1.000000\t2.800000\t5000.00\t58.934400\t78.922630\n"
+    )
+    okr = load_okr_log(log)
+    assert len(okr.block_markers) == 3
+    assert okr.fixation_markers == []
+    assert okr.stimulus_name == "White Dots Up 100% Contrast Left Dot Size Testing"
+    assert okr.block_markers[0].event_type == "TrialBlock"
+    assert okr.block_markers[0].block_index == 0
+    assert okr.block_markers[0].label == "B0↑"
+    assert okr.block_markers[0].start_time == pytest.approx(10.883830)
+    assert okr.block_markers[0].end_time == pytest.approx(30.888290)
+    assert okr.block_markers[0].dot_start_size == pytest.approx(2.8)
+    assert okr.block_markers[0].emission_rate == pytest.approx(7500)
+    assert okr.block_markers[1].block_index == 1
+    assert okr.block_markers[1].dot_start_size == pytest.approx(0.7)
+    assert okr.block_markers[1].emission_rate == pytest.approx(10000)
+
+    text = condition_at_time(okr, 20.0)
+    assert "Dots → Left eye" in text
+    assert "size 2.8" in text
+    assert "rate 7500" in text
+    assert "Up" in text
+    assert "contrast 1" in text
+
+    fields = segment_condition_fields(okr, 40.0, 41.0)
+    assert fields["block_label"] == "B1↑"
+    assert fields["dot_start_size"] == pytest.approx(0.7)
+    assert fields["emission_rate"] == pytest.approx(10000)
+    assert fields["event_type"] == "TrialBlock"
 
 
 def test_condition_at_time(tmp_path: Path):
@@ -612,6 +659,107 @@ def test_attach_sranipal_pupil(tmp_path: Path):
     assert trial.pupil.eye == "right"
 
 
+def test_attach_sranipal_pupils_both_eyes(tmp_path: Path):
+    from slowphase_okr.gaze import attach_sranipal_pupils
+
+    gaze = tmp_path / "rotatedGaze.txt"
+    gaze.write_text("(0.0, 0.1, 1.0)\n")
+    timef = tmp_path / "gazeTime.txt"
+    timef.write_text("0.0\n")
+    trial = load_ush2a_trial(gaze, timef, trial_id="test RE")
+    for eye, prefix in (("left", "sranipalLeft"), ("right", "sranipalRight")):
+        (tmp_path / f"{prefix}PupilPositions.txt").write_text("(0.5, 0.5)\n")
+        (tmp_path / f"{prefix}PupilPositionTimes.txt").write_text("0.0\n")
+    left, right = attach_sranipal_pupils(trial, tmp_path)
+    assert left is not None and right is not None
+    assert trial.pupil_left is left
+    assert trial.pupil_right is right
+    assert trial.pupil is right  # RE trial → viewing eye
+    assert trial.has_pupil_sensor()
+
+
+def test_summarize_pupil_sensor_near_edge():
+    from slowphase_okr.gaze import PupilTrace, pupil_edge_distance, summarize_pupil_sensor
+
+    pupil = PupilTrace(
+        times=np.array([0.0, 0.1, 0.2, 0.3]),
+        x=np.array([0.5, 0.05, 0.5, 0.95]),
+        y=np.array([0.5, 0.5, 0.5, 0.5]),
+        eye="left",
+    )
+    edge = pupil_edge_distance(pupil.x, pupil.y)
+    assert edge[0] == pytest.approx(0.5)
+    assert edge[1] == pytest.approx(0.05)
+    stats = summarize_pupil_sensor(pupil, margin=0.15)
+    assert stats.n_valid == 4
+    assert stats.pct_near_edge == pytest.approx(50.0)
+    assert stats.mean_x == pytest.approx(0.5)
+
+
+def test_attach_and_compare_gaze_origins(tmp_path: Path):
+    from slowphase_okr.gaze import (
+        attach_sranipal_gaze_origins,
+        compare_gaze_origins,
+        summarize_gaze_origin,
+    )
+
+    gaze = tmp_path / "rotatedGaze.txt"
+    gaze.write_text("(0.0, 0.1, 1.0)\n")
+    timef = tmp_path / "gazeTime.txt"
+    timef.write_text("0.0\n")
+    trial = load_ush2a_trial(gaze, timef, trial_id="test RE")
+    (tmp_path / "sranipalLeftGazeOrigins.txt").write_text(
+        "(34.0, 2.0, -38.0)\n(34.1, 2.1, -38.1)\n(34.2, 2.0, -38.0)\n"
+    )
+    (tmp_path / "sranipalLeftGazeTime.txt").write_text("0.0\n0.01\n0.02\n")
+    (tmp_path / "sranipalRightGazeOrigins.txt").write_text(
+        "(-28.0, 6.0, -35.0)\n(-28.1, 6.1, -35.1)\n"
+    )
+    (tmp_path / "sranipalRightGazeTime.txt").write_text("0.0\n0.01\n")
+    left, right = attach_sranipal_gaze_origins(trial, tmp_path)
+    assert left is not None and right is not None
+    assert trial.has_gaze_origins()
+    sym = compare_gaze_origins(left, right)
+    assert sym.ipd_mm == pytest.approx(62.15, abs=0.2)
+    assert sym.delta_y == pytest.approx(-4.0, abs=0.2)
+    assert sym.delta_z == pytest.approx(-3.0, abs=0.2)
+    left_stats = summarize_gaze_origin(left)
+    assert left_stats.jitter_x == pytest.approx(0.1, abs=1e-6)
+    assert left_stats.jitter_3d > 0.0
+
+
+def test_load_heading_trace_stable(tmp_path: Path):
+    from slowphase_okr.gaze import (
+        attach_heading_trace,
+        load_heading_trace,
+        summarize_heading_wiggle,
+    )
+
+    # Constant Inverse(heading) → recovered heading constant → Δ ≈ 0
+    q = "(-0.4, -0.01, -0.002, 0.9)\n"
+    rot = tmp_path / "gazeRotations.txt"
+    rot.write_text(q * 3)
+    timef = tmp_path / "gazeTime.txt"
+    timef.write_text("0.0\n0.1\n0.2\n")
+    heading = load_heading_trace(rot, timef)
+    assert len(heading.times) == 3
+    assert heading.roll_deg[0] == pytest.approx(0.0, abs=1e-6)
+    assert heading.pitch_deg[0] == pytest.approx(0.0, abs=1e-6)
+    assert heading.yaw_deg[0] == pytest.approx(0.0, abs=1e-6)
+    assert heading.angle_from_start_deg[0] == pytest.approx(0.0, abs=1e-6)
+    assert np.all(np.abs(heading.angle_from_start_deg) < 1e-6)
+
+    gaze = tmp_path / "rotatedGaze.txt"
+    gaze.write_text("(0.0, 0.1, 1.0)\n(0.0, 0.1, 1.0)\n(0.0, 0.1, 1.0)\n")
+    trial = load_ush2a_trial(gaze, timef, trial_id="wiggle")
+    attached = attach_heading_trace(trial, tmp_path)
+    assert attached is not None
+    assert trial.has_heading()
+    stats = summarize_heading_wiggle(trial.heading)
+    assert stats.max_angle_from_start == pytest.approx(0.0, abs=1e-6)
+    assert stats.yaw_ptp == pytest.approx(0.0, abs=1e-6)
+
+
 def test_refit_segment_by_time():
     from slowphase_okr.fit import refit_segment_by_time
 
@@ -685,4 +833,91 @@ def test_annotations_dir_prefs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     chosen = prefs.set_annotations_dir(tmp_path / "markings")
     assert chosen == (tmp_path / "markings").resolve()
     assert prefs.get_annotations_dir() == chosen
+
+
+def test_conservative_gain_for_upward_window():
+    from slowphase_okr.conservative import compute_conservative_gain_for_window
+
+    times = np.arange(0.0, 1.1, 0.1)
+    elevation = 10.0 * times
+    elevation[6:] += 10.0  # one large positive saccade frame
+    result = compute_conservative_gain_for_window(
+        times,
+        elevation,
+        start_time=0.0,
+        end_time=1.0,
+        stimulus_velocity_deg_s=20.0,
+        saccade_threshold_deg_s=20.0,
+        min_slow_frames=1,
+    )
+    assert result.n_velocity_frames == 10
+    assert result.n_slow_frames == 9
+    assert result.pct_saccade_frames == pytest.approx(10.0)
+    assert result.mean_velocity_deg_s == pytest.approx(10.0)
+    assert result.gain == pytest.approx(0.5)
+    assert result.gain_sd == pytest.approx(0.0)
+
+
+def test_conservative_gain_is_direction_matched_for_down_block():
+    from slowphase_okr.conservative import compute_conservative_gain_for_window
+
+    times = np.arange(0.0, 1.1, 0.1)
+    elevation = -8.0 * times
+    result = compute_conservative_gain_for_window(
+        times,
+        elevation,
+        start_time=0.0,
+        end_time=1.0,
+        stimulus_velocity_deg_s=20.0,
+        saccade_threshold_deg_s=20.0,
+        direction="Down",
+        min_slow_frames=1,
+    )
+    assert result.mean_velocity_deg_s == pytest.approx(-8.0)
+    assert result.gain == pytest.approx(0.4)
+    assert result.gain_sd == pytest.approx(0.0)
+
+
+def test_conservative_gain_sd_from_variable_frame_gains():
+    from slowphase_okr.conservative import compute_conservative_gain_for_window
+
+    times = np.arange(0.0, 0.5, 0.1)
+    # Frame velocities: 4, 8, 12, 16 deg/s → gains 0.2, 0.4, 0.6, 0.8
+    elevation = np.array([0.0, 0.4, 1.2, 2.4, 4.0])
+    result = compute_conservative_gain_for_window(
+        times,
+        elevation,
+        start_time=0.0,
+        end_time=0.4,
+        stimulus_velocity_deg_s=20.0,
+        saccade_threshold_deg_s=20.0,
+        min_slow_frames=1,
+    )
+    assert result.gain == pytest.approx(0.5)
+    assert result.gain_sd == pytest.approx(np.std([0.2, 0.4, 0.6, 0.8], ddof=1))
+
+
+def test_conservative_gain_by_okr_block(tmp_path: Path):
+    from slowphase_okr.conservative import compute_conservative_gains_by_block
+
+    log = tmp_path / "OKR_Log_blocks.txt"
+    log.write_text(
+        "eventIndex\teventType\tcontrastBlockIndex\tstartTime\tendTime\tdirection\n"
+        "1\tContrastBlock\t0\t0.0\t1.0\tUp\n"
+        "2\tContrastBlock\t1\t1.1\t2.0\tDown\n"
+    )
+    okr = load_okr_log(log)
+    times = np.arange(0.0, 2.1, 0.1)
+    elevation = np.where(times <= 1.0, 10.0 * times, 10.0 - 5.0 * (times - 1.0))
+    results = compute_conservative_gains_by_block(
+        times,
+        elevation,
+        stimulus_velocity_deg_s=20.0,
+        saccade_threshold_deg_s=20.0,
+        okr_log=okr,
+        min_slow_frames=1,
+    )
+    assert [result.block_label for result in results] == ["B0↑", "B1↓"]
+    assert results[0].gain == pytest.approx(0.5)
+    assert results[1].gain == pytest.approx(0.25)
 

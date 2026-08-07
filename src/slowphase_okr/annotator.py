@@ -25,6 +25,10 @@ from slowphase_okr.autosave import (
     save_autosave,
     segments_from_autosave,
 )
+from slowphase_okr.conservative import (
+    ConservativeBlockGain,
+    compute_conservative_gains_by_block,
+)
 from slowphase_okr.prefs import get_annotations_dir, set_annotations_dir
 from slowphase_okr.detect import DetectParams, detect_slow_phases
 from slowphase_okr.export import export_to_excel
@@ -38,11 +42,16 @@ from slowphase_okr.fit import (
     trial_summary_gain,
 )
 from slowphase_okr.gaze import (
+    GazeOriginTrace,
     GazeTrial,
     analysis_window_mask,
     attach_eye_openness,
+    attach_heading_trace,
+    attach_sranipal_gaze_origins,
+    compare_gaze_origins,
     is_tobii_glasses3_gazedata,
     load_gaze_trial,
+    summarize_heading_wiggle,
 )
 from slowphase_okr.okr_log import (
     OkrLog,
@@ -77,8 +86,14 @@ Other
   ?                Show this help
 
 Notes
+  • Velocity: toggle on Annotate to show frame-wise velocity under the gaze plot.
+    Samples beyond the Conservative gain saccade threshold are highlighted red.
   • Eye openness: toggle on Annotate to show left/right SRanipal openness under the gaze
     plot (auto-loaded from sranipalLeft/RightEyeOpenness.txt + *Times.txt in the gaze folder).
+  • Eye seating tab: SRanipal left/right gaze origins (HMD-local mm). Front view (x–y)
+    and depth view (x–z) show how symmetrically the eyes sit in the headset.
+  • Headset wiggle tab: HMD heading from gazeRotations.txt (Δ roll/pitch/yaw vs trial start).
+    Shows how much the headset/rig itself moves — not skull slip inside the HMD.
   • Analysis window spans the full trial (first to last timestamp).
   • Gaze: Vive/Unity rotatedGaze.txt + gazeTime.txt, or Tobii Glasses 3 gazedata.json
     (timestamps embedded — no separate time file).
@@ -311,12 +326,21 @@ class AnnotatorApp:
 
         self.setup_tab = ttk.Frame(self.notebook, padding=8)
         self.annotate_tab = ttk.Frame(self.notebook)
+        self.conservative_tab = ttk.Frame(self.notebook, padding=8)
+        self.sensor_qc_tab = ttk.Frame(self.notebook, padding=8)
+        self.heading_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(self.setup_tab, text="1. Load trial")
         self.notebook.add(self.annotate_tab, text="2. Annotate")
+        self.notebook.add(self.conservative_tab, text="3. Conservative gain")
+        self.notebook.add(self.sensor_qc_tab, text="4. Eye seating")
+        self.notebook.add(self.heading_tab, text="5. Headset wiggle")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         self._build_setup_tab()
         self._build_annotate_tab()
+        self._build_conservative_tab()
+        self._build_sensor_qc_tab()
+        self._build_heading_tab()
         self._build_plot()
         self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -330,6 +354,12 @@ class AnnotatorApp:
             selected = self.notebook.select()
             if selected == str(self.annotate_tab) and hasattr(self, "canvas"):
                 self.root.after_idle(self.canvas.draw_idle)
+            elif selected == str(self.conservative_tab):
+                self._refresh_conservative_results()
+            elif selected == str(self.sensor_qc_tab):
+                self._refresh_sensor_qc()
+            elif selected == str(self.heading_tab):
+                self._refresh_heading_wiggle()
         except tk.TclError:
             pass
 
@@ -448,6 +478,7 @@ class AnnotatorApp:
         self._refit_all_segments()
         self._update_signal_ylim()
         self._redraw()
+        self._refresh_conservative_results()
         mode = "azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "elevation"
         self._set_status(f"Signal: {mode}. Segments refit on this trace.")
 
@@ -467,6 +498,7 @@ class AnnotatorApp:
         self._refit_all_segments()
         self._update_signal_ylim()
         self._redraw()
+        self._refresh_conservative_results()
         self._set_status(
             f"Eye: {self.eye_var.get()}. Segments refit on this trace."
         )
@@ -499,6 +531,15 @@ class AnnotatorApp:
             self._set_status("Connect points on — samples joined with a line.")
         else:
             self._set_status("Connect points off — markers only.")
+
+    def _on_show_velocity_toggled(self) -> None:
+        if self.show_velocity_var.get():
+            self._set_status(
+                "Velocity shown under gaze; red samples exceed the saccade threshold."
+            )
+        else:
+            self._set_status("Velocity panel hidden.")
+        self._redraw()
 
     def _on_show_openness_toggled(self) -> None:
         if self.show_openness_var.get():
@@ -741,6 +782,782 @@ class AnnotatorApp:
             wraplength=780,
         ).pack(side=tk.LEFT, padx=(12, 0))
 
+    def _build_conservative_tab(self) -> None:
+        top = self.conservative_tab
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(3, weight=1)
+
+        nav = ttk.Frame(top)
+        nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Button(
+            nav,
+            text="← Annotate",
+            command=lambda: self.notebook.select(self.annotate_tab),
+        ).pack(side=tk.LEFT)
+        self.conservative_summary_var = tk.StringVar(
+            value="Load a trial to calculate conservative gain."
+        )
+        ttk.Label(
+            nav,
+            textvariable=self.conservative_summary_var,
+            foreground="#333333",
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        settings = ttk.LabelFrame(
+            top, text="Conservative gain settings", padding=8
+        )
+        settings.grid(row=1, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Label(settings, text="Saccade threshold (deg/s):").pack(side=tk.LEFT)
+        self.conservative_threshold_var = tk.StringVar(value="20")
+        self.conservative_threshold_entry = ttk.Entry(
+            settings,
+            textvariable=self.conservative_threshold_var,
+            width=8,
+        )
+        self.conservative_threshold_entry.pack(side=tk.LEFT, padx=(6, 8))
+        self.conservative_threshold_entry.bind(
+            "<Return>", self._apply_conservative_threshold
+        )
+        self.conservative_threshold_entry.bind(
+            "<FocusOut>", self._apply_conservative_threshold
+        )
+        ttk.Button(
+            settings,
+            text="Recalculate",
+            command=self._apply_conservative_threshold,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            settings,
+            text=(
+                "Frames with |velocity| above this value are excluded. "
+                "Gain = mean direction-matched slow velocity ÷ stimulus speed."
+            ),
+            foreground="#666666",
+            wraplength=680,
+        ).pack(side=tk.LEFT, padx=(14, 0))
+
+        ttk.Label(
+            top,
+            text=(
+                "One row is calculated automatically for every stimulus block in the "
+                "OKR log. Up/Right blocks use positive velocity; Down/Left blocks use "
+                "negative velocity and report gain as a positive magnitude. Gain SD is "
+                "the sample standard deviation of per-frame gains among direction-matched "
+                "slow frames."
+            ),
+            foreground="#555555",
+            wraplength=1000,
+        ).grid(row=2, column=0, sticky=tk.W, pady=(0, 8))
+
+        table_frame = ttk.Frame(top)
+        table_frame.grid(row=3, column=0, sticky=tk.NSEW)
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        columns = (
+            "block",
+            "condition",
+            "time",
+            "slow_frames",
+            "saccade_pct",
+            "mean_velocity",
+            "gain",
+            "gain_sd",
+            "status",
+        )
+        self.conservative_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+        )
+        headings = {
+            "block": "Block",
+            "condition": "Condition",
+            "time": "Time (s)",
+            "slow_frames": "Slow frames",
+            "saccade_pct": "Saccade %",
+            "mean_velocity": "Mean velocity",
+            "gain": "Gain",
+            "gain_sd": "Gain SD",
+            "status": "QC",
+        }
+        widths = {
+            "block": 75,
+            "condition": 340,
+            "time": 115,
+            "slow_frames": 90,
+            "saccade_pct": 85,
+            "mean_velocity": 110,
+            "gain": 75,
+            "gain_sd": 75,
+            "status": 220,
+        }
+        for column in columns:
+            self.conservative_tree.heading(column, text=headings[column])
+            self.conservative_tree.column(
+                column,
+                width=widths[column],
+                minwidth=60,
+                anchor=tk.W if column in ("condition", "status") else tk.CENTER,
+            )
+        yscroll = ttk.Scrollbar(
+            table_frame, orient=tk.VERTICAL, command=self.conservative_tree.yview
+        )
+        xscroll = ttk.Scrollbar(
+            table_frame, orient=tk.HORIZONTAL, command=self.conservative_tree.xview
+        )
+        self.conservative_tree.configure(
+            yscrollcommand=yscroll.set,
+            xscrollcommand=xscroll.set,
+        )
+        self.conservative_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        yscroll.grid(row=0, column=1, sticky=tk.NS)
+        xscroll.grid(row=1, column=0, sticky=tk.EW)
+        self.conservative_results: list[ConservativeBlockGain] = []
+
+    def _conservative_threshold(self) -> float:
+        try:
+            threshold = float(self.conservative_threshold_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("Saccade threshold must be a number.") from exc
+        if not np.isfinite(threshold) or threshold <= 0:
+            raise ValueError("Saccade threshold must be greater than zero.")
+        return threshold
+
+    def _apply_conservative_threshold(self, _event=None) -> None:
+        try:
+            threshold = self._conservative_threshold()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid saccade threshold", str(exc))
+            self.conservative_threshold_entry.focus_set()
+            return
+        self.conservative_threshold_var.set(f"{threshold:g}")
+        self._refresh_conservative_results()
+        self._redraw()
+
+    @staticmethod
+    def _conservative_number(value: float, digits: int = 3) -> str:
+        return f"{value:.{digits}f}" if np.isfinite(value) else "—"
+
+    def _refresh_conservative_results(self) -> None:
+        if not hasattr(self, "conservative_tree"):
+            return
+        for item in self.conservative_tree.get_children():
+            self.conservative_tree.delete(item)
+        self.conservative_results = []
+        if self.trial is None:
+            self.conservative_summary_var.set(
+                "Load a trial to calculate conservative gain."
+            )
+            return
+        try:
+            threshold = self._conservative_threshold()
+            stimulus_velocity = self._stimulus_velocity()
+            results = compute_conservative_gains_by_block(
+                self._active_times(),
+                self._active_values(),
+                stimulus_velocity_deg_s=stimulus_velocity,
+                saccade_threshold_deg_s=threshold,
+                okr_log=self.okr_log,
+            )
+        except ValueError as exc:
+            self.conservative_summary_var.set(str(exc))
+            return
+
+        self.conservative_results = results
+        for result in results:
+            qc = result.error or "OK"
+            self.conservative_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    result.block_label,
+                    result.condition,
+                    f"{result.start_time:.2f}–{result.end_time:.2f}",
+                    f"{result.n_slow_frames}/{result.n_velocity_frames}",
+                    self._conservative_number(result.pct_saccade_frames, 1),
+                    self._conservative_number(result.mean_velocity_deg_s, 2),
+                    self._conservative_number(result.gain),
+                    self._conservative_number(result.gain_sd),
+                    qc,
+                ),
+            )
+        source = (
+            f"{len(results)} OKR block(s)"
+            if self.okr_log is not None and self.okr_log.block_markers
+            else "full trial (no OKR log)"
+        )
+        self.conservative_summary_var.set(
+            f"{self.trial.trial_id} · {source} · "
+            f"threshold {threshold:g} deg/s · stimulus {stimulus_velocity:g} deg/s · "
+            f"{self._signal_plot_label()}"
+        )
+
+    def _build_sensor_qc_tab(self) -> None:
+        top = self.sensor_qc_tab
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(2, weight=1)
+
+        nav = ttk.Frame(top)
+        nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Button(
+            nav,
+            text="← Conservative gain",
+            command=lambda: self.notebook.select(self.conservative_tab),
+        ).pack(side=tk.LEFT)
+        self.sensor_qc_summary_var = tk.StringVar(
+            value="Load a Vive/Unity trial with sranipal*GazeOrigins.txt to inspect eye seating."
+        )
+        ttk.Label(
+            nav,
+            textvariable=self.sensor_qc_summary_var,
+            foreground="#333333",
+            wraplength=820,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        ttk.Label(
+            top,
+            text=(
+                "SRanipal gaze origins ≈ eye centers in HMD-local mm (not world space). "
+                "Left plot: front view (x horizontal, y vertical). "
+                "Right plot: top view (x horizontal, z depth toward the lenses). "
+                "Compare left vs right means for vertical (Δy) and depth (Δz) asymmetry. "
+                "SD = spread around the mean; jitter = mean |sample-to-sample| change (mm)."
+            ),
+            foreground="#555555",
+            wraplength=1000,
+        ).grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
+
+        plot_frame = ttk.Frame(top)
+        plot_frame.grid(row=2, column=0, sticky=tk.NSEW)
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+
+        self.sensor_qc_fig, self.sensor_qc_axes = plt.subplots(
+            1, 2, figsize=(9.5, 4.4), constrained_layout=True
+        )
+        self.sensor_qc_canvas = FigureCanvasTkAgg(self.sensor_qc_fig, master=plot_frame)
+        self.sensor_qc_canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
+
+        stats_frame = ttk.Frame(top)
+        stats_frame.grid(row=3, column=0, sticky=tk.EW, pady=(8, 0))
+        stats_frame.columnconfigure(0, weight=1)
+        columns = (
+            "eye",
+            "n_valid",
+            "mean_xyz",
+            "sd_xyz",
+            "jitter_xyz",
+            "jitter_3d",
+            "delta",
+            "qc",
+        )
+        self.sensor_qc_tree = ttk.Treeview(
+            stats_frame,
+            columns=columns,
+            show="headings",
+            height=4,
+            selectmode="browse",
+        )
+        headings = {
+            "eye": "Eye",
+            "n_valid": "Valid samples",
+            "mean_xyz": "Mean (x, y, z) mm",
+            "sd_xyz": "SD (x, y, z) mm",
+            "jitter_xyz": "Jitter (x, y, z) mm",
+            "jitter_3d": "Jitter 3D mm",
+            "delta": "L−R Δ (mm)",
+            "qc": "QC note",
+        }
+        widths = {
+            "eye": 70,
+            "n_valid": 100,
+            "mean_xyz": 170,
+            "sd_xyz": 150,
+            "jitter_xyz": 160,
+            "jitter_3d": 100,
+            "delta": 150,
+            "qc": 220,
+        }
+        for column in columns:
+            self.sensor_qc_tree.heading(column, text=headings[column])
+            self.sensor_qc_tree.column(
+                column,
+                width=widths[column],
+                minwidth=50,
+                anchor=tk.W if column != "n_valid" else tk.CENTER,
+            )
+        self.sensor_qc_tree.grid(row=0, column=0, sticky=tk.EW)
+        self._refresh_sensor_qc()
+
+    @staticmethod
+    def _subsample_indices(n: int, max_points: int = 4000) -> np.ndarray:
+        if n <= max_points:
+            return np.arange(n)
+        step = max(1, int(np.ceil(n / max_points)))
+        return np.arange(0, n, step)
+
+    @staticmethod
+    def _origin_qc_note(delta_y: float, delta_z: float, ipd_mm: float) -> str:
+        if not (
+            np.isfinite(delta_y) and np.isfinite(delta_z) and np.isfinite(ipd_mm)
+        ):
+            return "Need both eyes"
+        notes: list[str] = []
+        if abs(delta_y) >= 8.0:
+            notes.append(f"large vertical Δy ({delta_y:+.1f} mm)")
+        elif abs(delta_y) >= 3.0:
+            notes.append(f"moderate vertical Δy ({delta_y:+.1f} mm)")
+        if abs(delta_z) >= 8.0:
+            notes.append(f"large depth Δz ({delta_z:+.1f} mm)")
+        elif abs(delta_z) >= 3.0:
+            notes.append(f"moderate depth Δz ({delta_z:+.1f} mm)")
+        if ipd_mm < 45.0 or ipd_mm > 80.0:
+            notes.append(f"unusual |Δx|/IPD ({ipd_mm:.1f} mm)")
+        if not notes:
+            return "OK — roughly symmetric seating"
+        return "; ".join(notes)
+
+    def _scatter_origin_eye(
+        self,
+        ax,
+        origin: GazeOriginTrace | None,
+        *,
+        x_vals: np.ndarray | None,
+        y_vals: np.ndarray | None,
+        color: str,
+        label: str,
+    ) -> tuple[float, float] | None:
+        if origin is None or x_vals is None or y_vals is None:
+            return None
+        valid = np.isfinite(x_vals) & np.isfinite(y_vals)
+        if not np.any(valid):
+            return None
+        xs = x_vals[valid]
+        ys = y_vals[valid]
+        idx = self._subsample_indices(len(xs))
+        ax.scatter(
+            xs[idx],
+            ys[idx],
+            s=5,
+            c=color,
+            alpha=0.25,
+            linewidths=0,
+            label=label,
+        )
+        mean_xy = (float(np.mean(xs)), float(np.mean(ys)))
+        ax.scatter(
+            [mean_xy[0]],
+            [mean_xy[1]],
+            s=70,
+            c=color,
+            edgecolors="#222222",
+            linewidths=1.0,
+            zorder=5,
+            marker="o",
+        )
+        return mean_xy
+
+    def _plot_gaze_origin_views(
+        self,
+        left: GazeOriginTrace | None,
+        right: GazeOriginTrace | None,
+    ) -> None:
+        ax_front, ax_depth = self.sensor_qc_axes
+        for ax in (ax_front, ax_depth):
+            ax.clear()
+
+        left_color = "#e76f51"
+        right_color = "#457b9d"
+
+        mean_front_l = self._scatter_origin_eye(
+            ax_front,
+            left,
+            x_vals=None if left is None else left.x,
+            y_vals=None if left is None else left.y,
+            color=left_color,
+            label="Left",
+        )
+        mean_front_r = self._scatter_origin_eye(
+            ax_front,
+            right,
+            x_vals=None if right is None else right.x,
+            y_vals=None if right is None else right.y,
+            color=right_color,
+            label="Right",
+        )
+        ax_front.axhline(0.0, color="#cccccc", lw=0.8)
+        ax_front.axvline(0.0, color="#cccccc", lw=0.8)
+        ax_front.set_xlabel("x (mm, HMD)")
+        ax_front.set_ylabel("y (mm, HMD)")
+        ax_front.set_title("Front view (x–y)")
+        ax_front.set_aspect("equal", adjustable="datalim")
+        if mean_front_l is not None and mean_front_r is not None:
+            ax_front.plot(
+                [mean_front_l[0], mean_front_r[0]],
+                [mean_front_l[1], mean_front_r[1]],
+                color="#333333",
+                lw=1.2,
+                linestyle="--",
+                zorder=4,
+                label="mean link",
+            )
+        if mean_front_l is None and mean_front_r is None:
+            ax_front.text(
+                0.5,
+                0.5,
+                "No gaze-origin files",
+                transform=ax_front.transAxes,
+                ha="center",
+                va="center",
+                color="#888888",
+            )
+        else:
+            ax_front.legend(loc="best", fontsize=8, framealpha=0.9)
+
+        mean_depth_l = self._scatter_origin_eye(
+            ax_depth,
+            left,
+            x_vals=None if left is None else left.x,
+            y_vals=None if left is None else left.z,
+            color=left_color,
+            label="Left",
+        )
+        mean_depth_r = self._scatter_origin_eye(
+            ax_depth,
+            right,
+            x_vals=None if right is None else right.x,
+            y_vals=None if right is None else right.z,
+            color=right_color,
+            label="Right",
+        )
+        ax_depth.axhline(0.0, color="#cccccc", lw=0.8)
+        ax_depth.axvline(0.0, color="#cccccc", lw=0.8)
+        ax_depth.set_xlabel("x (mm, HMD)")
+        ax_depth.set_ylabel("z (mm, HMD depth)")
+        ax_depth.set_title("Top / depth view (x–z)")
+        ax_depth.set_aspect("equal", adjustable="datalim")
+        if mean_depth_l is not None and mean_depth_r is not None:
+            ax_depth.plot(
+                [mean_depth_l[0], mean_depth_r[0]],
+                [mean_depth_l[1], mean_depth_r[1]],
+                color="#333333",
+                lw=1.2,
+                linestyle="--",
+                zorder=4,
+                label="mean link",
+            )
+        if mean_depth_l is None and mean_depth_r is None:
+            ax_depth.text(
+                0.5,
+                0.5,
+                "No gaze-origin files",
+                transform=ax_depth.transAxes,
+                ha="center",
+                va="center",
+                color="#888888",
+            )
+        else:
+            ax_depth.legend(loc="best", fontsize=8, framealpha=0.9)
+
+        self.sensor_qc_canvas.draw_idle()
+
+    def _refresh_sensor_qc(self) -> None:
+        if not hasattr(self, "sensor_qc_tree"):
+            return
+        for item in self.sensor_qc_tree.get_children():
+            self.sensor_qc_tree.delete(item)
+
+        left = None if self.trial is None else self.trial.origin_left
+        right = None if self.trial is None else self.trial.origin_right
+        self._plot_gaze_origin_views(left, right)
+
+        if self.trial is None:
+            self.sensor_qc_summary_var.set(
+                "Load a Vive/Unity trial with sranipal*GazeOrigins.txt to inspect eye seating."
+            )
+            return
+        if left is None and right is None:
+            self.sensor_qc_summary_var.set(
+                f"{self.trial.trial_id} · no sranipalLeft/RightGazeOrigins.txt in gaze folder"
+            )
+            return
+
+        sym = compare_gaze_origins(left, right)
+        qc = self._origin_qc_note(sym.delta_y, sym.delta_z, sym.ipd_mm)
+
+        def _fmt_mean(stats) -> str:
+            if stats is None or stats.n_valid == 0:
+                return "—"
+            return f"({stats.mean_x:.1f}, {stats.mean_y:.1f}, {stats.mean_z:.1f})"
+
+        def _fmt_sd(stats) -> str:
+            if stats is None or stats.n_valid == 0:
+                return "—"
+            return f"({stats.sd_x:.2f}, {stats.sd_y:.2f}, {stats.sd_z:.2f})"
+
+        def _fmt_jitter(stats) -> str:
+            if stats is None or stats.n_valid == 0:
+                return "—"
+            return (
+                f"({stats.jitter_x:.3f}, {stats.jitter_y:.3f}, {stats.jitter_z:.3f})"
+            )
+
+        def _fmt_jitter_3d(stats) -> str:
+            if stats is None or stats.n_valid == 0 or not np.isfinite(stats.jitter_3d):
+                return "—"
+            return f"{stats.jitter_3d:.3f}"
+
+        for eye_label, stats in (("Left", sym.left), ("Right", sym.right)):
+            if stats is None:
+                self.sensor_qc_tree.insert(
+                    "",
+                    tk.END,
+                    values=(eye_label, "—", "—", "—", "—", "—", "—", "Missing file"),
+                )
+                continue
+            self.sensor_qc_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    eye_label,
+                    f"{stats.n_valid}/{stats.n_total}",
+                    _fmt_mean(stats),
+                    _fmt_sd(stats),
+                    _fmt_jitter(stats),
+                    _fmt_jitter_3d(stats),
+                    "—",
+                    "—",
+                ),
+            )
+
+        delta_txt = (
+            f"Δx={sym.delta_x:+.1f}, Δy={sym.delta_y:+.1f}, Δz={sym.delta_z:+.1f}"
+            if np.isfinite(sym.delta_x)
+            else "—"
+        )
+        ipd_txt = f" |Δx|={sym.ipd_mm:.1f}" if np.isfinite(sym.ipd_mm) else ""
+        self.sensor_qc_tree.insert(
+            "",
+            tk.END,
+            values=(
+                "Compare",
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+                delta_txt + ipd_txt,
+                qc,
+            ),
+        )
+
+        jitter_bits: list[str] = []
+        for label, stats in (("L", sym.left), ("R", sym.right)):
+            if stats is not None and np.isfinite(stats.jitter_3d):
+                jitter_bits.append(f"{label} jit={stats.jitter_3d:.2f} mm")
+        jitter_txt = (" · " + " · ".join(jitter_bits)) if jitter_bits else ""
+
+        if np.isfinite(sym.delta_y) and np.isfinite(sym.delta_z):
+            self.sensor_qc_summary_var.set(
+                f"{self.trial.trial_id} · |Δx|={sym.ipd_mm:.1f} mm · "
+                f"Δy={sym.delta_y:+.1f} mm · Δz={sym.delta_z:+.1f} mm{jitter_txt} · {qc}"
+            )
+        else:
+            self.sensor_qc_summary_var.set(
+                f"{self.trial.trial_id} · one eye only — load both GazeOrigins for symmetry"
+                f"{jitter_txt}"
+            )
+
+    def _build_heading_tab(self) -> None:
+        top = self.heading_tab
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(2, weight=1)
+
+        nav = ttk.Frame(top)
+        nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Button(
+            nav,
+            text="← Eye seating",
+            command=lambda: self.notebook.select(self.sensor_qc_tab),
+        ).pack(side=tk.LEFT)
+        self.heading_summary_var = tk.StringVar(
+            value="Load a Vive/Unity trial with gazeRotations.txt to inspect headset wiggle."
+        )
+        ttk.Label(
+            nav,
+            textvariable=self.heading_summary_var,
+            foreground="#333333",
+            wraplength=820,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        ttk.Label(
+            top,
+            text=(
+                "HMD heading recovered from gazeRotations.txt (Glance stores inverse heading). "
+                "Traces are Δ orientation vs the first sample — a stable rig should stay near 0°. "
+                "This shows headset/rig motion in tracking space, not head slip inside the HMD."
+            ),
+            foreground="#555555",
+            wraplength=1000,
+        ).grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
+
+        plot_frame = ttk.Frame(top)
+        plot_frame.grid(row=2, column=0, sticky=tk.NSEW)
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+
+        self.heading_fig, self.heading_axes = plt.subplots(
+            4, 1, figsize=(9.5, 6.2), sharex=True, constrained_layout=True
+        )
+        self.heading_canvas = FigureCanvasTkAgg(self.heading_fig, master=plot_frame)
+        self.heading_canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
+
+        stats_frame = ttk.Frame(top)
+        stats_frame.grid(row=3, column=0, sticky=tk.EW, pady=(8, 0))
+        stats_frame.columnconfigure(0, weight=1)
+        columns = ("metric", "roll", "pitch", "yaw", "total")
+        self.heading_tree = ttk.Treeview(
+            stats_frame,
+            columns=columns,
+            show="headings",
+            height=3,
+            selectmode="browse",
+        )
+        headings = {
+            "metric": "Metric",
+            "roll": "Δ roll (°)",
+            "pitch": "Δ pitch (°)",
+            "yaw": "Δ yaw (°)",
+            "total": "|angle from start| (°)",
+        }
+        widths = {"metric": 120, "roll": 140, "pitch": 140, "yaw": 140, "total": 180}
+        for column in columns:
+            self.heading_tree.heading(column, text=headings[column])
+            self.heading_tree.column(
+                column,
+                width=widths[column],
+                minwidth=60,
+                anchor=tk.W if column == "metric" else tk.CENTER,
+            )
+        self.heading_tree.grid(row=0, column=0, sticky=tk.EW)
+        self._refresh_heading_wiggle()
+
+    @staticmethod
+    def _heading_qc_note(stats) -> str:
+        if stats.n_valid == 0 or not np.isfinite(stats.max_angle_from_start):
+            return "No valid heading samples"
+        peak = max(stats.roll_ptp, stats.pitch_ptp, stats.yaw_ptp)
+        if stats.max_angle_from_start >= 5.0 or peak >= 5.0:
+            return "large headset motion — check rig / tracking"
+        if stats.max_angle_from_start >= 2.0 or peak >= 2.0:
+            return "moderate headset motion"
+        return "OK — headset mostly stable"
+
+    def _refresh_heading_wiggle(self) -> None:
+        if not hasattr(self, "heading_tree"):
+            return
+        for item in self.heading_tree.get_children():
+            self.heading_tree.delete(item)
+
+        for ax in self.heading_axes:
+            ax.clear()
+
+        heading = None if self.trial is None else self.trial.heading
+        if heading is None:
+            for ax in self.heading_axes:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No gazeRotations.txt",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#888888",
+                )
+            self.heading_axes[-1].set_xlabel("Time (s)")
+            self.heading_canvas.draw_idle()
+            if self.trial is None:
+                self.heading_summary_var.set(
+                    "Load a Vive/Unity trial with gazeRotations.txt to inspect headset wiggle."
+                )
+            else:
+                self.heading_summary_var.set(
+                    f"{self.trial.trial_id} · no gazeRotations.txt in gaze folder"
+                )
+            return
+
+        t = heading.times
+        series = (
+            (self.heading_axes[0], heading.roll_deg, "Δ roll", "#e76f51"),
+            (self.heading_axes[1], heading.pitch_deg, "Δ pitch", "#2a9d8f"),
+            (self.heading_axes[2], heading.yaw_deg, "Δ yaw", "#457b9d"),
+            (
+                self.heading_axes[3],
+                heading.angle_from_start_deg,
+                "|angle from start|",
+                "#6d597a",
+            ),
+        )
+        for ax, values, label, color in series:
+            valid = np.isfinite(t) & np.isfinite(values)
+            if np.any(valid):
+                ax.plot(t[valid], values[valid], color=color, lw=0.9)
+            ax.axhline(0.0, color="#cccccc", lw=0.8)
+            ax.set_ylabel(f"{label} (°)")
+            ax.grid(True, alpha=0.25)
+        self.heading_axes[-1].set_xlabel("Time (s)")
+        self.heading_axes[0].set_title("Headset heading change vs trial start")
+        self.heading_canvas.draw_idle()
+
+        stats = summarize_heading_wiggle(heading)
+        qc = self._heading_qc_note(stats)
+
+        def _fmt(v: float) -> str:
+            return f"{v:.3f}" if np.isfinite(v) else "—"
+
+        self.heading_tree.insert(
+            "",
+            tk.END,
+            values=(
+                "SD",
+                _fmt(stats.roll_sd),
+                _fmt(stats.pitch_sd),
+                _fmt(stats.yaw_sd),
+                "—",
+            ),
+        )
+        self.heading_tree.insert(
+            "",
+            tk.END,
+            values=(
+                "Peak-to-peak",
+                _fmt(stats.roll_ptp),
+                _fmt(stats.pitch_ptp),
+                _fmt(stats.yaw_ptp),
+                _fmt(stats.max_angle_from_start),
+            ),
+        )
+        self.heading_tree.insert(
+            "",
+            tk.END,
+            values=(
+                "QC",
+                f"{stats.n_valid}/{stats.n_total} samples",
+                "—",
+                "—",
+                qc,
+            ),
+        )
+
+        assert self.trial is not None
+        self.heading_summary_var.set(
+            f"{self.trial.trial_id} · max |angle|={stats.max_angle_from_start:.2f}° · "
+            f"ptp yaw={stats.yaw_ptp:.2f}° · {qc}"
+            if np.isfinite(stats.max_angle_from_start)
+            else f"{self.trial.trial_id} · {qc}"
+        )
+
     def _build_annotate_tab(self) -> None:
         # Footer first (BOTTOM) so Accept / Save / status stay under the plot.
         self._build_annotate_footer()
@@ -820,6 +1637,20 @@ class AnnotatorApp:
             self.connect_points_chk,
             "Draw a line through successive samples.\n"
             "Useful when manually placing start/end marks.",
+        )
+
+        self.show_velocity_var = tk.BooleanVar(value=False)
+        self.show_velocity_chk = ttk.Checkbutton(
+            controls_row,
+            text="Velocity",
+            variable=self.show_velocity_var,
+            command=self._on_show_velocity_toggled,
+        )
+        self.show_velocity_chk.pack(side=tk.LEFT, padx=(0, 8))
+        _bind_tooltip(
+            self.show_velocity_chk,
+            "Show frame-wise gaze velocity under the gaze plot.\n"
+            "Samples beyond the Conservative gain saccade threshold are red.",
         )
 
         self.show_openness_var = tk.BooleanVar(value=False)
@@ -1145,6 +1976,7 @@ class AnnotatorApp:
     def _build_plot(self) -> None:
         self.fig = plt.figure(figsize=(10, 4))
         self.ax = self.fig.add_subplot(111)
+        self.velocity_ax = None
         self.openness_ax = None
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Elevation (deg)")
@@ -1184,21 +2016,152 @@ class AnnotatorApp:
             hasattr(self, "show_openness_var") and self.show_openness_var.get()
         )
 
+    def _velocity_visible(self) -> bool:
+        return bool(
+            hasattr(self, "show_velocity_var") and self.show_velocity_var.get()
+        )
+
     def _sync_plot_layout(self) -> None:
-        """Rebuild axes when the eye-openness panel is shown or hidden."""
-        want = self._eye_openness_visible()
-        have = getattr(self, "openness_ax", None) is not None
-        if want == have and hasattr(self, "ax") and self.ax is not None:
+        """Rebuild axes when optional velocity/openness panels change."""
+        want_velocity = self._velocity_visible()
+        want_openness = self._eye_openness_visible()
+        have_velocity = getattr(self, "velocity_ax", None) is not None
+        have_openness = getattr(self, "openness_ax", None) is not None
+        if (
+            want_velocity == have_velocity
+            and want_openness == have_openness
+            and hasattr(self, "ax")
+            and self.ax is not None
+        ):
             return
         self.fig.clf()
-        if want:
-            gs = self.fig.add_gridspec(2, 1, height_ratios=[2.4, 1.0], hspace=0.06)
-            self.ax = self.fig.add_subplot(gs[0])
-            self.openness_ax = self.fig.add_subplot(gs[1], sharex=self.ax)
-            plt.setp(self.ax.get_xticklabels(), visible=False)
-        else:
+        n_aux = int(want_velocity) + int(want_openness)
+        if n_aux == 0:
             self.ax = self.fig.add_subplot(111)
+            self.velocity_ax = None
             self.openness_ax = None
+            return
+
+        gs = self.fig.add_gridspec(
+            1 + n_aux,
+            1,
+            height_ratios=[2.4] + [1.0] * n_aux,
+            hspace=0.06,
+        )
+        self.ax = self.fig.add_subplot(gs[0])
+        row = 1
+        if want_velocity:
+            self.velocity_ax = self.fig.add_subplot(gs[row], sharex=self.ax)
+            row += 1
+        else:
+            self.velocity_ax = None
+        if want_openness:
+            self.openness_ax = self.fig.add_subplot(gs[row], sharex=self.ax)
+        else:
+            self.openness_ax = None
+
+    def _draw_velocity_panel(self, vx0: float, vx1: float) -> None:
+        ax = getattr(self, "velocity_ax", None)
+        if ax is None or self.trial is None:
+            return
+
+        times = np.asarray(self._active_times(), dtype=float)
+        values = np.asarray(self._active_values(), dtype=float)
+        dt = np.diff(times)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            velocity = np.diff(values) / dt
+        velocity_times = times[:-1]
+        finite = np.isfinite(velocity) & np.isfinite(velocity_times) & (dt > 0)
+        visible = (
+            finite
+            & (velocity_times >= self.analysis_t0)
+            & (velocity_times <= self.analysis_t1)
+            & (velocity_times >= vx0)
+            & (velocity_times <= vx1)
+        )
+
+        try:
+            threshold = self._conservative_threshold()
+        except (AttributeError, ValueError):
+            threshold = 20.0
+        saccade = visible & (np.abs(velocity) > threshold)
+        slow = visible & ~saccade
+
+        ax.axhline(0.0, color="0.6", linewidth=0.7, zorder=0)
+        ax.axhline(
+            threshold,
+            color="#c62828",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.8,
+            zorder=0,
+        )
+        ax.axhline(
+            -threshold,
+            color="#c62828",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.8,
+            zorder=0,
+        )
+        velocity_line = velocity.copy()
+        velocity_line[~visible] = np.nan
+        ax.plot(
+            velocity_times,
+            velocity_line,
+            color="0.55",
+            linewidth=0.6,
+            alpha=0.65,
+            zorder=1,
+        )
+        ax.plot(
+            velocity_times[slow],
+            velocity[slow],
+            linestyle="none",
+            marker=".",
+            markersize=3,
+            color="#355c7d",
+            label="Within threshold",
+            zorder=2,
+        )
+        ax.plot(
+            velocity_times[saccade],
+            velocity[saccade],
+            linestyle="none",
+            marker=".",
+            markersize=5,
+            color="#d32f2f",
+            label="Beyond threshold",
+            zorder=3,
+        )
+        ax.set_ylabel("Velocity\n(deg/s)")
+        ax.set_xlim(vx0, vx1)
+        ax.text(
+            0.995,
+            0.94,
+            f"threshold ±{threshold:g}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            color="#a61b1b",
+        )
+
+        for kind, seg in self._segments_sorted_by_time():
+            if seg.t_end < vx0 or seg.t_start > vx1:
+                continue
+            color = "green" if kind == "accepted" else "steelblue"
+            ax.axvspan(seg.t_start, seg.t_end, color=color, alpha=0.1, zorder=0)
+        if self.pending_fit is not None:
+            ax.axvspan(
+                self.pending_fit.t_start,
+                self.pending_fit.t_end,
+                color="orange",
+                alpha=0.1,
+                zorder=0,
+            )
+        if self.okr_log is not None:
+            self._draw_okr_log_markers(vx0, vx1, ax=ax, labels=False)
 
     def _draw_openness_panel(self, vx0: float, vx1: float) -> None:
         ax = getattr(self, "openness_ax", None)
@@ -1712,6 +2675,7 @@ class AnnotatorApp:
         if self.trial is not None:
             self._update_condition_display()
             self._refresh_segment_list()
+            self._refresh_conservative_results()
             self._redraw()
         elif self.okr_log is not None:
             self._update_condition_display(
@@ -1731,6 +2695,7 @@ class AnnotatorApp:
         self._update_files_label()
         self.condition_var.set("")
         self._refresh_segment_list()
+        self._refresh_conservative_results()
         if self.trial is not None:
             self._redraw()
         self._set_status("Cleared OKR log markers and condition readout.")
@@ -2181,6 +3146,7 @@ class AnnotatorApp:
             self._recalculate_gains_for_velocity(vel)
             self._refresh_segment_list()
             self._redraw()
+        self._refresh_conservative_results()
 
         status = f"Stimulus velocity applied: {vel:g} deg/s."
         if had_segments:
@@ -2258,9 +3224,17 @@ class AnnotatorApp:
             )
             if self.gaze_path is not None and not self._is_tobii_gaze():
                 attach_eye_openness(self.trial, self.gaze_path.parent)
+                attach_sranipal_gaze_origins(self.trial, self.gaze_path.parent)
+                attach_heading_trace(self.trial, self.gaze_path.parent)
             else:
                 self.trial.openness_left = None
                 self.trial.openness_right = None
+                self.trial.origin_left = None
+                self.trial.origin_right = None
+                self.trial.heading = None
+                self.trial.pupil = None
+                self.trial.pupil_left = None
+                self.trial.pupil_right = None
             t0 = float(self.trial.times[0])
             t1 = float(self.trial.times[-1])
             for openness in (self.trial.openness_left, self.trial.openness_right):
@@ -2292,6 +3266,9 @@ class AnnotatorApp:
             if self.okr_log is not None:
                 self.detect_dir_var.set("Auto")
                 self.detect_blocks_var.set(True)
+            self._refresh_conservative_results()
+            self._refresh_sensor_qc()
+            self._refresh_heading_wiggle()
             self._update_files_label()
             self._redraw()
             duration = t1 - t0
@@ -2308,6 +3285,15 @@ class AnnotatorApp:
                     if tr is not None
                 )
                 status += f"; eye openness: {n_eyes} eye(s)"
+            if self.trial.has_gaze_origins():
+                n_origin = sum(
+                    1
+                    for tr in (self.trial.origin_left, self.trial.origin_right)
+                    if tr is not None
+                )
+                status += f"; gaze origins: {n_origin} eye(s)"
+            if self.trial.has_heading():
+                status += "; heading/wiggle loaded"
             if self.okr_log is not None:
                 status += (
                     f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
@@ -2442,6 +3428,8 @@ class AnnotatorApp:
 
     def _on_scroll(self, event) -> None:
         allowed_axes = {self.ax}
+        if getattr(self, "velocity_ax", None) is not None:
+            allowed_axes.add(self.velocity_ax)
         if getattr(self, "openness_ax", None) is not None:
             allowed_axes.add(self.openness_ax)
         allowed_axes.discard(None)
@@ -3299,9 +4287,19 @@ class AnnotatorApp:
     def _redraw(self) -> None:
         self._sync_plot_layout()
         self.ax.clear()
+        if self.velocity_ax is not None:
+            self.velocity_ax.clear()
         if self.openness_ax is not None:
             self.openness_ax.clear()
+        auxiliary_axes = [
+            axis
+            for axis in (self.velocity_ax, self.openness_ax)
+            if axis is not None
+        ]
+        if auxiliary_axes:
             plt.setp(self.ax.get_xticklabels(), visible=False)
+            for axis in auxiliary_axes[:-1]:
+                plt.setp(axis.get_xticklabels(), visible=False)
         self._click_markers.clear()
         self._hover_artists.clear()
 
@@ -3534,7 +4532,10 @@ class AnnotatorApp:
                         title += " — none pass"
             self.ax.set_title(title)
 
-        self.ax.set_xlabel("" if self.openness_ax is not None else "Time (s)")
+        has_auxiliary_panel = (
+            self.velocity_ax is not None or self.openness_ax is not None
+        )
+        self.ax.set_xlabel("" if has_auxiliary_panel else "Time (s)")
         self.ax.set_ylabel(self._signal_y_label())
         self.ax.set_xlim(vx0, vx1)
 
@@ -3543,6 +4544,11 @@ class AnnotatorApp:
             if ymin < ymax:
                 self.ax.set_ylim(ymin, ymax)
 
+        if self.velocity_ax is not None:
+            self._draw_velocity_panel(vx0, vx1)
+            self.velocity_ax.set_xlabel(
+                "" if self.openness_ax is not None else "Time (s)"
+            )
         if self.openness_ax is not None:
             self._draw_openness_panel(vx0, vx1)
 

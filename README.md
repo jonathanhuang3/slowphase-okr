@@ -181,7 +181,11 @@ ZIP installs do not update automatically — prefer cloning with Git if you anno
 4. **Scroll vertically** or use **←/→** to pan the time axis (20% of window per step), and pick a **Window** (1 s, 2 s, 5 s, 10 s, or Full trial)
 5. Press **Accept segment** (`A`) to keep the fit
 6. **Save segments** for JSON (if that filename already exists, you’ll be asked whether to overwrite or save under a new name), then **Export Excel** when done
-7. Optional: enable **Eye openness** on Annotate to show left/right SRanipal openness under the gaze plot while marking (auto-loaded from the gaze folder when those files exist)
+7. Optional: enable **Velocity** on Annotate to show frame-wise gaze velocity under the gaze trace. Samples beyond the Conservative gain saccade threshold are highlighted red.
+8. Optional: enable **Eye openness** to show left/right SRanipal openness under the gaze plot while marking (auto-loaded from the gaze folder when those files exist).
+9. Open **3. Conservative gain** to see automatic frame-wise gain for every OKR-log block. Change the saccade threshold and press **Recalculate** (or Enter); the velocity plot updates to the same threshold.
+10. Open **4. Eye seating** to compare left/right SRanipal gaze origins in HMD-local mm (front x–y and depth x–z). Use this to check vertical/depth asymmetry when combined Tobii gaze looks noisy.
+11. Open **5. Headset wiggle** to plot HMD heading change (Δ roll/pitch/yaw from `gazeRotations.txt`) — headset/rig motion, not skull slip inside the HMD.
 
 ### Semi-automatic annotation (recommended with OKR log)
 
@@ -204,6 +208,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Signal** | Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze |
 | **Zero at start** | Optional (on by default). Subtracts the angle at the first valid sample so the trace starts at 0° — removes headset pose offset. Slopes and gains are unchanged. |
 | **Connect points** | Optional (off by default). Draws a line through successive samples; markers stay visible. Useful for manual start/end marking. |
+| **Velocity plot** | Optional (off by default). Shows frame-wise velocity (`Δangle / Δtime`) in a synchronized panel under the gaze trace. Red samples exceed the adjustable Conservative gain saccade threshold; dashed red lines mark `±threshold`. |
 | **Eye openness** | Optional (off by default). Shows left/right SRanipal openness under the gaze plot (auto-loaded from the gaze folder) so you can compare while marking. |
 | **Y span** | Optional. Auto = full trial range (default). Choose 5° / 10° / 20° / 40° to zoom; Shift+scroll pans Y; Recenter Y resets the window. |
 | **Fixed y-axis** | With Auto, signal scale stays fixed to the full trial while you pan in time |
@@ -217,6 +222,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray). Clear OKR log removes markers for the next patient. |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
 | **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …) with separate median/mean gain in the side panel and Excel `by_block` sheet. Use **Show: Median / Mean** to switch the panel (and plot/status trial summary). Optional **Min R²** (blank = all) recalculates those summaries using only segments at or above that R²; segments are not deleted and Excel still exports all accepted. |
+| **Automatic conservative gain** | The third tab calculates gain independently for every OKR-log block from frame-wise gaze velocity. Frames over the adjustable saccade threshold (default 20°/s) are excluded; direction-matched slow velocities are averaged and divided by stimulus speed. It also reports the sample SD of those per-frame gains. Without an OKR log, the full trial is shown as one upward block. |
 | **Invalid gaze samples** | `(NaN, NaN, NaN)` lines stay aligned but are skipped for clicking and fitting |
 | **Parameter tooltips** | Hover auto-detect settings in the app for plain-language help |
 
