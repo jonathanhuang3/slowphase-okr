@@ -265,7 +265,7 @@ class GazeTrial:
     pupil: PupilTrace | None = None
     pupil_left: PupilTrace | None = None
     pupil_right: PupilTrace | None = None
-    source_format: str = "ush2a"  # "ush2a" | "tobii_glasses3"
+    source_format: str = "ush2a"  # "ush2a" | "tobii_glasses3" | "eyelink_asc"
     # Per-eye traces (Tobii Glasses 3); None for Unity/Vive exports.
     elevation_left_deg: np.ndarray | None = None
     elevation_right_deg: np.ndarray | None = None
@@ -663,10 +663,14 @@ def load_gaze_trial(
     trial_id: str = "",
     padding_frames: int = 0,
 ) -> GazeTrial:
-    """Load a trial from Unity gaze+time files or Tobii Glasses 3 JSON."""
+    """Load Unity gaze+time, Tobii Glasses 3 JSON, or EyeLink ASC."""
     gaze_path = Path(gaze_path)
     if is_tobii_glasses3_gazedata(gaze_path):
         return load_tobii_glasses3_trial(gaze_path, trial_id=trial_id)
+    from slowphase_okr.eyelink_asc import is_eyelink_asc, load_eyelink_asc_trial
+
+    if is_eyelink_asc(gaze_path):
+        return load_eyelink_asc_trial(gaze_path, trial_id=trial_id)
     if time_path is None:
         raise ValueError(
             "Time file is required for Unity/Vive gaze exports "

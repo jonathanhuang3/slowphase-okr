@@ -183,9 +183,10 @@ ZIP installs do not update automatically — prefer cloning with Git if you anno
 6. **Save segments** for JSON (if that filename already exists, you’ll be asked whether to overwrite or save under a new name), then **Export Excel** when done
 7. Optional: enable **Velocity** on Annotate to show frame-wise gaze velocity under the gaze trace. Samples beyond the Conservative gain saccade threshold are highlighted red.
 8. Optional: enable **Eye openness** to show left/right SRanipal openness under the gaze plot while marking (auto-loaded from the gaze folder when those files exist).
-9. Open **3. Conservative gain** to see automatic frame-wise gain for every OKR-log block. Change the saccade threshold and press **Recalculate** (or Enter); the velocity plot updates to the same threshold.
-10. Open **4. Eye seating** to compare left/right SRanipal gaze origins in HMD-local mm (front x–y and depth x–z). Use this to check vertical/depth asymmetry when combined Tobii gaze looks noisy.
-11. Open **5. Headset wiggle** to plot HMD heading change (Δ roll/pitch/yaw from `gazeRotations.txt`) — headset/rig motion, not skull slip inside the HMD.
+9. Open **3. Conservative gain** to see automatic frame-wise gain for every OKR-log block, plus a gain-vs-contrast plot (persistent blocks at the end). Change the saccade threshold and press **Recalculate** (or Enter); the velocity plot updates to the same threshold.
+10. Open **4. Net displacement** for the unidirectionalUp.mlx-style net displacement per OKR-log block (zero 2D speed >40°/s by default, median filter + ~500 ms smooth, failure-normalized). Up/Down use elevation; Left/Right use azimuth.
+11. Open **5. Eye seating** to compare left/right SRanipal gaze origins in HMD-local mm (front x–y and depth x–z scatters, plus per-eye x/y and x/z traces over time). Use this to check vertical/depth asymmetry or seating drift when combined Tobii gaze looks noisy.
+12. Open **6. Headset wiggle** to plot HMD heading change (Δ roll/pitch/yaw from `gazeRotations.txt`) — headset/rig motion, not skull slip inside the HMD.
 
 ### Semi-automatic annotation (recommended with OKR log)
 
@@ -222,7 +223,9 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray). Clear OKR log removes markers for the next patient. |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
 | **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …) with separate median/mean gain in the side panel and Excel `by_block` sheet. Use **Show: Median / Mean** to switch the panel (and plot/status trial summary). Optional **Min R²** (blank = all) recalculates those summaries using only segments at or above that R²; segments are not deleted and Excel still exports all accepted. |
-| **Automatic conservative gain** | The third tab calculates gain independently for every OKR-log block from frame-wise gaze velocity. Frames over the adjustable saccade threshold (default 20°/s) are excluded; direction-matched slow velocities are averaged and divided by stimulus speed. It also reports the sample SD of those per-frame gains. Without an OKR log, the full trial is shown as one upward block. |
+| **Automatic conservative gain** | The third tab calculates gain independently for every OKR-log block from frame-wise gaze velocity. Frames over the adjustable saccade threshold (default 20°/s) are excluded; direction-matched slow velocities are averaged and divided by stimulus speed. It also reports the sample SD of those per-frame gains and plots gain vs contrast (flicker low→high, persistent last). Without an OKR log, the full trial is shown as one upward block. |
+| **Net displacement** | The fourth tab computes the same mlx-style net displacement used in prior glaucoma analyses (`mlx_net_disp` / `mlx_norm_disp`): zero frames with 2D gaze speed above an adjustable threshold (default 40°/s), cumsum primary-axis displacement, median filter + ~500 ms moving mean, cumsum again, then normalize by `(1 − failure fraction)`. |
+| **Eye seating** | The fifth tab shows SRanipal left/right gaze origins in HMD-local mm: front (x–y) and depth (x–z) scatters, plus per-eye x/y and x/z component traces over time for seating drift / asymmetry checks. |
 | **Invalid gaze samples** | `(NaN, NaN, NaN)` lines stay aligned but are skipped for clicking and fitting |
 | **Parameter tooltips** | Hover auto-detect settings in the app for plain-language help |
 

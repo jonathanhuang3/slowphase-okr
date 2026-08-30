@@ -224,6 +224,68 @@ def test_is_tobii_rejects_unity_gaze(tmp_path: Path):
     assert not is_tobii_glasses3_gazedata(gaze)
 
 
+def _minimal_eyelink_asc(
+    tmp_path: Path,
+    samples=None,
+    synctime=1000,
+):
+    """Write a tiny binocular EyeLink ASC with vertical gaze ramp."""
+    path = tmp_path / "test.asc"
+    if samples is None:
+        samples = [
+            (1000, 960.0, 540.0, 960.0, 540.0),
+            (1001, 960.0, 530.0, 960.0, 530.0),
+            (1002, 960.0, 520.0, 960.0, 520.0),
+        ]
+    lines = [
+        "** VERSION: EYELINK 3",
+        "MSG\t500 DISPLAY_COORDS 0 0 1919 1079",
+        "MSG\t600 VALIDATE LR POINT 0  LEFT  at 960,540  OFFSET 1.00 deg.  0.0,-40.0 pix.",
+        "START\t900 \tLEFT\tRIGHT\tSAMPLES\tEVENTS",
+        "SAMPLES\tGAZE\tLEFT\tRIGHT\tRATE\t1000.00\tTRACKING\tCR\tFILTER\t2",
+    ]
+    if synctime is not None:
+        lines.append(f"MSG\t{synctime} SYNCTIME")
+    for ts, lx, ly, rx, ry in samples:
+        lines.append(
+            f"{ts}\t{lx:.1f}\t{ly:.1f}\t59.0\t{rx:.1f}\t{ry:.1f}\t......"
+        )
+    lines.append("MSG\t2000 TRIAL_RESULT 0")
+    lines.append("END\t2001 \tSAMPLES\tEVENTS")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_eyelink_asc_loader(tmp_path: Path):
+    from slowphase_okr.eyelink_asc import is_eyelink_asc, load_eyelink_asc_trial
+
+    path = _minimal_eyelink_asc(tmp_path)
+    assert is_eyelink_asc(path)
+    trial = load_eyelink_asc_trial(path, trial_id="el")
+    assert trial.source_format == "eyelink_asc"
+    assert trial.trial_id == "el"
+    assert len(trial.times) == 3
+    assert trial.times[0] == pytest.approx(0.0)
+    assert trial.times[-1] == pytest.approx(0.002)
+    assert trial.has_per_eye_gaze()
+    # 10 px up at ~40 px/deg => ~0.25 deg; center sample is 0
+    assert trial.elevation_deg[0] == pytest.approx(0.0, abs=0.05)
+    assert trial.elevation_deg[-1] == pytest.approx(0.5, abs=0.1)
+    assert trial.azimuth_deg is not None
+    assert np.allclose(trial.azimuth_deg, 0.0, atol=0.05, equal_nan=True)
+
+    via = load_gaze_trial(path, trial_id="via")
+    assert via.source_format == "eyelink_asc"
+
+
+def test_eyelink_asc_rejects_non_eyelink(tmp_path: Path):
+    from slowphase_okr.eyelink_asc import is_eyelink_asc
+
+    path = tmp_path / "notes.asc"
+    path.write_text("random text\n")
+    assert not is_eyelink_asc(path)
+
+
 def test_load_okr_log(tmp_path: Path):
     log = tmp_path / "OKR_Log_test.txt"
     log.write_text(
@@ -920,4 +982,195 @@ def test_conservative_gain_by_okr_block(tmp_path: Path):
     assert [result.block_label for result in results] == ["B0↑", "B1↓"]
     assert results[0].gain == pytest.approx(0.5)
     assert results[1].gain == pytest.approx(0.25)
+
+
+def test_sort_conservative_gains_puts_persistent_last():
+    from slowphase_okr.conservative import (
+        ConservativeBlockGain,
+        contrast_plot_x_label,
+        sort_conservative_gains_for_contrast_plot,
+    )
+
+    def _block(
+        label: str,
+        contrast: float | None,
+        persistent: bool | None,
+        gain: float,
+        start: float,
+    ) -> ConservativeBlockGain:
+        return ConservativeBlockGain(
+            block_label=label,
+            condition=label,
+            direction="Up",
+            start_time=start,
+            end_time=start + 1.0,
+            n_velocity_frames=10,
+            n_slow_frames=10,
+            pct_saccade_frames=0.0,
+            mean_velocity_deg_s=10.0,
+            gain=gain,
+            gain_sd=0.0,
+            contrast_level=contrast,
+            is_persistent=persistent,
+        )
+
+    blocks = [
+        _block("P", 1.0, True, 0.9, 4.0),
+        _block("C_high", 0.8, False, 0.7, 2.0),
+        _block("C_low", 0.2, False, 0.3, 0.0),
+        _block("C_mid", 0.5, False, 0.5, 1.0),
+    ]
+    ordered = sort_conservative_gains_for_contrast_plot(blocks)
+    assert [b.block_label for b in ordered] == ["C_low", "C_mid", "C_high", "P"]
+    assert contrast_plot_x_label(ordered[0]) == "0.2"
+    assert contrast_plot_x_label(ordered[-1]) == "Persistent\n(1)"
+
+
+def test_conservative_gain_keeps_contrast_and_persistent_from_okr_log(tmp_path: Path):
+    from slowphase_okr.conservative import (
+        compute_conservative_gains_by_block,
+        sort_conservative_gains_for_contrast_plot,
+    )
+
+    log = tmp_path / "OKR_Log_contrast.txt"
+    log.write_text(
+        "eventIndex\teventType\teyePatch\tcontrastBlockIndex\tdotColor\t"
+        "direction\tcontrastLevel\tdotStartSize\temissionRate\tusePersistentDots\t"
+        "sessionContrastThreshold\tthresholdMultiplier\tisAnchor100\tstartTime\tendTime\n"
+        "1\tContrastBlock\tRight\t0\tWhite\tUp\t0.25\t1\t10\t0\t0.1\t1\t0\t0.0\t1.0\n"
+        "2\tAnchor100PersistentBlock\tRight\t1\tWhite\tUp\t1.0\t1\t10\t1\t0.1\tNA\t1\t1.1\t2.0\n"
+    )
+    okr = load_okr_log(log)
+    times = np.arange(0.0, 2.1, 0.1)
+    elevation = 10.0 * times
+    results = compute_conservative_gains_by_block(
+        times,
+        elevation,
+        stimulus_velocity_deg_s=20.0,
+        saccade_threshold_deg_s=40.0,
+        okr_log=okr,
+        min_slow_frames=1,
+    )
+    assert results[0].contrast_level == pytest.approx(0.25)
+    assert results[0].is_persistent is False
+    assert results[1].contrast_level == pytest.approx(1.0)
+    assert results[1].is_persistent is True
+    ordered = sort_conservative_gains_for_contrast_plot(results)
+    assert [r.block_label for r in ordered] == [results[0].block_label, results[1].block_label]
+
+
+def test_mlx_net_displacement_recovers_steady_upward_ramp():
+    from slowphase_okr.net_displacement import compute_mlx_net_displacement_for_window
+
+    fs = 100.0
+    times = np.arange(0.0, 2.0 + 1e-9, 1.0 / fs)
+    elevation = 10.0 * times  # 10 deg/s upward
+    azimuth = np.zeros_like(times)
+    result = compute_mlx_net_displacement_for_window(
+        times,
+        elevation,
+        azimuth,
+        start_time=0.0,
+        end_time=2.0,
+        max_speed_deg_s=40.0,
+        min_samples=20,
+        direction="Up",
+    )
+    assert result.error == ""
+    assert result.axis == "elevation"
+    assert result.net_disp_deg == pytest.approx(20.0, abs=1.0)
+    assert result.norm_disp_deg == pytest.approx(result.net_disp_deg, abs=1e-6)
+
+
+def test_mlx_net_displacement_zeros_fast_saccades():
+    from slowphase_okr.net_displacement import compute_mlx_net_displacement_for_window
+
+    fs = 100.0
+    times = np.arange(0.0, 1.0 + 1e-9, 1.0 / fs)
+    elevation = 5.0 * times
+    # Inject one large jump (~80 deg in one frame → >>40 deg/s)
+    elevation = elevation.copy()
+    elevation[50:] += 80.0
+    azimuth = np.zeros_like(times)
+    result = compute_mlx_net_displacement_for_window(
+        times,
+        elevation,
+        azimuth,
+        start_time=0.0,
+        end_time=1.0,
+        max_speed_deg_s=40.0,
+        min_samples=20,
+        direction="Up",
+    )
+    assert result.error == ""
+    # Without zeroing, net would be ~85°; with saccade zeroing stay near slow ramp (~5°)
+    assert result.net_disp_deg == pytest.approx(5.0, abs=2.0)
+    assert result.pct_saccade_frames > 0
+
+
+def test_mlx_net_displacement_by_block_uses_azimuth_for_right(tmp_path: Path):
+    from slowphase_okr.net_displacement import compute_mlx_net_displacements_by_block
+
+    log = tmp_path / "OKR_Log_right.txt"
+    log.write_text(
+        "eventIndex\teventType\tcontrastBlockIndex\tstartTime\tendTime\tdirection\n"
+        "1\tContrastBlock\t0\t0.0\t1.0\tRight\n"
+    )
+    okr = load_okr_log(log)
+    times = np.arange(0.0, 1.0 + 1e-9, 0.01)
+    elevation = np.zeros_like(times)
+    azimuth = 8.0 * times
+    results = compute_mlx_net_displacements_by_block(
+        times,
+        elevation,
+        azimuth,
+        okr_log=okr,
+        max_speed_deg_s=40.0,
+        min_samples=20,
+    )
+    assert len(results) == 1
+    assert results[0].axis == "azimuth"
+    assert results[0].error == ""
+    assert results[0].net_disp_deg == pytest.approx(8.0, abs=1.0)
+
+
+def test_sort_net_displacements_puts_persistent_last():
+    from slowphase_okr.net_displacement import (
+        NetDisplacementBlockResult,
+        net_disp_contrast_plot_x_label,
+        sort_net_displacements_for_contrast_plot,
+    )
+
+    def _block(
+        label: str,
+        contrast: float | None,
+        persistent: bool | None,
+        start: float,
+    ) -> NetDisplacementBlockResult:
+        return NetDisplacementBlockResult(
+            block_label=label,
+            condition=label,
+            direction="Up",
+            start_time=start,
+            end_time=start + 1.0,
+            axis="elevation",
+            n_samples=100,
+            pct_saccade_frames=0.0,
+            fraction_failures=0.0,
+            net_disp_deg=10.0,
+            norm_disp_deg=10.0,
+            contrast_level=contrast,
+            is_persistent=persistent,
+        )
+
+    blocks = [
+        _block("P", 1.0, True, 4.0),
+        _block("C_high", 0.8, False, 2.0),
+        _block("C_low", 0.2, False, 0.0),
+        _block("C_mid", 0.5, False, 1.0),
+    ]
+    ordered = sort_net_displacements_for_contrast_plot(blocks)
+    assert [b.block_label for b in ordered] == ["C_low", "C_mid", "C_high", "P"]
+    assert net_disp_contrast_plot_x_label(ordered[0]) == "0.2"
+    assert net_disp_contrast_plot_x_label(ordered[-1]) == "Persistent\n(1)"
 

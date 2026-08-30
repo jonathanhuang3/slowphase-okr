@@ -25,6 +25,48 @@ class ConservativeBlockGain:
     gain: float
     gain_sd: float
     error: str = ""
+    contrast_level: float | None = None
+    is_persistent: bool | None = None
+
+
+def _marker_is_persistent(marker: OkrLogBlockMarker) -> bool | None:
+    event_lower = marker.event_type.lower()
+    if "persistent" in event_lower:
+        return True
+    if "flicker" in event_lower:
+        return False
+    return marker.use_persistent_dots
+
+
+def sort_conservative_gains_for_contrast_plot(
+    results: list[ConservativeBlockGain],
+) -> list[ConservativeBlockGain]:
+    """Order blocks by contrast (low→high); persistent blocks last.
+
+    Blocks without a contrast level sort after numbered contrasts within their
+    flicker/persistent group. Start time breaks remaining ties.
+    """
+
+    def sort_key(result: ConservativeBlockGain) -> tuple[int, float, float]:
+        persistent_rank = 1 if result.is_persistent else 0
+        if result.contrast_level is None or not np.isfinite(result.contrast_level):
+            contrast_rank = float("inf")
+        else:
+            contrast_rank = float(result.contrast_level)
+        return (persistent_rank, contrast_rank, float(result.start_time))
+
+    return sorted(results, key=sort_key)
+
+
+def contrast_plot_x_label(result: ConservativeBlockGain) -> str:
+    """Short categorical x-axis label for the gain-vs-contrast plot."""
+    if result.contrast_level is not None and np.isfinite(result.contrast_level):
+        contrast = f"{result.contrast_level:g}"
+    else:
+        contrast = "?"
+    if result.is_persistent:
+        return f"Persistent\n({contrast})"
+    return contrast
 
 
 def _direction_sign(direction: str | None) -> int:
@@ -61,6 +103,8 @@ def compute_conservative_gain_for_window(
     block_label: str = "Full trial",
     condition: str = "Full trial",
     min_slow_frames: int = 10,
+    contrast_level: float | None = None,
+    is_persistent: bool | None = None,
 ) -> ConservativeBlockGain:
     """Calculate Mean20-style gain in one time window.
 
@@ -131,6 +175,8 @@ def compute_conservative_gain_for_window(
         gain=gain,
         gain_sd=gain_sd,
         error=error,
+        contrast_level=contrast_level,
+        is_persistent=is_persistent,
     )
 
 
@@ -182,6 +228,8 @@ def compute_conservative_gains_by_block(
                 block_label=marker.label,
                 condition=format_block_condition(marker),
                 min_slow_frames=min_slow_frames,
+                contrast_level=marker.contrast_level,
+                is_persistent=_marker_is_persistent(marker),
             )
         )
     return results

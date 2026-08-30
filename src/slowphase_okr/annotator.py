@@ -28,6 +28,14 @@ from slowphase_okr.autosave import (
 from slowphase_okr.conservative import (
     ConservativeBlockGain,
     compute_conservative_gains_by_block,
+    contrast_plot_x_label,
+    sort_conservative_gains_for_contrast_plot,
+)
+from slowphase_okr.net_displacement import (
+    NetDisplacementBlockResult,
+    compute_mlx_net_displacements_by_block,
+    net_disp_contrast_plot_x_label,
+    sort_net_displacements_for_contrast_plot,
 )
 from slowphase_okr.prefs import get_annotations_dir, set_annotations_dir
 from slowphase_okr.detect import DetectParams, detect_slow_phases
@@ -41,6 +49,7 @@ from slowphase_okr.fit import (
     summarize_gains_by_block,
     trial_summary_gain,
 )
+from slowphase_okr.eyelink_asc import is_eyelink_asc
 from slowphase_okr.gaze import (
     GazeOriginTrace,
     GazeTrial,
@@ -90,14 +99,16 @@ Notes
     Samples beyond the Conservative gain saccade threshold are highlighted red.
   • Eye openness: toggle on Annotate to show left/right SRanipal openness under the gaze
     plot (auto-loaded from sranipalLeft/RightEyeOpenness.txt + *Times.txt in the gaze folder).
-  • Eye seating tab: SRanipal left/right gaze origins (HMD-local mm). Front view (x–y)
-    and depth view (x–z) show how symmetrically the eyes sit in the headset.
+  • Net displacement tab: unidirectionalUp.mlx-style net displacement per OKR-log block
+    (zero 2D speed >40°/s, medfilt + ~500 ms smooth, failure-normalized).
+  • Eye seating tab: SRanipal left/right gaze origins (HMD-local mm). Front (x–y) and
+    depth (x–z) scatter views, plus per-eye x/y and x/z traces over time.
   • Headset wiggle tab: HMD heading from gazeRotations.txt (Δ roll/pitch/yaw vs trial start).
     Shows how much the headset/rig itself moves — not skull slip inside the HMD.
   • Analysis window spans the full trial (first to last timestamp).
-  • Gaze: Vive/Unity rotatedGaze.txt + gazeTime.txt, or Tobii Glasses 3 gazedata.json
-    (timestamps embedded — no separate time file).
-  • Tobii Eye menu: Binocular / Left / Right (per-eye gaze direction).
+  • Gaze: Vive/Unity rotatedGaze.txt + gazeTime.txt; Tobii Glasses 3 gazedata.json; or
+    EyeLink ASC (.asc, timestamps embedded — no separate time file).
+  • Tobii / EyeLink Eye menu: Binocular / Left / Right (per-eye gaze when available).
   • Signal: Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze.
   • Connect points: optional line through successive samples (helps manual marking).
   • Zero at start: subtract angle at the first valid sample so the trace starts at 0°
@@ -327,18 +338,21 @@ class AnnotatorApp:
         self.setup_tab = ttk.Frame(self.notebook, padding=8)
         self.annotate_tab = ttk.Frame(self.notebook)
         self.conservative_tab = ttk.Frame(self.notebook, padding=8)
+        self.net_disp_tab = ttk.Frame(self.notebook, padding=8)
         self.sensor_qc_tab = ttk.Frame(self.notebook, padding=8)
         self.heading_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(self.setup_tab, text="1. Load trial")
         self.notebook.add(self.annotate_tab, text="2. Annotate")
         self.notebook.add(self.conservative_tab, text="3. Conservative gain")
-        self.notebook.add(self.sensor_qc_tab, text="4. Eye seating")
-        self.notebook.add(self.heading_tab, text="5. Headset wiggle")
+        self.notebook.add(self.net_disp_tab, text="4. Net displacement")
+        self.notebook.add(self.sensor_qc_tab, text="5. Eye seating")
+        self.notebook.add(self.heading_tab, text="6. Headset wiggle")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         self._build_setup_tab()
         self._build_annotate_tab()
         self._build_conservative_tab()
+        self._build_net_disp_tab()
         self._build_sensor_qc_tab()
         self._build_heading_tab()
         self._build_plot()
@@ -356,6 +370,8 @@ class AnnotatorApp:
                 self.root.after_idle(self.canvas.draw_idle)
             elif selected == str(self.conservative_tab):
                 self._refresh_conservative_results()
+            elif selected == str(self.net_disp_tab):
+                self._refresh_net_disp_results()
             elif selected == str(self.sensor_qc_tab):
                 self._refresh_sensor_qc()
             elif selected == str(self.heading_tab):
@@ -479,6 +495,7 @@ class AnnotatorApp:
         self._update_signal_ylim()
         self._redraw()
         self._refresh_conservative_results()
+        self._refresh_net_disp_results()
         mode = "azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "elevation"
         self._set_status(f"Signal: {mode}. Segments refit on this trace.")
 
@@ -499,6 +516,7 @@ class AnnotatorApp:
         self._update_signal_ylim()
         self._redraw()
         self._refresh_conservative_results()
+        self._refresh_net_disp_results()
         self._set_status(
             f"Eye: {self.eye_var.get()}. Segments refit on this trace."
         )
@@ -786,6 +804,7 @@ class AnnotatorApp:
         top = self.conservative_tab
         top.columnconfigure(0, weight=1)
         top.rowconfigure(3, weight=1)
+        top.rowconfigure(4, weight=1)
 
         nav = ttk.Frame(top)
         nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
@@ -794,6 +813,11 @@ class AnnotatorApp:
             text="← Annotate",
             command=lambda: self.notebook.select(self.annotate_tab),
         ).pack(side=tk.LEFT)
+        ttk.Button(
+            nav,
+            text="Net displacement →",
+            command=lambda: self.notebook.select(self.net_disp_tab),
+        ).pack(side=tk.RIGHT)
         self.conservative_summary_var = tk.StringVar(
             value="Load a trial to calculate conservative gain."
         )
@@ -843,14 +867,27 @@ class AnnotatorApp:
                 "OKR log. Up/Right blocks use positive velocity; Down/Left blocks use "
                 "negative velocity and report gain as a positive magnitude. Gain SD is "
                 "the sample standard deviation of per-frame gains among direction-matched "
-                "slow frames."
+                "slow frames. The plot orders flicker contrasts low→high and places "
+                "persistent (non-flicker) blocks at the end."
             ),
             foreground="#555555",
             wraplength=1000,
         ).grid(row=2, column=0, sticky=tk.W, pady=(0, 8))
 
+        plot_frame = ttk.Frame(top)
+        plot_frame.grid(row=3, column=0, sticky=tk.NSEW, pady=(0, 8))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        self.conservative_fig, self.conservative_ax = plt.subplots(
+            figsize=(9.5, 3.2), constrained_layout=True
+        )
+        self.conservative_canvas = FigureCanvasTkAgg(
+            self.conservative_fig, master=plot_frame
+        )
+        self.conservative_canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
+
         table_frame = ttk.Frame(top)
-        table_frame.grid(row=3, column=0, sticky=tk.NSEW)
+        table_frame.grid(row=4, column=0, sticky=tk.NSEW)
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         columns = (
@@ -869,6 +906,7 @@ class AnnotatorApp:
             columns=columns,
             show="headings",
             selectmode="browse",
+            height=8,
         )
         headings = {
             "block": "Block",
@@ -914,6 +952,7 @@ class AnnotatorApp:
         yscroll.grid(row=0, column=1, sticky=tk.NS)
         xscroll.grid(row=1, column=0, sticky=tk.EW)
         self.conservative_results: list[ConservativeBlockGain] = []
+        self._draw_conservative_contrast_plot([])
 
     def _conservative_threshold(self) -> float:
         try:
@@ -939,6 +978,99 @@ class AnnotatorApp:
     def _conservative_number(value: float, digits: int = 3) -> str:
         return f"{value:.{digits}f}" if np.isfinite(value) else "—"
 
+    def _draw_conservative_contrast_plot(
+        self, results: list[ConservativeBlockGain]
+    ) -> None:
+        if not hasattr(self, "conservative_ax"):
+            return
+        ax = self.conservative_ax
+        ax.clear()
+        ordered = sort_conservative_gains_for_contrast_plot(results)
+        # Prefer blocks that have contrast or persistent metadata from an OKR log.
+        plottable = [
+            result
+            for result in ordered
+            if np.isfinite(result.gain)
+            and (
+                result.contrast_level is not None
+                or result.is_persistent is True
+            )
+        ]
+        if not plottable:
+            ax.text(
+                0.5,
+                0.5,
+                "No contrast-labeled blocks to plot",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                color="#666666",
+            )
+            ax.set_xlabel("Contrast (low → high; persistent last)")
+            ax.set_ylabel("Gain")
+            ax.set_title("Conservative gain vs contrast")
+            self.conservative_canvas.draw_idle()
+            return
+
+        direction_styles = {
+            "Up": ("o", "#e76f51", "Up"),
+            "Down": ("s", "#2a9d8f", "Down"),
+            "Left": ("^", "#457b9d", "Left"),
+            "Right": ("D", "#9b5de5", "Right"),
+        }
+        labels = [contrast_plot_x_label(result) for result in plottable]
+        # Stable unique x categories preserving order (persistent already last).
+        categories: list[str] = []
+        for label in labels:
+            if label not in categories:
+                categories.append(label)
+        x_index = {label: idx for idx, label in enumerate(categories)}
+
+        by_direction: dict[str, list[ConservativeBlockGain]] = {}
+        for result in plottable:
+            key = result.direction if result.direction in direction_styles else "Other"
+            by_direction.setdefault(key, []).append(result)
+
+        for direction, group in by_direction.items():
+            marker, color, legend = direction_styles.get(
+                direction, ("x", "#333333", direction)
+            )
+            xs = [x_index[contrast_plot_x_label(result)] for result in group]
+            ys = [result.gain for result in group]
+            yerr = [
+                result.gain_sd if np.isfinite(result.gain_sd) else 0.0
+                for result in group
+            ]
+            # Sort within direction by category index so lines don't zigzag.
+            order = np.argsort(xs)
+            xs_sorted = [xs[i] for i in order]
+            ys_sorted = [ys[i] for i in order]
+            yerr_sorted = [yerr[i] for i in order]
+            ax.errorbar(
+                xs_sorted,
+                ys_sorted,
+                yerr=yerr_sorted,
+                fmt=f"-{marker}",
+                color=color,
+                ecolor=color,
+                elinewidth=1,
+                capsize=3,
+                markersize=7,
+                label=legend,
+                alpha=0.9,
+            )
+
+        ax.set_xticks(range(len(categories)))
+        ax.set_xticklabels(categories)
+        ax.set_xlabel("Contrast (low → high; persistent last)")
+        ax.set_ylabel("Gain")
+        ax.set_title("Conservative gain vs contrast")
+        ax.axhline(0.0, color="#bbbbbb", linewidth=0.8)
+        if any(by_direction):
+            ax.legend(loc="best", fontsize=8)
+        ax.grid(True, axis="y", alpha=0.3)
+        self.conservative_canvas.draw_idle()
+
     def _refresh_conservative_results(self) -> None:
         if not hasattr(self, "conservative_tree"):
             return
@@ -949,6 +1081,7 @@ class AnnotatorApp:
             self.conservative_summary_var.set(
                 "Load a trial to calculate conservative gain."
             )
+            self._draw_conservative_contrast_plot([])
             return
         try:
             threshold = self._conservative_threshold()
@@ -962,6 +1095,7 @@ class AnnotatorApp:
             )
         except ValueError as exc:
             self.conservative_summary_var.set(str(exc))
+            self._draw_conservative_contrast_plot([])
             return
 
         self.conservative_results = results
@@ -992,6 +1126,342 @@ class AnnotatorApp:
             f"threshold {threshold:g} deg/s · stimulus {stimulus_velocity:g} deg/s · "
             f"{self._signal_plot_label()}"
         )
+        self._draw_conservative_contrast_plot(results)
+
+    def _raw_elevation_azimuth(self) -> tuple[np.ndarray, np.ndarray | None]:
+        """Raw elevation/azimuth for the selected eye (no zero-at-start offset)."""
+        assert self.trial is not None
+        eye = self._eye_mode()
+        if eye != self.EYE_BINOCULAR and self.trial.has_per_eye_gaze():
+            if eye == self.EYE_LEFT:
+                return (
+                    self.trial.elevation_left_deg
+                    if self.trial.elevation_left_deg is not None
+                    else self.trial.elevation_deg,
+                    self.trial.azimuth_left_deg,
+                )
+            return (
+                self.trial.elevation_right_deg
+                if self.trial.elevation_right_deg is not None
+                else self.trial.elevation_deg,
+                self.trial.azimuth_right_deg,
+            )
+        return self.trial.elevation_deg, self.trial.azimuth_deg
+
+    def _build_net_disp_tab(self) -> None:
+        top = self.net_disp_tab
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(3, weight=1)
+        top.rowconfigure(4, weight=1)
+
+        nav = ttk.Frame(top)
+        nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Button(
+            nav,
+            text="← Conservative gain",
+            command=lambda: self.notebook.select(self.conservative_tab),
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            nav,
+            text="Eye seating →",
+            command=lambda: self.notebook.select(self.sensor_qc_tab),
+        ).pack(side=tk.RIGHT)
+        self.net_disp_summary_var = tk.StringVar(
+            value="Load a trial to calculate net displacement."
+        )
+        ttk.Label(
+            nav,
+            textvariable=self.net_disp_summary_var,
+            foreground="#333333",
+            wraplength=720,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        settings = ttk.LabelFrame(top, text="Net displacement settings", padding=8)
+        settings.grid(row=1, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Label(settings, text="Max 2D speed (deg/s):").pack(side=tk.LEFT)
+        self.net_disp_speed_var = tk.StringVar(value="40")
+        self.net_disp_speed_entry = ttk.Entry(
+            settings,
+            textvariable=self.net_disp_speed_var,
+            width=8,
+        )
+        self.net_disp_speed_entry.pack(side=tk.LEFT, padx=(6, 8))
+        self.net_disp_speed_entry.bind("<Return>", self._apply_net_disp_settings)
+        self.net_disp_speed_entry.bind("<FocusOut>", self._apply_net_disp_settings)
+        ttk.Label(settings, text="Skip (s):").pack(side=tk.LEFT, padx=(8, 0))
+        self.net_disp_skip_var = tk.StringVar(value="0")
+        self.net_disp_skip_entry = ttk.Entry(
+            settings,
+            textvariable=self.net_disp_skip_var,
+            width=6,
+        )
+        self.net_disp_skip_entry.pack(side=tk.LEFT, padx=(6, 8))
+        self.net_disp_skip_entry.bind("<Return>", self._apply_net_disp_settings)
+        self.net_disp_skip_entry.bind("<FocusOut>", self._apply_net_disp_settings)
+        ttk.Button(
+            settings,
+            text="Recalculate",
+            command=self._apply_net_disp_settings,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            settings,
+            text=(
+                "Same pipeline as unidirectionalUp.mlx / mlx_net_disp: zero high-speed "
+                "frames, medfilt + ~500 ms smooth, then failure-normalized displacement."
+            ),
+            foreground="#666666",
+            wraplength=520,
+        ).pack(side=tk.LEFT, padx=(14, 0))
+
+        ttk.Label(
+            top,
+            text=(
+                "One row per OKR-log block. Up/Down blocks use elevation displacement; "
+                "Left/Right blocks use azimuth. Norm disp = net disp ÷ (1 − failure fraction). "
+                "The plot orders flicker contrasts low→high and places persistent "
+                "(non-flicker) blocks at the end. Uses the Annotate-tab eye selection "
+                "when per-eye gaze is available."
+            ),
+            foreground="#555555",
+            wraplength=1000,
+        ).grid(row=2, column=0, sticky=tk.W, pady=(0, 8))
+
+        plot_frame = ttk.Frame(top)
+        plot_frame.grid(row=3, column=0, sticky=tk.NSEW, pady=(0, 8))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        self.net_disp_fig, self.net_disp_ax = plt.subplots(
+            figsize=(9.5, 3.2), constrained_layout=True
+        )
+        self.net_disp_canvas = FigureCanvasTkAgg(self.net_disp_fig, master=plot_frame)
+        self.net_disp_canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
+
+        table_frame = ttk.Frame(top)
+        table_frame.grid(row=4, column=0, sticky=tk.NSEW)
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        columns = (
+            "block",
+            "condition",
+            "time",
+            "axis",
+            "samples",
+            "saccade_pct",
+            "fail_frac",
+            "net_disp",
+            "norm_disp",
+            "status",
+        )
+        self.net_disp_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        headings = {
+            "block": "Block",
+            "condition": "Condition",
+            "time": "Time (s)",
+            "axis": "Axis",
+            "samples": "Samples",
+            "saccade_pct": "Saccade %",
+            "fail_frac": "Fail frac",
+            "net_disp": "Net disp (°)",
+            "norm_disp": "Norm disp (°)",
+            "status": "QC",
+        }
+        widths = {
+            "block": 75,
+            "condition": 300,
+            "time": 115,
+            "axis": 80,
+            "samples": 75,
+            "saccade_pct": 85,
+            "fail_frac": 75,
+            "net_disp": 95,
+            "norm_disp": 100,
+            "status": 200,
+        }
+        for column in columns:
+            self.net_disp_tree.heading(column, text=headings[column])
+            self.net_disp_tree.column(
+                column,
+                width=widths[column],
+                minwidth=55,
+                anchor=tk.W if column in ("condition", "status") else tk.CENTER,
+            )
+        yscroll = ttk.Scrollbar(
+            table_frame, orient=tk.VERTICAL, command=self.net_disp_tree.yview
+        )
+        xscroll = ttk.Scrollbar(
+            table_frame, orient=tk.HORIZONTAL, command=self.net_disp_tree.xview
+        )
+        self.net_disp_tree.configure(
+            yscrollcommand=yscroll.set,
+            xscrollcommand=xscroll.set,
+        )
+        self.net_disp_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        yscroll.grid(row=0, column=1, sticky=tk.NS)
+        xscroll.grid(row=1, column=0, sticky=tk.EW)
+        self.net_disp_results: list[NetDisplacementBlockResult] = []
+        self._draw_net_disp_plot([])
+
+    def _net_disp_settings(self) -> tuple[float, float]:
+        try:
+            max_speed = float(self.net_disp_speed_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("Max 2D speed must be a number.") from exc
+        if not np.isfinite(max_speed) or max_speed <= 0:
+            raise ValueError("Max 2D speed must be greater than zero.")
+        try:
+            skip = float(self.net_disp_skip_var.get().strip() or "0")
+        except ValueError as exc:
+            raise ValueError("Skip duration must be a number.") from exc
+        if not np.isfinite(skip) or skip < 0:
+            raise ValueError("Skip duration must be zero or positive.")
+        return max_speed, skip
+
+    def _apply_net_disp_settings(self, _event=None) -> None:
+        try:
+            max_speed, skip = self._net_disp_settings()
+        except ValueError as exc:
+            messagebox.showerror("Net displacement settings", str(exc))
+            self.net_disp_speed_entry.focus_set()
+            return
+        self.net_disp_speed_var.set(f"{max_speed:g}")
+        self.net_disp_skip_var.set(f"{skip:g}")
+        self._refresh_net_disp_results()
+
+    @staticmethod
+    def _net_disp_number(value: float, digits: int = 2) -> str:
+        if not np.isfinite(value):
+            return "—"
+        return f"{value:.{digits}f}"
+
+    def _draw_net_disp_plot(self, results: list[NetDisplacementBlockResult]) -> None:
+        if not hasattr(self, "net_disp_ax"):
+            return
+        ax = self.net_disp_ax
+        ax.clear()
+        ordered = sort_net_displacements_for_contrast_plot(results)
+        # Prefer blocks that have contrast or persistent metadata from an OKR log.
+        plottable = [
+            result
+            for result in ordered
+            if result.error == ""
+            and np.isfinite(result.norm_disp_deg)
+            and (
+                result.contrast_level is not None
+                or result.is_persistent is True
+            )
+        ]
+        if not plottable:
+            ax.text(
+                0.5,
+                0.5,
+                "No contrast-labeled blocks to plot",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                color="#666666",
+            )
+            ax.set_xlabel("Contrast (low → high; persistent last)")
+            ax.set_ylabel("Displacement (deg)")
+            ax.set_title("Net displacement vs contrast")
+            self.net_disp_canvas.draw_idle()
+            return
+
+        base_labels = [net_disp_contrast_plot_x_label(result) for result in plottable]
+        # If Up/Down (etc.) share a contrast, keep both bars and tag the direction.
+        label_counts: dict[str, int] = {}
+        for label in base_labels:
+            label_counts[label] = label_counts.get(label, 0) + 1
+        labels: list[str] = []
+        for result, base in zip(plottable, base_labels):
+            if label_counts[base] > 1 and result.direction:
+                labels.append(f"{base}\n{result.direction}")
+            else:
+                labels.append(base)
+
+        x = np.arange(len(plottable))
+        net = np.array([r.net_disp_deg for r in plottable], dtype=float)
+        norm = np.array([r.norm_disp_deg for r in plottable], dtype=float)
+        width = 0.38
+        ax.bar(x - width / 2, net, width=width, color="#4c78a8", label="Net disp")
+        ax.bar(x + width / 2, norm, width=width, color="#f58518", label="Norm disp")
+        ax.axhline(0.0, color="#333333", lw=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_xlabel("Contrast (low → high; persistent last)")
+        ax.set_ylabel("Displacement (deg)")
+        ax.set_title("Net displacement vs contrast")
+        ax.legend(frameon=False, fontsize=8, loc="best")
+        ax.grid(True, axis="y", alpha=0.3)
+        self.net_disp_canvas.draw_idle()
+
+    def _refresh_net_disp_results(self) -> None:
+        if not hasattr(self, "net_disp_tree"):
+            return
+        for item in self.net_disp_tree.get_children():
+            self.net_disp_tree.delete(item)
+        self.net_disp_results = []
+        if self.trial is None:
+            self.net_disp_summary_var.set(
+                "Load a trial to calculate net displacement."
+            )
+            self._draw_net_disp_plot([])
+            return
+        try:
+            max_speed, skip = self._net_disp_settings()
+            elevation, azimuth = self._raw_elevation_azimuth()
+            results = compute_mlx_net_displacements_by_block(
+                self._active_times(),
+                elevation,
+                azimuth,
+                okr_log=self.okr_log,
+                skip_duration_s=skip,
+                max_speed_deg_s=max_speed,
+            )
+        except ValueError as exc:
+            self.net_disp_summary_var.set(str(exc))
+            self._draw_net_disp_plot([])
+            return
+
+        self.net_disp_results = results
+        for result in results:
+            qc = result.error or "OK"
+            self.net_disp_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    result.block_label,
+                    result.condition,
+                    f"{result.start_time:.2f}–{result.end_time:.2f}",
+                    result.axis,
+                    result.n_samples,
+                    self._net_disp_number(result.pct_saccade_frames, 1),
+                    self._net_disp_number(result.fraction_failures, 3),
+                    self._net_disp_number(result.net_disp_deg, 2),
+                    self._net_disp_number(result.norm_disp_deg, 2),
+                    qc,
+                ),
+            )
+        source = (
+            f"{len(results)} OKR block(s)"
+            if self.okr_log is not None and self.okr_log.block_markers
+            else "full trial (no OKR log)"
+        )
+        eye_label = (
+            self.eye_var.get()
+            if hasattr(self, "eye_var")
+            else "Binocular"
+        )
+        self.net_disp_summary_var.set(
+            f"{self.trial.trial_id} · {source} · max speed {max_speed:g} deg/s · "
+            f"skip {skip:g} s · eye {eye_label}"
+        )
+        self._draw_net_disp_plot(results)
 
     def _build_sensor_qc_tab(self) -> None:
         top = self.sensor_qc_tab
@@ -1002,8 +1472,8 @@ class AnnotatorApp:
         nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
         ttk.Button(
             nav,
-            text="← Conservative gain",
-            command=lambda: self.notebook.select(self.conservative_tab),
+            text="← Net displacement",
+            command=lambda: self.notebook.select(self.net_disp_tab),
         ).pack(side=tk.LEFT)
         self.sensor_qc_summary_var = tk.StringVar(
             value="Load a Vive/Unity trial with sranipal*GazeOrigins.txt to inspect eye seating."
@@ -1019,8 +1489,8 @@ class AnnotatorApp:
             top,
             text=(
                 "SRanipal gaze origins ≈ eye centers in HMD-local mm (not world space). "
-                "Left plot: front view (x horizontal, y vertical). "
-                "Right plot: top view (x horizontal, z depth toward the lenses). "
+                "Top: front (x–y) and depth (x–z) scatters with means. "
+                "Bottom: per-eye x/y and x/z components over time (slip / seating drift). "
                 "Compare left vs right means for vertical (Δy) and depth (Δz) asymmetry. "
                 "SD = spread around the mean; jitter = mean |sample-to-sample| change (mm)."
             ),
@@ -1034,7 +1504,11 @@ class AnnotatorApp:
         plot_frame.rowconfigure(0, weight=1)
 
         self.sensor_qc_fig, self.sensor_qc_axes = plt.subplots(
-            1, 2, figsize=(9.5, 4.4), constrained_layout=True
+            2,
+            2,
+            figsize=(9.5, 7.2),
+            constrained_layout=True,
+            gridspec_kw={"height_ratios": [1.15, 1.0]},
         )
         self.sensor_qc_canvas = FigureCanvasTkAgg(self.sensor_qc_fig, master=plot_frame)
         self.sensor_qc_canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
@@ -1158,13 +1632,53 @@ class AnnotatorApp:
         )
         return mean_xy
 
+    def _plot_origin_component_over_time(
+        self,
+        ax,
+        origin: GazeOriginTrace | None,
+        *,
+        values: np.ndarray | None,
+        color: str,
+        label: str,
+        linestyle: str = "-",
+    ) -> bool:
+        if origin is None or values is None:
+            return False
+        times = np.asarray(origin.times, dtype=float)
+        vals = np.asarray(values, dtype=float)
+        if len(times) != len(vals) or len(times) == 0:
+            return False
+        valid = np.isfinite(times) & np.isfinite(vals)
+        if not np.any(valid):
+            return False
+        t = times[valid]
+        y = vals[valid]
+        idx = self._subsample_indices(len(t), max_points=6000)
+        ax.plot(
+            t[idx],
+            y[idx],
+            color=color,
+            lw=0.9,
+            alpha=0.9,
+            linestyle=linestyle,
+            label=label,
+        )
+        return True
+
     def _plot_gaze_origin_views(
         self,
         left: GazeOriginTrace | None,
         right: GazeOriginTrace | None,
     ) -> None:
-        ax_front, ax_depth = self.sensor_qc_axes
-        for ax in (ax_front, ax_depth):
+        axes = np.asarray(self.sensor_qc_axes)
+        if axes.ndim == 1:
+            ax_front, ax_depth = axes[0], axes[1]
+            ax_xy_t = ax_xz_t = None
+        else:
+            ax_front, ax_depth = axes[0, 0], axes[0, 1]
+            ax_xy_t, ax_xz_t = axes[1, 0], axes[1, 1]
+
+        for ax in axes.ravel():
             ax.clear()
 
         left_color = "#e76f51"
@@ -1259,6 +1773,87 @@ class AnnotatorApp:
             )
         else:
             ax_depth.legend(loc="best", fontsize=8, framealpha=0.9)
+
+        if ax_xy_t is not None and ax_xz_t is not None:
+            # Front components over time: x (solid), y (dashed) per eye.
+            drew_xy = False
+            for origin, color, eye_lab in (
+                (left, left_color, "L"),
+                (right, right_color, "R"),
+            ):
+                drew_xy |= self._plot_origin_component_over_time(
+                    ax_xy_t,
+                    origin,
+                    values=None if origin is None else origin.x,
+                    color=color,
+                    label=f"{eye_lab} x",
+                    linestyle="-",
+                )
+                drew_xy |= self._plot_origin_component_over_time(
+                    ax_xy_t,
+                    origin,
+                    values=None if origin is None else origin.y,
+                    color=color,
+                    label=f"{eye_lab} y",
+                    linestyle="--",
+                )
+            ax_xy_t.set_xlabel("Time (s)")
+            ax_xy_t.set_ylabel("mm (HMD)")
+            ax_xy_t.set_title("Front components over time (x, y)")
+            ax_xy_t.axhline(0.0, color="#cccccc", lw=0.8)
+            ax_xy_t.grid(True, axis="y", alpha=0.25)
+            if drew_xy:
+                ax_xy_t.legend(loc="best", fontsize=7, ncol=2, framealpha=0.9)
+            else:
+                ax_xy_t.text(
+                    0.5,
+                    0.5,
+                    "No gaze-origin files",
+                    transform=ax_xy_t.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#888888",
+                )
+
+            # Depth components over time: x (solid), z (dotted) per eye.
+            drew_xz = False
+            for origin, color, eye_lab in (
+                (left, left_color, "L"),
+                (right, right_color, "R"),
+            ):
+                drew_xz |= self._plot_origin_component_over_time(
+                    ax_xz_t,
+                    origin,
+                    values=None if origin is None else origin.x,
+                    color=color,
+                    label=f"{eye_lab} x",
+                    linestyle="-",
+                )
+                drew_xz |= self._plot_origin_component_over_time(
+                    ax_xz_t,
+                    origin,
+                    values=None if origin is None else origin.z,
+                    color=color,
+                    label=f"{eye_lab} z",
+                    linestyle=":",
+                )
+            ax_xz_t.set_xlabel("Time (s)")
+            ax_xz_t.set_ylabel("mm (HMD)")
+            ax_xz_t.set_title("Depth components over time (x, z)")
+            ax_xz_t.axhline(0.0, color="#cccccc", lw=0.8)
+            ax_xz_t.grid(True, axis="y", alpha=0.25)
+            if drew_xz:
+                ax_xz_t.legend(loc="best", fontsize=7, ncol=2, framealpha=0.9)
+            else:
+                ax_xz_t.text(
+                    0.5,
+                    0.5,
+                    "No gaze-origin files",
+                    transform=ax_xz_t.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#888888",
+                )
 
         self.sensor_qc_canvas.draw_idle()
 
@@ -2590,14 +3185,22 @@ class AnnotatorApp:
     def _is_tobii_gaze(self) -> bool:
         return self.gaze_path is not None and is_tobii_glasses3_gazedata(self.gaze_path)
 
+    def _is_eyelink_gaze(self) -> bool:
+        return self.gaze_path is not None and is_eyelink_asc(self.gaze_path)
+
+    def _gaze_embeds_timestamps(self) -> bool:
+        return self._is_tobii_gaze() or self._is_eyelink_gaze()
+
     def _update_files_label(self) -> None:
         self.gaze_file_label.config(
             text=self.gaze_path.name if self.gaze_path else "Not selected"
         )
-        if self._is_tobii_gaze():
-            self.time_file_label.config(
-                text="Embedded in gazedata.json (Tobii Glasses 3)"
-            )
+        if self._gaze_embeds_timestamps():
+            if self._is_tobii_gaze():
+                label = "Embedded in gazedata.json (Tobii Glasses 3)"
+            else:
+                label = "Embedded in .asc (EyeLink)"
+            self.time_file_label.config(text=label)
         else:
             self.time_file_label.config(
                 text=self.time_path.name if self.time_path else "Not selected"
@@ -2623,9 +3226,10 @@ class AnnotatorApp:
 
     def _browse_gaze(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select gaze file (rotatedGaze.txt or Tobii gazedata.json)",
+            title="Select gaze file (rotatedGaze.txt, gazedata.json, or EyeLink .asc)",
             filetypes=[
-                ("Gaze files", "*.txt *.json"),
+                ("Gaze files", "*.txt *.json *.asc"),
+                ("EyeLink ASC", "*.asc"),
                 ("Text", "*.txt"),
                 ("Tobii Glasses 3 JSON", "*.json"),
                 ("All files", "*.*"),
@@ -2633,18 +3237,24 @@ class AnnotatorApp:
         )
         if path:
             self.gaze_path = Path(path)
-            if is_tobii_glasses3_gazedata(self.gaze_path):
+            if self._gaze_embeds_timestamps():
                 self.time_path = self.gaze_path
             self._update_files_label()
             self.trial_id_var.set(markings_id_from_gaze_path(self.gaze_path))
 
     def _browse_time(self) -> None:
-        if self._is_tobii_gaze():
-            messagebox.showinfo(
-                "Time file not needed",
-                "Tobii Glasses 3 gazedata.json already includes timestamps.\n"
-                "You can load the trial without selecting a separate time file.",
-            )
+        if self._gaze_embeds_timestamps():
+            if self._is_tobii_gaze():
+                msg = (
+                    "Tobii Glasses 3 gazedata.json already includes timestamps.\n"
+                    "You can load the trial without selecting a separate time file."
+                )
+            else:
+                msg = (
+                    "EyeLink ASC files already include sample timestamps.\n"
+                    "You can load the trial without selecting a separate time file."
+                )
+            messagebox.showinfo("Time file not needed", msg)
             return
         path = filedialog.askopenfilename(
             title="Select time file (gazeTime.txt)",
@@ -2676,6 +3286,7 @@ class AnnotatorApp:
             self._update_condition_display()
             self._refresh_segment_list()
             self._refresh_conservative_results()
+            self._refresh_net_disp_results()
             self._redraw()
         elif self.okr_log is not None:
             self._update_condition_display(
@@ -2696,6 +3307,7 @@ class AnnotatorApp:
         self.condition_var.set("")
         self._refresh_segment_list()
         self._refresh_conservative_results()
+        self._refresh_net_disp_results()
         if self.trial is not None:
             self._redraw()
         self._set_status("Cleared OKR log markers and condition readout.")
@@ -3172,16 +3784,17 @@ class AnnotatorApp:
                 "Missing trial files",
                 "Select a gaze file in section 2.\n\n"
                 "Vive/Unity needs gaze + time files.\n"
-                "Tobii Glasses 3 needs only gazedata.json.",
+                "Tobii Glasses 3 needs only gazedata.json.\n"
+                "EyeLink needs only the .asc file.",
             )
             return
-        if not self._is_tobii_gaze() and not self.time_path:
+        if not self._gaze_embeds_timestamps() and not self.time_path:
             messagebox.showwarning(
                 "Missing trial files",
                 "Select both a gaze file and a time file in section 2.",
             )
             return
-        if self._is_tobii_gaze():
+        if self._gaze_embeds_timestamps():
             self.time_path = self.gaze_path
         if not self.stim_vel_var.get().strip():
             messagebox.showwarning(
@@ -3219,10 +3832,10 @@ class AnnotatorApp:
             self.trial_id_var.set(trial_id)
             self.trial = load_gaze_trial(
                 self.gaze_path,
-                None if self._is_tobii_gaze() else self.time_path,
+                None if self._gaze_embeds_timestamps() else self.time_path,
                 trial_id=trial_id,
             )
-            if self.gaze_path is not None and not self._is_tobii_gaze():
+            if self.gaze_path is not None and not self._gaze_embeds_timestamps():
                 attach_eye_openness(self.trial, self.gaze_path.parent)
                 attach_sranipal_gaze_origins(self.trial, self.gaze_path.parent)
                 attach_heading_trace(self.trial, self.gaze_path.parent)
@@ -3267,6 +3880,7 @@ class AnnotatorApp:
                 self.detect_dir_var.set("Auto")
                 self.detect_blocks_var.set(True)
             self._refresh_conservative_results()
+            self._refresh_net_disp_results()
             self._refresh_sensor_qc()
             self._refresh_heading_wiggle()
             self._update_files_label()
