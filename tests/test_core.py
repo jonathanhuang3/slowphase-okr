@@ -286,6 +286,77 @@ def test_eyelink_asc_rejects_non_eyelink(tmp_path: Path):
     assert not is_eyelink_asc(path)
 
 
+def test_eyelink_asc_hpose_and_eye_in_head(tmp_path: Path):
+    from slowphase_okr.eyelink_asc import load_eyelink_asc_trial
+
+    path = tmp_path / "el3.asc"
+    lines = [
+        "** VERSION: EYELINK 3",
+        "MSG\t500 DISPLAY_COORDS 0 0 1919 1079",
+        "MSG\t600 VALIDATE LR POINT 0  LEFT  at 960,540  OFFSET 1.00 deg.  0.0,-40.0 pix.",
+        "START\t900 \tLEFT\tRIGHT\tSAMPLES\tEVENTS",
+        "SAMPLES\tGAZE\tLEFT\tRIGHT\tHPOSE\tRATE\t1000.00\tTRACKING\tCR\tFILTER\t2",
+        "MSG\t1000 SYNCTIME",
+    ]
+    # time Lx Ly Lp Rx Ry Rp roll pitch yaw x y z headx heady + eye cols ... eihLy eihRy
+    row = (
+        "1000\t960.0\t540.0\t59.0\t960.0\t540.0\t59.0"
+        "\t......\t10.0\t2.0\t3.0\t-19.0\t-19.0\t-607.0"
+        "\t....\t960.0\t540.0"
+        "\t960.0\t960.0\t960.0"
+        "\t530.0\t520.0\t525.0"
+    )
+    lines.append(row)
+    lines.append("MSG\t2000 TRIAL_RESULT 0")
+    lines.append("END\t2001 \tSAMPLES\tEVENTS")
+    path.write_text("\n".join(lines) + "\n")
+
+    trial = load_eyelink_asc_trial(path)
+    assert trial.has_heading()
+    assert trial.heading is not None
+    assert trial.heading.roll_deg[0] == pytest.approx(0.0, abs=1e-6)
+    assert trial.heading.pitch_deg[0] == pytest.approx(0.0, abs=1e-6)
+    assert trial.has_eye_in_head()
+    assert trial.eye_in_head is not None
+    assert trial.eye_in_head.elevation_left_deg[0] == pytest.approx(0.25, abs=0.05)
+
+
+def test_eyelink_asc_monocular_loader(tmp_path: Path):
+    from slowphase_okr.eyelink_asc import load_eyelink_asc_trial
+
+    path = tmp_path / "mono.asc"
+    lines = [
+        "** VERSION: EYELINK 3",
+        "MSG\t500 DISPLAY_COORDS 0 0 1919 1079",
+        "MSG\t600 VALIDATE LR POINT 0  LEFT  at 960,540  OFFSET 1.00 deg.  0.0,-40.0 pix.",
+        "START\t900 \tLEFT\tSAMPLES\tEVENTS",
+        "SAMPLES\tGAZE\tLEFT\tHPOSE\tRATE\t1000.00\tTRACKING\tCR\tFILTER\t2",
+        "MSG\t1000 SYNCTIME",
+        # Lx Ly Lp roll pitch yaw x y z headx heady pad eihLy
+        "1000\t960.0\t540.0\t59.0\t10.0\t2.0\t3.0\t-19.0\t-19.0\t-607.0"
+        "\t960.0\t540.0\t0.0\t530.0",
+        "1001\t960.0\t530.0\t59.0\t10.0\t2.0\t3.0\t-19.0\t-19.0\t-607.0"
+        "\t960.0\t540.0\t0.0\t520.0",
+        "MSG\t2000 TRIAL_RESULT 0",
+        "END\t2001 \tSAMPLES\tEVENTS",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+    trial = load_eyelink_asc_trial(path, trial_id="mono")
+    assert trial.source_format == "eyelink_asc"
+    assert not trial.has_per_eye_gaze()
+    assert trial.elevation_right_deg is None
+    assert trial.azimuth_right_deg is None
+    assert trial.elevation_left_deg is not None
+    assert trial.elevation_deg[0] == pytest.approx(0.0, abs=0.05)
+    assert trial.elevation_deg[-1] == pytest.approx(0.25, abs=0.1)
+    assert trial.has_heading()
+    assert trial.has_eye_in_head()
+    assert trial.eye_in_head is not None
+    assert trial.eye_in_head.elevation_left_deg[0] == pytest.approx(0.25, abs=0.05)
+    assert np.all(np.isnan(trial.eye_in_head.elevation_right_deg))
+
+
 def test_load_okr_log(tmp_path: Path):
     log = tmp_path / "OKR_Log_test.txt"
     log.write_text(

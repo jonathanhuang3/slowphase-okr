@@ -8,7 +8,11 @@ from pathlib import Path
 
 import numpy as np
 
-from slowphase_okr.gaze import GazeTrial
+from slowphase_okr.gaze import (
+    EyeInHeadTrace,
+    GazeTrial,
+    heading_trace_from_euler_deg,
+)
 
 _VALIDATE_RE = re.compile(
     r"VALIDATE LR POINT \d+\s+(?:LEFT|RIGHT)\s+at [\d.]+\,[\d.]+\s+"
@@ -18,6 +22,22 @@ _VALIDATE_RE = re.compile(
 _DISPLAY_COORDS_RE = re.compile(
     r"(?:DISPLAY_COORDS|GAZE_COORDS)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)"
 )
+
+
+@dataclass(frozen=True)
+class _AscColumnMap:
+    """Float-column indices after parsing one EyeLink sample line."""
+
+    binocular: bool
+    gaze_lx: int
+    gaze_ly: int
+    gaze_rx: int | None
+    gaze_ry: int | None
+    hpose_roll: int | None
+    hpose_pitch: int | None
+    hpose_yaw: int | None
+    eih_ly: int | None
+    eih_ry: int | None
 
 
 @dataclass(frozen=True)
@@ -32,7 +52,39 @@ class _AscMeta:
     px_per_deg_y: float
     trim_start_ms: int | None
     trim_end_ms: int | None
-    has_hpose: bool
+    column_map: _AscColumnMap
+
+
+def _column_map_from_samples_line(line: str) -> _AscColumnMap:
+    """Map parsed float columns from the SAMPLES header line."""
+    tokens = {t.strip().upper() for t in line.split("\t")}
+    has_right = "RIGHT" in tokens
+    has_hpose = "HPOSE" in tokens
+    if has_right:
+        return _AscColumnMap(
+            binocular=True,
+            gaze_lx=0,
+            gaze_ly=1,
+            gaze_rx=3,
+            gaze_ry=4,
+            hpose_roll=6 if has_hpose else None,
+            hpose_pitch=7 if has_hpose else None,
+            hpose_yaw=8 if has_hpose else None,
+            eih_ly=17 if has_hpose else None,
+            eih_ry=18 if has_hpose else None,
+        )
+    return _AscColumnMap(
+        binocular=False,
+        gaze_lx=0,
+        gaze_ly=1,
+        gaze_rx=None,
+        gaze_ry=None,
+        hpose_roll=3 if has_hpose else None,
+        hpose_pitch=4 if has_hpose else None,
+        hpose_yaw=5 if has_hpose else None,
+        eih_ly=12 if has_hpose else None,
+        eih_ry=None,
+    )
 
 
 def is_eyelink_asc(path: str | Path) -> bool:
@@ -84,11 +136,22 @@ def _parse_meta(lines: list[str]) -> _AscMeta:
     px_y: list[float] = []
     trim_start: int | None = None
     trim_end: int | None = None
-    has_hpose = False
+    column_map = _AscColumnMap(
+        binocular=True,
+        gaze_lx=0,
+        gaze_ly=1,
+        gaze_rx=3,
+        gaze_ry=4,
+        hpose_roll=6,
+        hpose_pitch=7,
+        hpose_yaw=8,
+        eih_ly=17,
+        eih_ry=18,
+    )
 
     for line in lines:
-        if line.startswith("SAMPLES\t") and "HPOSE" in line:
-            has_hpose = True
+        if line.startswith("SAMPLES\t"):
+            column_map = _column_map_from_samples_line(line)
         m = _DISPLAY_COORDS_RE.search(line)
         if m:
             left, top, right, bottom = (float(m.group(i)) for i in range(1, 5))
@@ -128,7 +191,7 @@ def _parse_meta(lines: list[str]) -> _AscMeta:
         px_per_deg_y=px_per_deg_y,
         trim_start_ms=trim_start,
         trim_end_ms=trim_end,
-        has_hpose=has_hpose,
+        column_map=column_map,
     )
 
 
@@ -161,11 +224,40 @@ def _col(rows: list[tuple[int, list[float | None]]], idx: int) -> np.ndarray:
     return out
 
 
+def _mask_hpose_angles(
+    roll: np.ndarray,
+    pitch: np.ndarray,
+    yaw: np.ndarray,
+    *,
+    max_abs_deg: float = 45.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Drop HPOSE Euler samples outside a plausible tower range."""
+    roll = roll.astype(float, copy=True)
+    pitch = pitch.astype(float, copy=True)
+    yaw = yaw.astype(float, copy=True)
+    bad = (
+        ~np.isfinite(roll)
+        | ~np.isfinite(pitch)
+        | ~np.isfinite(yaw)
+        | (np.abs(roll) > max_abs_deg)
+        | (np.abs(pitch) > max_abs_deg)
+        | (np.abs(yaw) > max_abs_deg)
+    )
+    roll[bad] = np.nan
+    pitch[bad] = np.nan
+    yaw[bad] = np.nan
+    return roll, pitch, yaw
+
+
+def _nan_array_like(rows: list[tuple[int, list[float | None]]]) -> np.ndarray:
+    return np.full(len(rows), np.nan, dtype=float)
+
+
 def load_eyelink_asc_trial(
     gaze_path: str | Path,
     trial_id: str = "",
 ) -> GazeTrial:
-    """Load binocular EyeLink ASC samples (screen GAZE → elevation/azimuth deg)."""
+    """Load EyeLink ASC samples (binocular or monocular) as elevation/azimuth deg."""
     gaze_path = Path(gaze_path)
     if not gaze_path.is_file():
         raise FileNotFoundError(gaze_path)
@@ -173,6 +265,7 @@ def load_eyelink_asc_trial(
     text = gaze_path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     meta = _parse_meta(lines)
+    cols = meta.column_map
 
     in_samples = False
     raw_rows: list[tuple[int, list[float | None]]] = []
@@ -191,7 +284,7 @@ def load_eyelink_asc_trial(
             continue
         ts = int(parts[0])
         floats = _parse_sample_floats(parts)
-        if len(floats) < 5:
+        if len(floats) < 3:
             continue
         raw_rows.append((ts, floats))
 
@@ -213,12 +306,14 @@ def load_eyelink_asc_trial(
     t0_ms = raw_rows[0][0]
     times = np.array([(t - t0_ms) / 1000.0 for t, _ in raw_rows], dtype=float)
 
-    lx_i, ly_i, rx_i, ry_i = 0, 1, 3, 4
-
-    lx = _col(raw_rows, lx_i)
-    ly = _col(raw_rows, ly_i)
-    rx = _col(raw_rows, rx_i)
-    ry = _col(raw_rows, ry_i)
+    lx = _col(raw_rows, cols.gaze_lx)
+    ly = _col(raw_rows, cols.gaze_ly)
+    if cols.gaze_rx is not None and cols.gaze_ry is not None:
+        rx = _col(raw_rows, cols.gaze_rx)
+        ry = _col(raw_rows, cols.gaze_ry)
+    else:
+        rx = _nan_array_like(raw_rows)
+        ry = _nan_array_like(raw_rows)
 
     margin = 500.0
     x_min = meta.display_left - margin
@@ -242,17 +337,72 @@ def load_eyelink_asc_trial(
         return x, y
 
     lx, ly = _mask_oob(lx, ly)
-    rx, ry = _mask_oob(rx, ry)
+    if cols.binocular:
+        rx, ry = _mask_oob(rx, ry)
 
     elev_l, az_l = _px_to_elev_az(lx, ly, meta)
-    elev_r, az_r = _px_to_elev_az(rx, ry, meta)
-    elev_b = _binocular_mean(elev_l, elev_r)
-    az_b = _binocular_mean(az_l, az_r)
+    if cols.binocular:
+        elev_r, az_r = _px_to_elev_az(rx, ry, meta)
+        elev_b = _binocular_mean(elev_l, elev_r)
+        az_b = _binocular_mean(az_l, az_r)
+    else:
+        elev_r = _nan_array_like(raw_rows)
+        az_r = _nan_array_like(raw_rows)
+        elev_b = elev_l.copy()
+        az_b = az_l.copy()
+
+    heading = None
+    eye_in_head = None
+    n_cols = len(raw_rows[0][1])
+    roll = pitch = yaw = None
+    if (
+        cols.hpose_roll is not None
+        and cols.hpose_pitch is not None
+        and cols.hpose_yaw is not None
+        and n_cols > cols.hpose_yaw
+    ):
+        roll, pitch, yaw = _mask_hpose_angles(
+            _col(raw_rows, cols.hpose_roll),
+            _col(raw_rows, cols.hpose_pitch),
+            _col(raw_rows, cols.hpose_yaw),
+        )
+
+    if cols.eih_ly is not None and n_cols > cols.eih_ly:
+        eih_ly = _col(raw_rows, cols.eih_ly)
+        bad_l = ~np.isfinite(eih_ly) | (eih_ly < y_min) | (eih_ly > y_max)
+        eih_ly = eih_ly.astype(float, copy=True)
+        eih_ly[bad_l] = np.nan
+        eih_elev_l = (meta.center_y - eih_ly) / meta.px_per_deg_y
+        if cols.eih_ry is not None and n_cols > cols.eih_ry:
+            eih_ry = _col(raw_rows, cols.eih_ry)
+            bad_r = ~np.isfinite(eih_ry) | (eih_ry < y_min) | (eih_ry > y_max)
+            eih_ry = eih_ry.astype(float, copy=True)
+            eih_ry[bad_r] = np.nan
+            eih_elev_r = (meta.center_y - eih_ry) / meta.px_per_deg_y
+            eih_elev_b = _binocular_mean(eih_elev_l, eih_elev_r)
+        else:
+            eih_elev_r = _nan_array_like(raw_rows)
+            eih_elev_b = eih_elev_l.copy()
+        eye_in_head = EyeInHeadTrace(
+            times=times,
+            elevation_left_deg=eih_elev_l.astype(float),
+            elevation_right_deg=eih_elev_r.astype(float),
+            elevation_deg=eih_elev_b.astype(float),
+        )
 
     if not trial_id:
         trial_id = gaze_path.stem or gaze_path.parent.name or "trial"
 
     resolved = str(gaze_path.resolve())
+    if roll is not None and pitch is not None and yaw is not None:
+        heading = heading_trace_from_euler_deg(
+            times,
+            roll,
+            pitch,
+            yaw,
+            source_rotations=resolved,
+            source_time=resolved,
+        )
     return GazeTrial(
         times=times,
         elevation_deg=elev_b,
@@ -262,7 +412,9 @@ def load_eyelink_asc_trial(
         source_time=resolved,
         source_format="eyelink_asc",
         elevation_left_deg=elev_l,
-        elevation_right_deg=elev_r,
+        elevation_right_deg=elev_r if cols.binocular else None,
         azimuth_left_deg=az_l,
-        azimuth_right_deg=az_r,
+        azimuth_right_deg=az_r if cols.binocular else None,
+        heading=heading,
+        eye_in_head=eye_in_head,
     )

@@ -276,6 +276,7 @@ class GazeTrial:
     origin_left: GazeOriginTrace | None = None
     origin_right: GazeOriginTrace | None = None
     heading: HeadingTrace | None = None
+    eye_in_head: EyeInHeadTrace | None = None
 
     def has_per_eye_gaze(self) -> bool:
         return (
@@ -294,6 +295,19 @@ class GazeTrial:
 
     def has_heading(self) -> bool:
         return self.heading is not None
+
+    def has_eye_in_head(self) -> bool:
+        return self.eye_in_head is not None
+
+
+@dataclass
+class EyeInHeadTrace:
+    """EyeLink 3 eye-in-head screen position (virtual head-yoked screen) as elevation."""
+
+    times: np.ndarray
+    elevation_left_deg: np.ndarray
+    elevation_right_deg: np.ndarray
+    elevation_deg: np.ndarray
 
 
 @dataclass
@@ -1057,6 +1071,50 @@ def _quat_to_euler_deg(
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     yaw = np.degrees(np.arctan2(siny_cosp, cosy_cosp))
     return roll, pitch, yaw
+
+
+def heading_trace_from_euler_deg(
+    times: np.ndarray,
+    roll_deg: np.ndarray,
+    pitch_deg: np.ndarray,
+    yaw_deg: np.ndarray,
+    *,
+    source_rotations: str = "",
+    source_time: str = "",
+) -> HeadingTrace:
+    """Build a heading trace as Δ roll/pitch/yaw vs the first valid sample."""
+    times = np.asarray(times, dtype=float)
+    roll = np.asarray(roll_deg, dtype=float)
+    pitch = np.asarray(pitch_deg, dtype=float)
+    yaw = np.asarray(yaw_deg, dtype=float)
+    valid = (
+        np.isfinite(times)
+        & np.isfinite(roll)
+        & np.isfinite(pitch)
+        & np.isfinite(yaw)
+    )
+    d_roll = np.full(len(times), np.nan, dtype=float)
+    d_pitch = np.full(len(times), np.nan, dtype=float)
+    d_yaw = np.full(len(times), np.nan, dtype=float)
+    ang = np.full(len(times), np.nan, dtype=float)
+    if np.any(valid):
+        first = int(np.flatnonzero(valid)[0])
+        r0, p0, y0 = roll[first], pitch[first], yaw[first]
+        d_roll[valid] = roll[valid] - r0
+        d_pitch[valid] = pitch[valid] - p0
+        d_yaw[valid] = yaw[valid] - y0
+        ang[valid] = np.sqrt(
+            d_roll[valid] ** 2 + d_pitch[valid] ** 2 + d_yaw[valid] ** 2
+        )
+    return HeadingTrace(
+        times=times,
+        roll_deg=d_roll,
+        pitch_deg=d_pitch,
+        yaw_deg=d_yaw,
+        angle_from_start_deg=ang,
+        source_rotations=source_rotations,
+        source_time=source_time,
+    )
 
 
 def discover_heading_files(trial_dir: str | Path) -> tuple[Path, Path] | None:

@@ -103,8 +103,8 @@ Notes
     (zero 2D speed >40°/s, medfilt + ~500 ms smooth, failure-normalized).
   • Eye seating tab: SRanipal left/right gaze origins (HMD-local mm). Front (x–y) and
     depth (x–z) scatter views, plus per-eye x/y and x/z traces over time.
-  • Headset wiggle tab: HMD heading from gazeRotations.txt (Δ roll/pitch/yaw vs trial start).
-    Shows how much the headset/rig itself moves — not skull slip inside the HMD.
+  • Head pose tab: Vive HMD heading from gazeRotations.txt, or EyeLink HPOSE roll/pitch/yaw.
+  • Eye-in-head tab (EyeLink): eye rotation on the head-yoked virtual screen vs screen gaze.
   • Analysis window spans the full trial (first to last timestamp).
   • Gaze: Vive/Unity rotatedGaze.txt + gazeTime.txt; Tobii Glasses 3 gazedata.json; or
     EyeLink ASC (.asc, timestamps embedded — no separate time file).
@@ -341,12 +341,14 @@ class AnnotatorApp:
         self.net_disp_tab = ttk.Frame(self.notebook, padding=8)
         self.sensor_qc_tab = ttk.Frame(self.notebook, padding=8)
         self.heading_tab = ttk.Frame(self.notebook, padding=8)
+        self.eye_in_head_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(self.setup_tab, text="1. Load trial")
         self.notebook.add(self.annotate_tab, text="2. Annotate")
         self.notebook.add(self.conservative_tab, text="3. Conservative gain")
         self.notebook.add(self.net_disp_tab, text="4. Net displacement")
         self.notebook.add(self.sensor_qc_tab, text="5. Eye seating")
-        self.notebook.add(self.heading_tab, text="6. Headset wiggle")
+        self.notebook.add(self.heading_tab, text="6. Head pose")
+        self.notebook.add(self.eye_in_head_tab, text="7. Eye-in-head")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         self._build_setup_tab()
@@ -355,6 +357,7 @@ class AnnotatorApp:
         self._build_net_disp_tab()
         self._build_sensor_qc_tab()
         self._build_heading_tab()
+        self._build_eye_in_head_tab()
         self._build_plot()
         self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -376,6 +379,8 @@ class AnnotatorApp:
                 self._refresh_sensor_qc()
             elif selected == str(self.heading_tab):
                 self._refresh_heading_wiggle()
+            elif selected == str(self.eye_in_head_tab):
+                self._refresh_eye_in_head()
         except tk.TclError:
             pass
 
@@ -399,27 +404,46 @@ class AnnotatorApp:
         assert self.trial is not None
         return self.trial.times
 
+    def _trial_has_left_eye_gaze(self) -> bool:
+        return self.trial is not None and self.trial.elevation_left_deg is not None
+
+    def _trial_has_right_eye_gaze(self) -> bool:
+        return self.trial is not None and self.trial.elevation_right_deg is not None
+
     def _raw_signal_values(self) -> np.ndarray:
         assert self.trial is not None
         want_az = self._signal_mode() == self.SIGNAL_AZIMUTH
         eye = self._eye_mode()
-        if (
-            eye != self.EYE_BINOCULAR
-            and self.trial.has_per_eye_gaze()
-        ):
-            if want_az:
-                if eye == self.EYE_LEFT:
+        if eye != self.EYE_BINOCULAR:
+            if eye == self.EYE_LEFT and self._trial_has_left_eye_gaze():
+                if want_az:
                     az = self.trial.azimuth_left_deg
-                else:
-                    az = self.trial.azimuth_right_deg
-                if az is None:
-                    return np.full_like(self.trial.elevation_deg, np.nan)
-                return az
-            if eye == self.EYE_LEFT:
-                assert self.trial.elevation_left_deg is not None
+                    if az is None:
+                        return np.full_like(self.trial.elevation_deg, np.nan)
+                    return az
                 return self.trial.elevation_left_deg
-            assert self.trial.elevation_right_deg is not None
-            return self.trial.elevation_right_deg
+            if eye == self.EYE_RIGHT and self._trial_has_right_eye_gaze():
+                if want_az:
+                    az = self.trial.azimuth_right_deg
+                    if az is None:
+                        return np.full_like(self.trial.elevation_deg, np.nan)
+                    return az
+                assert self.trial.elevation_right_deg is not None
+                return self.trial.elevation_right_deg
+            if self.trial.has_per_eye_gaze():
+                if want_az:
+                    if eye == self.EYE_LEFT:
+                        az = self.trial.azimuth_left_deg
+                    else:
+                        az = self.trial.azimuth_right_deg
+                    if az is None:
+                        return np.full_like(self.trial.elevation_deg, np.nan)
+                    return az
+                if eye == self.EYE_LEFT:
+                    assert self.trial.elevation_left_deg is not None
+                    return self.trial.elevation_left_deg
+                assert self.trial.elevation_right_deg is not None
+                return self.trial.elevation_right_deg
 
         if want_az:
             az = self.trial.azimuth_deg
@@ -501,12 +525,35 @@ class AnnotatorApp:
 
     def _on_eye_selected(self, _event=None) -> None:
         if self._eye_mode() != self.EYE_BINOCULAR:
-            if self.trial is None or not self.trial.has_per_eye_gaze():
+            eye = self._eye_mode()
+            if eye == self.EYE_LEFT and not self._trial_has_left_eye_gaze():
+                self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
+                messagebox.showwarning(
+                    "Per-eye gaze unavailable",
+                    "Left eye trace is not available for this trial.",
+                )
+                return
+            if eye == self.EYE_RIGHT and not self._trial_has_right_eye_gaze():
+                self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
+                messagebox.showwarning(
+                    "Per-eye gaze unavailable",
+                    "Right eye trace is not available for this trial "
+                    "(monocular EyeLink recordings are left eye only).",
+                )
+                return
+            if (
+                self.trial is None
+                or (
+                    not self.trial.has_per_eye_gaze()
+                    and not self._trial_has_left_eye_gaze()
+                    and not self._trial_has_right_eye_gaze()
+                )
+            ):
                 self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
                 messagebox.showwarning(
                     "Per-eye gaze unavailable",
                     "Left/right eye traces are only available for Tobii Glasses 3 "
-                    "gazedata.json trials.",
+                    "gazedata.json trials or EyeLink ASC files with per-eye data.",
                 )
                 return
         if self.pending_start_idx is not None or self.pending_fit is not None:
@@ -524,8 +571,15 @@ class AnnotatorApp:
     def _update_eye_combo_state(self) -> None:
         if not hasattr(self, "eye_combo"):
             return
-        if self.trial is not None and self.trial.has_per_eye_gaze():
+        has_left = self._trial_has_left_eye_gaze()
+        has_right = self._trial_has_right_eye_gaze()
+        if self.trial is not None and (has_left or has_right):
             self.eye_combo.configure(state="readonly")
+            eye = self._eye_mode()
+            if eye == self.EYE_RIGHT and not has_right:
+                self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
+            elif eye == self.EYE_LEFT and not has_left:
+                self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
         else:
             self.eye_var.set(self._eye_label_map[self.EYE_BINOCULAR])
             self.eye_combo.configure(state="disabled")
@@ -1976,8 +2030,16 @@ class AnnotatorApp:
             text="← Eye seating",
             command=lambda: self.notebook.select(self.sensor_qc_tab),
         ).pack(side=tk.LEFT)
+        ttk.Button(
+            nav,
+            text="Eye-in-head →",
+            command=lambda: self.notebook.select(self.eye_in_head_tab),
+        ).pack(side=tk.LEFT, padx=(8, 0))
         self.heading_summary_var = tk.StringVar(
-            value="Load a Vive/Unity trial with gazeRotations.txt to inspect headset wiggle."
+            value=(
+                "Load a Vive trial (gazeRotations.txt) or EyeLink .asc (HPOSE) "
+                "to inspect head pose."
+            )
         )
         ttk.Label(
             nav,
@@ -1989,9 +2051,9 @@ class AnnotatorApp:
         ttk.Label(
             top,
             text=(
-                "HMD heading recovered from gazeRotations.txt (Glance stores inverse heading). "
-                "Traces are Δ orientation vs the first sample — a stable rig should stay near 0°. "
-                "This shows headset/rig motion in tracking space, not head slip inside the HMD."
+                "Δ roll / pitch / yaw vs the first sample. Vive: HMD heading from "
+                "gazeRotations.txt. EyeLink: 6DOF HPOSE from the .asc file. "
+                "A stable tower rig should stay near 0°."
             ),
             foreground="#555555",
             wraplength=1000,
@@ -2074,7 +2136,12 @@ class AnnotatorApp:
             self.heading_canvas.draw_idle()
             if self.trial is None:
                 self.heading_summary_var.set(
-                    "Load a Vive/Unity trial with gazeRotations.txt to inspect headset wiggle."
+                    "Load a Vive trial (gazeRotations.txt) or EyeLink .asc (HPOSE) "
+                    "to inspect head pose."
+                )
+            elif self.trial.source_format == "eyelink_asc":
+                self.heading_summary_var.set(
+                    f"{self.trial.trial_id} · no HPOSE block in EyeLink .asc"
                 )
             else:
                 self.heading_summary_var.set(
@@ -2102,7 +2169,7 @@ class AnnotatorApp:
             ax.set_ylabel(f"{label} (°)")
             ax.grid(True, alpha=0.25)
         self.heading_axes[-1].set_xlabel("Time (s)")
-        self.heading_axes[0].set_title("Headset heading change vs trial start")
+        self.heading_axes[0].set_title("Head pose change vs trial start")
         self.heading_canvas.draw_idle()
 
         stats = summarize_heading_wiggle(heading)
@@ -2146,11 +2213,141 @@ class AnnotatorApp:
         )
 
         assert self.trial is not None
+        source = (
+            "EyeLink HPOSE"
+            if self.trial.source_format == "eyelink_asc"
+            else "HMD heading"
+        )
         self.heading_summary_var.set(
-            f"{self.trial.trial_id} · max |angle|={stats.max_angle_from_start:.2f}° · "
+            f"{self.trial.trial_id} · {source} · max |angle|={stats.max_angle_from_start:.2f}° · "
             f"ptp yaw={stats.yaw_ptp:.2f}° · {qc}"
             if np.isfinite(stats.max_angle_from_start)
             else f"{self.trial.trial_id} · {qc}"
+        )
+
+    def _build_eye_in_head_tab(self) -> None:
+        top = self.eye_in_head_tab
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(2, weight=1)
+
+        nav = ttk.Frame(top)
+        nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Button(
+            nav,
+            text="← Head pose",
+            command=lambda: self.notebook.select(self.heading_tab),
+        ).pack(side=tk.LEFT)
+        self.eye_in_head_summary_var = tk.StringVar(
+            value="Load an EyeLink .asc file to inspect eye-in-head elevation."
+        )
+        ttk.Label(
+            nav,
+            textvariable=self.eye_in_head_summary_var,
+            foreground="#333333",
+            wraplength=820,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        ttk.Label(
+            top,
+            text=(
+                "EyeLink 3 eye-in-head elevation: gaze on the virtual screen yoked to the head "
+                "(eye rotation only). Dashed lines show combined screen gaze elevation for comparison."
+            ),
+            foreground="#555555",
+            wraplength=1000,
+        ).grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
+
+        plot_frame = ttk.Frame(top)
+        plot_frame.grid(row=2, column=0, sticky=tk.NSEW)
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+
+        self.eye_in_head_fig, self.eye_in_head_axes = plt.subplots(
+            2, 1, figsize=(9.5, 5.0), sharex=True, constrained_layout=True
+        )
+        self.eye_in_head_canvas = FigureCanvasTkAgg(
+            self.eye_in_head_fig, master=plot_frame
+        )
+        self.eye_in_head_canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
+        self._refresh_eye_in_head()
+
+    def _refresh_eye_in_head(self) -> None:
+        if not hasattr(self, "eye_in_head_axes"):
+            return
+        for ax in self.eye_in_head_axes:
+            ax.clear()
+
+        trial = self.trial
+        eih = None if trial is None else trial.eye_in_head
+        if eih is None:
+            for ax in self.eye_in_head_axes:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No EyeLink eye-in-head data",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#888888",
+                )
+            self.eye_in_head_axes[-1].set_xlabel("Time (s)")
+            self.eye_in_head_canvas.draw_idle()
+            if trial is None:
+                self.eye_in_head_summary_var.set(
+                    "Load an EyeLink .asc file to inspect eye-in-head elevation."
+                )
+            else:
+                self.eye_in_head_summary_var.set(
+                    f"{trial.trial_id} · eye-in-head not available for this gaze format"
+                )
+            return
+
+        t = eih.times
+        panels = (
+            (self.eye_in_head_axes[0], eih.elevation_left_deg, "Left eye-in-head", "#e76f51"),
+            (self.eye_in_head_axes[1], eih.elevation_right_deg, "Right eye-in-head", "#457b9d"),
+        )
+        gaze_panels = (
+            trial.elevation_left_deg,
+            trial.elevation_right_deg,
+        )
+        for ax, values, label, color in panels:
+            valid = np.isfinite(t) & np.isfinite(values)
+            if np.any(valid):
+                ax.plot(t[valid], values[valid], color=color, lw=0.9, label=label)
+            elif "Right" in label:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Right eye not recorded",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#888888",
+                )
+            gaze = gaze_panels[0] if "Left" in label else gaze_panels[1]
+            if gaze is not None:
+                gvalid = valid & np.isfinite(gaze)
+                if np.any(gvalid):
+                    ax.plot(
+                        t[gvalid],
+                        gaze[gvalid],
+                        color="#999999",
+                        lw=0.7,
+                        ls="--",
+                        alpha=0.85,
+                        label="Screen gaze",
+                    )
+            ax.axhline(0.0, color="#cccccc", lw=0.8)
+            ax.set_ylabel("Elevation (°)")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.25)
+        self.eye_in_head_axes[0].set_title("Eye-in-head vs screen gaze elevation")
+        self.eye_in_head_axes[-1].set_xlabel("Time (s)")
+        self.eye_in_head_canvas.draw_idle()
+        assert trial is not None
+        self.eye_in_head_summary_var.set(
+            f"{trial.trial_id} · EyeLink eye-in-head elevation (solid) vs screen gaze (dashed)"
         )
 
     def _build_annotate_tab(self) -> None:
@@ -3839,12 +4036,21 @@ class AnnotatorApp:
                 attach_eye_openness(self.trial, self.gaze_path.parent)
                 attach_sranipal_gaze_origins(self.trial, self.gaze_path.parent)
                 attach_heading_trace(self.trial, self.gaze_path.parent)
+            elif self._is_eyelink_gaze():
+                self.trial.openness_left = None
+                self.trial.openness_right = None
+                self.trial.origin_left = None
+                self.trial.origin_right = None
+                self.trial.pupil = None
+                self.trial.pupil_left = None
+                self.trial.pupil_right = None
             else:
                 self.trial.openness_left = None
                 self.trial.openness_right = None
                 self.trial.origin_left = None
                 self.trial.origin_right = None
                 self.trial.heading = None
+                self.trial.eye_in_head = None
                 self.trial.pupil = None
                 self.trial.pupil_left = None
                 self.trial.pupil_right = None
@@ -3883,6 +4089,7 @@ class AnnotatorApp:
             self._refresh_net_disp_results()
             self._refresh_sensor_qc()
             self._refresh_heading_wiggle()
+            self._refresh_eye_in_head()
             self._update_files_label()
             self._redraw()
             duration = t1 - t0
@@ -3907,7 +4114,14 @@ class AnnotatorApp:
                 )
                 status += f"; gaze origins: {n_origin} eye(s)"
             if self.trial.has_heading():
-                status += "; heading/wiggle loaded"
+                source = (
+                    "EyeLink HPOSE"
+                    if self.trial.source_format == "eyelink_asc"
+                    else "heading/wiggle"
+                )
+                status += f"; {source} loaded"
+            if self.trial.has_eye_in_head():
+                status += "; eye-in-head loaded"
             if self.okr_log is not None:
                 status += (
                     f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
