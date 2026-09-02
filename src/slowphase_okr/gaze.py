@@ -9,6 +9,9 @@ from pathlib import Path
 
 import numpy as np
 
+_EYELINK_SBLINK_RE = re.compile(r"^SBLINK\s+\w+\s+(\d+)")
+_EYELINK_EBLINK_RE = re.compile(r"^EBLINK\s+\w+\s+(\d+)\t(\d+)")
+
 
 @dataclass
 class PupilTrace:
@@ -277,6 +280,7 @@ class GazeTrial:
     origin_right: GazeOriginTrace | None = None
     heading: HeadingTrace | None = None
     eye_in_head: EyeInHeadTrace | None = None
+    blink_intervals_sec: list[tuple[float, float]] | None = None
 
     def has_per_eye_gaze(self) -> bool:
         return (
@@ -298,6 +302,67 @@ class GazeTrial:
 
     def has_eye_in_head(self) -> bool:
         return self.eye_in_head is not None
+
+    def has_blink_intervals(self) -> bool:
+        return bool(self.blink_intervals_sec)
+
+
+BLINK_MASK_PAD_SEC = 0.05
+
+
+def parse_eyelink_blink_intervals_ms(lines: list[str]) -> list[tuple[int, int]]:
+    """Parse EyeLink SBLINK/EBLINK rows as absolute millisecond intervals."""
+    intervals: list[tuple[int, int]] = []
+    for line in lines:
+        match = _EYELINK_EBLINK_RE.match(line)
+        if not match:
+            continue
+        start_ms = int(match.group(1))
+        end_ms = int(match.group(2))
+        if end_ms < start_ms:
+            start_ms, end_ms = end_ms, start_ms
+        intervals.append((start_ms, end_ms))
+    return intervals
+
+
+def blink_intervals_to_trial_seconds(
+    intervals_ms: list[tuple[int, int]],
+    *,
+    t0_ms: int,
+    t_end_ms: int | None = None,
+) -> list[tuple[float, float]]:
+    """Convert absolute EyeLink blink times to seconds relative to trial start."""
+    out: list[tuple[float, float]] = []
+    for start_ms, end_ms in intervals_ms:
+        if end_ms < t0_ms:
+            continue
+        if t_end_ms is not None and start_ms > t_end_ms:
+            continue
+        start_s = (start_ms - t0_ms) / 1000.0
+        end_s = (end_ms - t0_ms) / 1000.0
+        if end_s >= 0.0:
+            out.append((max(0.0, start_s), end_s))
+    return out
+
+
+def mask_during_blink_intervals(
+    times: np.ndarray,
+    values: np.ndarray,
+    intervals_sec: list[tuple[float, float]] | None,
+    *,
+    pad_sec: float = BLINK_MASK_PAD_SEC,
+) -> np.ndarray:
+    """Return a copy of ``values`` with blink intervals set to NaN."""
+    out = np.asarray(values, dtype=float).copy()
+    if not intervals_sec:
+        return out
+    times = np.asarray(times, dtype=float)
+    for start_s, end_s in intervals_sec:
+        lo = start_s - pad_sec
+        hi = end_s + pad_sec
+        bad = (times >= lo) & (times <= hi)
+        out[bad] = np.nan
+    return out
 
 
 @dataclass

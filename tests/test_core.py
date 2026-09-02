@@ -357,6 +357,46 @@ def test_eyelink_asc_monocular_loader(tmp_path: Path):
     assert np.all(np.isnan(trial.eye_in_head.elevation_right_deg))
 
 
+def test_eyelink_blink_intervals(tmp_path: Path):
+    from slowphase_okr.eyelink_asc import load_eyelink_asc_trial
+    from slowphase_okr.gaze import mask_during_blink_intervals
+
+    path = tmp_path / "blink.asc"
+    lines = [
+        "** VERSION: EYELINK 3",
+        "MSG\t500 DISPLAY_COORDS 0 0 1919 1079",
+        "MSG\t600 VALIDATE LR POINT 0  LEFT  at 960,540  OFFSET 1.00 deg.  0.0,-40.0 pix.",
+        "START\t900 \tLEFT\tSAMPLES\tEVENTS",
+        "SAMPLES\tGAZE\tLEFT\tRATE\t1000.00\tTRACKING\tCR\tFILTER\t2",
+        "MSG\t1000 SYNCTIME",
+        "1000\t960.0\t540.0\t59.0",
+        "SBLINK L 1001",
+        "1001\t960.0\t530.0\t59.0",
+        "EBLINK L 1001\t1005\t4",
+        "1002\t960.0\t520.0\t59.0",
+        "MSG\t2000 TRIAL_RESULT 0",
+        "END\t2001 \tSAMPLES\tEVENTS",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+    trial = load_eyelink_asc_trial(path)
+    assert trial.has_blink_intervals()
+    assert trial.blink_intervals_sec is not None
+    assert len(trial.blink_intervals_sec) == 1
+    start, end = trial.blink_intervals_sec[0]
+    assert start == pytest.approx(0.001)
+    assert end == pytest.approx(0.005)
+
+    masked = mask_during_blink_intervals(
+        trial.times,
+        trial.elevation_deg,
+        trial.blink_intervals_sec,
+        pad_sec=0.0,
+    )
+    assert np.isfinite(masked[0])
+    assert np.isnan(masked[1])
+
+
 def test_load_okr_log(tmp_path: Path):
     log = tmp_path / "OKR_Log_test.txt"
     log.write_text(

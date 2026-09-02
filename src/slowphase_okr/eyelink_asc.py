@@ -11,7 +11,9 @@ import numpy as np
 from slowphase_okr.gaze import (
     EyeInHeadTrace,
     GazeTrial,
+    blink_intervals_to_trial_seconds,
     heading_trace_from_euler_deg,
+    parse_eyelink_blink_intervals_ms,
 )
 
 _VALIDATE_RE = re.compile(
@@ -403,6 +405,11 @@ def load_eyelink_asc_trial(
             source_rotations=resolved,
             source_time=resolved,
         )
+    blink_intervals_sec = blink_intervals_to_trial_seconds(
+        parse_eyelink_blink_intervals_ms(lines),
+        t0_ms=t0_ms,
+        t_end_ms=t_end,
+    )
     return GazeTrial(
         times=times,
         elevation_deg=elev_b,
@@ -417,4 +424,5 @@ def load_eyelink_asc_trial(
         azimuth_right_deg=az_r if cols.binocular else None,
         heading=heading,
         eye_in_head=eye_in_head,
+        blink_intervals_sec=blink_intervals_sec or None,
     )

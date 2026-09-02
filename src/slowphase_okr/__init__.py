@@ -1,3 +1,3 @@
 """slowphase-okr: manual slow-phase annotation for OKR gain."""
 
-__version__ = "0.2.33"
+__version__ = "0.2.39"

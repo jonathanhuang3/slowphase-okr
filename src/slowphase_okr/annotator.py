@@ -53,6 +53,7 @@ from slowphase_okr.eyelink_asc import is_eyelink_asc
 from slowphase_okr.gaze import (
     GazeOriginTrace,
     GazeTrial,
+    HeadingTrace,
     analysis_window_mask,
     attach_eye_openness,
     attach_heading_trace,
@@ -60,7 +61,9 @@ from slowphase_okr.gaze import (
     compare_gaze_origins,
     is_tobii_glasses3_gazedata,
     load_gaze_trial,
+    mask_during_blink_intervals,
     summarize_heading_wiggle,
+    BLINK_MASK_PAD_SEC,
 )
 from slowphase_okr.okr_log import (
     OkrLog,
@@ -104,7 +107,10 @@ Notes
   • Eye seating tab: SRanipal left/right gaze origins (HMD-local mm). Front (x–y) and
     depth (x–z) scatter views, plus per-eye x/y and x/z traces over time.
   • Head pose tab: Vive HMD heading from gazeRotations.txt, or EyeLink HPOSE roll/pitch/yaw.
-  • Eye-in-head tab (EyeLink): eye rotation on the head-yoked virtual screen vs screen gaze.
+  • EyeLink Trace dropdown (Annotate tab, top row after loading): switch between screen
+    gaze and eye-in-head elevation; segments refit on whichever trace is selected.
+  • EyeLink Mask blinks: below the Annotate plot — hide SBLINK/EBLINK intervals on
+    Annotate and Head pose; adjust padding (ms) as needed.
   • Analysis window spans the full trial (first to last timestamp).
   • Gaze: Vive/Unity rotatedGaze.txt + gazeTime.txt; Tobii Glasses 3 gazedata.json; or
     EyeLink ASC (.asc, timestamps embedded — no separate time file).
@@ -272,6 +278,12 @@ class AnnotatorApp:
         ("Left eye", EYE_LEFT),
         ("Right eye", EYE_RIGHT),
     )
+    TRACE_SCREEN = "screen"
+    TRACE_EYE_IN_HEAD = "eye_in_head"
+    TRACE_CHOICES = (
+        ("Screen gaze", TRACE_SCREEN),
+        ("Eye-in-head", TRACE_EYE_IN_HEAD),
+    )
 
     DEFAULT_VIEW_DURATION = 2.0
     VIEW_PRESET_LABELS = ("1 s", "2 s", "5 s", "10 s", "Full trial")
@@ -331,6 +343,12 @@ class AnnotatorApp:
         self._signal_label_map = {mode: label for label, mode in self.SIGNAL_CHOICES}
         self._eye_mode_map = {label: mode for label, mode in self.EYE_CHOICES}
         self._eye_label_map = {mode: label for label, mode in self.EYE_CHOICES}
+        self._trace_mode_map = {label: mode for label, mode in self.TRACE_CHOICES}
+        self._trace_label_map = {mode: label for label, mode in self.TRACE_CHOICES}
+        self.mask_blinks_var = tk.BooleanVar(value=True)
+        self.blink_pad_ms_var = tk.StringVar(
+            value=str(int(round(BLINK_MASK_PAD_SEC * 1000)))
+        )
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4, 0))
@@ -341,14 +359,12 @@ class AnnotatorApp:
         self.net_disp_tab = ttk.Frame(self.notebook, padding=8)
         self.sensor_qc_tab = ttk.Frame(self.notebook, padding=8)
         self.heading_tab = ttk.Frame(self.notebook, padding=8)
-        self.eye_in_head_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(self.setup_tab, text="1. Load trial")
         self.notebook.add(self.annotate_tab, text="2. Annotate")
         self.notebook.add(self.conservative_tab, text="3. Conservative gain")
         self.notebook.add(self.net_disp_tab, text="4. Net displacement")
         self.notebook.add(self.sensor_qc_tab, text="5. Eye seating")
         self.notebook.add(self.heading_tab, text="6. Head pose")
-        self.notebook.add(self.eye_in_head_tab, text="7. Eye-in-head")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         self._build_setup_tab()
@@ -357,7 +373,6 @@ class AnnotatorApp:
         self._build_net_disp_tab()
         self._build_sensor_qc_tab()
         self._build_heading_tab()
-        self._build_eye_in_head_tab()
         self._build_plot()
         self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -370,6 +385,7 @@ class AnnotatorApp:
         try:
             selected = self.notebook.select()
             if selected == str(self.annotate_tab) and hasattr(self, "canvas"):
+                self._update_trace_combo_state()
                 self.root.after_idle(self.canvas.draw_idle)
             elif selected == str(self.conservative_tab):
                 self._refresh_conservative_results()
@@ -379,8 +395,6 @@ class AnnotatorApp:
                 self._refresh_sensor_qc()
             elif selected == str(self.heading_tab):
                 self._refresh_heading_wiggle()
-            elif selected == str(self.eye_in_head_tab):
-                self._refresh_eye_in_head()
         except tk.TclError:
             pass
 
@@ -394,6 +408,14 @@ class AnnotatorApp:
         return self._signal_mode_map.get(
             self.signal_var.get(), self.SIGNAL_ELEVATION
         )
+
+    def _trace_mode(self) -> str:
+        if not hasattr(self, "trace_var"):
+            return self.TRACE_SCREEN
+        return self._trace_mode_map.get(self.trace_var.get(), self.TRACE_SCREEN)
+
+    def _is_eye_in_head_trace(self) -> bool:
+        return self._trace_mode() == self.TRACE_EYE_IN_HEAD
 
     def _eye_mode(self) -> str:
         if not hasattr(self, "eye_var"):
@@ -411,6 +433,9 @@ class AnnotatorApp:
         return self.trial is not None and self.trial.elevation_right_deg is not None
 
     def _raw_signal_values(self) -> np.ndarray:
+        return self._maybe_mask_blinks(self._unmasked_signal_values())
+
+    def _unmasked_signal_values(self) -> np.ndarray:
         assert self.trial is not None
         want_az = self._signal_mode() == self.SIGNAL_AZIMUTH
         eye = self._eye_mode()
@@ -452,27 +477,139 @@ class AnnotatorApp:
             return az
         return self.trial.elevation_deg
 
-    def _active_values(self) -> np.ndarray:
-        return self._raw_signal_values() - self._signal_zero_offset()
+    def _raw_eye_in_head_elevation_values(self) -> np.ndarray:
+        assert self.trial is not None and self.trial.eye_in_head is not None
+        eih = self.trial.eye_in_head
+        eye = self._eye_mode()
+        if eye == self.EYE_LEFT:
+            values = eih.elevation_left_deg
+        elif eye == self.EYE_RIGHT:
+            values = eih.elevation_right_deg
+        else:
+            values = eih.elevation_deg
+        return self._maybe_mask_blinks(values)
 
-    def _signal_zero_offset(self) -> float:
-        """Offset so first valid sample is 0° when the zero-at-start option is on."""
+    def _maybe_mask_blinks(self, values: np.ndarray) -> np.ndarray:
+        if (
+            self.trial is None
+            or not getattr(self, "mask_blinks_var", None)
+            or not self.mask_blinks_var.get()
+            or not self.trial.has_blink_intervals()
+        ):
+            return values
+        return mask_during_blink_intervals(
+            self.trial.times,
+            values,
+            self.trial.blink_intervals_sec,
+            pad_sec=self._blink_pad_sec(),
+        )
+
+    def _blink_pad_sec(self) -> float:
+        if not hasattr(self, "blink_pad_ms_var"):
+            return BLINK_MASK_PAD_SEC
+        try:
+            ms = float(self.blink_pad_ms_var.get().strip())
+        except ValueError:
+            return BLINK_MASK_PAD_SEC
+        return max(0.0, ms) / 1000.0
+
+    def _mask_blinks_enabled(self) -> bool:
+        return (
+            getattr(self, "mask_blinks_var", None) is not None
+            and self.mask_blinks_var.get()
+            and self.trial is not None
+            and self.trial.has_blink_intervals()
+        )
+
+    def _on_mask_blinks_toggled(self) -> None:
+        if self.pending_start_idx is not None or self.pending_fit is not None:
+            self._clear_pending(redraw=False)
+            self._set_status("Cleared pending segment after blink-mask change.")
+        self._refit_all_segments()
+        self._update_signal_ylim()
+        self._redraw()
+        self._refresh_heading_wiggle()
+        self._refresh_conservative_results()
+        self._refresh_net_disp_results()
+        state = "on" if self._mask_blinks_enabled() else "off"
+        n = len(self.trial.blink_intervals_sec) if self.trial and self.trial.blink_intervals_sec else 0
+        pad_ms = self._blink_pad_sec() * 1000.0
+        self._set_status(
+            f"Blink masking {state} ({n} interval(s), ±{pad_ms:.0f} ms pad)."
+        )
+
+    def _on_blink_pad_changed(self, _event=None) -> None:
+        if not hasattr(self, "blink_pad_ms_var"):
+            return
+        try:
+            ms = float(self.blink_pad_ms_var.get().strip())
+        except ValueError:
+            messagebox.showwarning(
+                "Invalid blink padding",
+                "Enter blink padding in milliseconds (e.g. 50).",
+            )
+            self.blink_pad_ms_var.set(str(int(round(BLINK_MASK_PAD_SEC * 1000))))
+            return
+        if ms < 0:
+            messagebox.showwarning(
+                "Invalid blink padding",
+                "Blink padding cannot be negative.",
+            )
+            self.blink_pad_ms_var.set("0")
+            return
+        self.blink_pad_ms_var.set(str(int(ms) if ms == int(ms) else ms))
+        if self.trial is None or not self.trial.has_blink_intervals():
+            return
+        self._on_mask_blinks_toggled()
+
+    def _update_blink_mask_controls(self) -> None:
+        show = self.trial is not None and self.trial.has_blink_intervals()
+        frame = getattr(self, "blink_controls", None)
+        if frame is None:
+            return
+        if show:
+            if not frame.winfo_ismapped():
+                frame.pack(side=tk.BOTTOM, fill=tk.X)
+        else:
+            frame.pack_forget()
+
+    def _plot_raw_values(self) -> np.ndarray:
+        if self._is_eye_in_head_trace():
+            if self.trial is None or not self.trial.has_eye_in_head():
+                return self._raw_signal_values()
+            return self._raw_eye_in_head_elevation_values()
+        return self._raw_signal_values()
+
+    def _active_values(self) -> np.ndarray:
+        return self._plot_raw_values() - self._plot_zero_offset()
+
+    def _plot_zero_offset(self) -> float:
         if not getattr(self, "zero_elevation_var", None) or not self.zero_elevation_var.get():
             return 0.0
         if self.trial is None:
             return 0.0
-        values = self._raw_signal_values()
+        values = self._plot_raw_values()
         finite = values[np.isfinite(values)]
         if finite.size == 0:
             return 0.0
         return float(finite[0])
+
+    def _plot_values(self) -> np.ndarray:
+        return self._active_values()
+
+    def _signal_zero_offset(self) -> float:
+        """Offset so first valid sample is 0° when the zero-at-start option is on."""
+        return self._plot_zero_offset()
 
     def _elevation_zero_offset(self) -> float:
         """Backward-compatible alias used by older call sites."""
         return self._signal_zero_offset()
 
     def _signal_plot_label(self) -> str:
-        base = "Azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "Elevation"
+        if self._is_eye_in_head_trace():
+            base = "Eye-in-head elev"
+        else:
+            base = "Azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "Elevation"
         eye = self._eye_mode()
         if eye == self.EYE_LEFT:
             base = f"{base} L"
@@ -483,7 +620,10 @@ class AnnotatorApp:
         return base
 
     def _signal_y_label(self) -> str:
-        base = "Azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "Elevation"
+        if self._is_eye_in_head_trace():
+            base = "Eye-in-head elevation"
+        else:
+            base = "Azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "Elevation"
         eye = self._eye_mode()
         if eye == self.EYE_LEFT:
             base = f"Left {base.lower()}"
@@ -504,6 +644,13 @@ class AnnotatorApp:
         )
 
     def _on_signal_selected(self, _event=None) -> None:
+        if self._is_eye_in_head_trace() and self._signal_mode() == self.SIGNAL_AZIMUTH:
+            self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
+            messagebox.showinfo(
+                "Azimuth unavailable",
+                "Eye-in-head trace is elevation only. Use Trace: Screen gaze for azimuth.",
+            )
+            return
         if self._signal_mode() == self.SIGNAL_AZIMUTH:
             if self.trial is None or self.trial.azimuth_deg is None:
                 self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
@@ -522,6 +669,35 @@ class AnnotatorApp:
         self._refresh_net_disp_results()
         mode = "azimuth" if self._signal_mode() == self.SIGNAL_AZIMUTH else "elevation"
         self._set_status(f"Signal: {mode}. Segments refit on this trace.")
+
+    def _on_trace_selected(self, _event=None) -> None:
+        if self._is_eye_in_head_trace() and self._signal_mode() == self.SIGNAL_AZIMUTH:
+            self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
+        if self.pending_start_idx is not None or self.pending_fit is not None:
+            self._clear_pending(redraw=False)
+            self._set_status("Cleared pending segment after trace change.")
+        self._refit_all_segments()
+        self._update_signal_ylim()
+        self._redraw()
+        self._refresh_conservative_results()
+        self._refresh_net_disp_results()
+        trace = "eye-in-head" if self._is_eye_in_head_trace() else "screen gaze"
+        self._set_status(
+            f"Trace: {trace}. Segments refit on this trace."
+        )
+
+    def _update_trace_combo_state(self) -> None:
+        if not hasattr(self, "trace_frame"):
+            return
+        has_eih = self.trial is not None and self.trial.has_eye_in_head()
+        if has_eih:
+            if not self.trace_frame.winfo_ismapped():
+                self.trace_frame.pack(side=tk.LEFT, padx=(12, 0))
+            self.trace_combo.configure(state="readonly")
+        else:
+            self.trace_var.set(self._trace_label_map[self.TRACE_SCREEN])
+            self.trace_frame.pack_forget()
+            self.trace_combo.configure(state="disabled")
 
     def _on_eye_selected(self, _event=None) -> None:
         if self._eye_mode() != self.EYE_BINOCULAR:
@@ -2030,11 +2206,6 @@ class AnnotatorApp:
             text="← Eye seating",
             command=lambda: self.notebook.select(self.sensor_qc_tab),
         ).pack(side=tk.LEFT)
-        ttk.Button(
-            nav,
-            text="Eye-in-head →",
-            command=lambda: self.notebook.select(self.eye_in_head_tab),
-        ).pack(side=tk.LEFT, padx=(8, 0))
         self.heading_summary_var = tk.StringVar(
             value=(
                 "Load a Vive trial (gazeRotations.txt) or EyeLink .asc (HPOSE) "
@@ -2150,13 +2321,17 @@ class AnnotatorApp:
             return
 
         t = heading.times
+        roll = self._maybe_mask_blinks(heading.roll_deg.copy())
+        pitch = self._maybe_mask_blinks(heading.pitch_deg.copy())
+        yaw = self._maybe_mask_blinks(heading.yaw_deg.copy())
+        angle = self._maybe_mask_blinks(heading.angle_from_start_deg.copy())
         series = (
-            (self.heading_axes[0], heading.roll_deg, "Δ roll", "#e76f51"),
-            (self.heading_axes[1], heading.pitch_deg, "Δ pitch", "#2a9d8f"),
-            (self.heading_axes[2], heading.yaw_deg, "Δ yaw", "#457b9d"),
+            (self.heading_axes[0], roll, "Δ roll", "#e76f51"),
+            (self.heading_axes[1], pitch, "Δ pitch", "#2a9d8f"),
+            (self.heading_axes[2], yaw, "Δ yaw", "#457b9d"),
             (
                 self.heading_axes[3],
-                heading.angle_from_start_deg,
+                angle,
                 "|angle from start|",
                 "#6d597a",
             ),
@@ -2172,7 +2347,16 @@ class AnnotatorApp:
         self.heading_axes[0].set_title("Head pose change vs trial start")
         self.heading_canvas.draw_idle()
 
-        stats = summarize_heading_wiggle(heading)
+        masked_heading = HeadingTrace(
+            times=t,
+            roll_deg=roll,
+            pitch_deg=pitch,
+            yaw_deg=yaw,
+            angle_from_start_deg=angle,
+            source_rotations=heading.source_rotations,
+            source_time=heading.source_time,
+        )
+        stats = summarize_heading_wiggle(masked_heading)
         qc = self._heading_qc_note(stats)
 
         def _fmt(v: float) -> str:
@@ -2218,136 +2402,18 @@ class AnnotatorApp:
             if self.trial.source_format == "eyelink_asc"
             else "HMD heading"
         )
+        blink_note = ""
+        if self.trial.has_blink_intervals():
+            n_blinks = len(self.trial.blink_intervals_sec or [])
+            if self._mask_blinks_enabled():
+                blink_note = f" · blink-mask on ({n_blinks}, ±{self._blink_pad_sec() * 1000:.0f} ms)"
+            else:
+                blink_note = f" · blink-mask off ({n_blinks})"
         self.heading_summary_var.set(
             f"{self.trial.trial_id} · {source} · max |angle|={stats.max_angle_from_start:.2f}° · "
-            f"ptp yaw={stats.yaw_ptp:.2f}° · {qc}"
+            f"ptp yaw={stats.yaw_ptp:.2f}° · {qc}{blink_note}"
             if np.isfinite(stats.max_angle_from_start)
             else f"{self.trial.trial_id} · {qc}"
-        )
-
-    def _build_eye_in_head_tab(self) -> None:
-        top = self.eye_in_head_tab
-        top.columnconfigure(0, weight=1)
-        top.rowconfigure(2, weight=1)
-
-        nav = ttk.Frame(top)
-        nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
-        ttk.Button(
-            nav,
-            text="← Head pose",
-            command=lambda: self.notebook.select(self.heading_tab),
-        ).pack(side=tk.LEFT)
-        self.eye_in_head_summary_var = tk.StringVar(
-            value="Load an EyeLink .asc file to inspect eye-in-head elevation."
-        )
-        ttk.Label(
-            nav,
-            textvariable=self.eye_in_head_summary_var,
-            foreground="#333333",
-            wraplength=820,
-        ).pack(side=tk.LEFT, padx=(12, 0))
-
-        ttk.Label(
-            top,
-            text=(
-                "EyeLink 3 eye-in-head elevation: gaze on the virtual screen yoked to the head "
-                "(eye rotation only). Dashed lines show combined screen gaze elevation for comparison."
-            ),
-            foreground="#555555",
-            wraplength=1000,
-        ).grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
-
-        plot_frame = ttk.Frame(top)
-        plot_frame.grid(row=2, column=0, sticky=tk.NSEW)
-        plot_frame.columnconfigure(0, weight=1)
-        plot_frame.rowconfigure(0, weight=1)
-
-        self.eye_in_head_fig, self.eye_in_head_axes = plt.subplots(
-            2, 1, figsize=(9.5, 5.0), sharex=True, constrained_layout=True
-        )
-        self.eye_in_head_canvas = FigureCanvasTkAgg(
-            self.eye_in_head_fig, master=plot_frame
-        )
-        self.eye_in_head_canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
-        self._refresh_eye_in_head()
-
-    def _refresh_eye_in_head(self) -> None:
-        if not hasattr(self, "eye_in_head_axes"):
-            return
-        for ax in self.eye_in_head_axes:
-            ax.clear()
-
-        trial = self.trial
-        eih = None if trial is None else trial.eye_in_head
-        if eih is None:
-            for ax in self.eye_in_head_axes:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "No EyeLink eye-in-head data",
-                    transform=ax.transAxes,
-                    ha="center",
-                    va="center",
-                    color="#888888",
-                )
-            self.eye_in_head_axes[-1].set_xlabel("Time (s)")
-            self.eye_in_head_canvas.draw_idle()
-            if trial is None:
-                self.eye_in_head_summary_var.set(
-                    "Load an EyeLink .asc file to inspect eye-in-head elevation."
-                )
-            else:
-                self.eye_in_head_summary_var.set(
-                    f"{trial.trial_id} · eye-in-head not available for this gaze format"
-                )
-            return
-
-        t = eih.times
-        panels = (
-            (self.eye_in_head_axes[0], eih.elevation_left_deg, "Left eye-in-head", "#e76f51"),
-            (self.eye_in_head_axes[1], eih.elevation_right_deg, "Right eye-in-head", "#457b9d"),
-        )
-        gaze_panels = (
-            trial.elevation_left_deg,
-            trial.elevation_right_deg,
-        )
-        for ax, values, label, color in panels:
-            valid = np.isfinite(t) & np.isfinite(values)
-            if np.any(valid):
-                ax.plot(t[valid], values[valid], color=color, lw=0.9, label=label)
-            elif "Right" in label:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "Right eye not recorded",
-                    transform=ax.transAxes,
-                    ha="center",
-                    va="center",
-                    color="#888888",
-                )
-            gaze = gaze_panels[0] if "Left" in label else gaze_panels[1]
-            if gaze is not None:
-                gvalid = valid & np.isfinite(gaze)
-                if np.any(gvalid):
-                    ax.plot(
-                        t[gvalid],
-                        gaze[gvalid],
-                        color="#999999",
-                        lw=0.7,
-                        ls="--",
-                        alpha=0.85,
-                        label="Screen gaze",
-                    )
-            ax.axhline(0.0, color="#cccccc", lw=0.8)
-            ax.set_ylabel("Elevation (°)")
-            ax.legend(loc="upper right", fontsize=8)
-            ax.grid(True, alpha=0.25)
-        self.eye_in_head_axes[0].set_title("Eye-in-head vs screen gaze elevation")
-        self.eye_in_head_axes[-1].set_xlabel("Time (s)")
-        self.eye_in_head_canvas.draw_idle()
-        assert trial is not None
-        self.eye_in_head_summary_var.set(
-            f"{trial.trial_id} · EyeLink eye-in-head elevation (solid) vs screen gaze (dashed)"
         )
 
     def _build_annotate_tab(self) -> None:
@@ -2375,6 +2441,25 @@ class AnnotatorApp:
             textvariable=self.annotate_summary_var,
             foreground="#333333",
         ).pack(side=tk.LEFT, padx=(0, 12))
+
+        self.trace_frame = ttk.Frame(nav_row)
+        self.trace_var = tk.StringVar(value=self.TRACE_CHOICES[0][0])
+        ttk.Label(self.trace_frame, text="Trace:").pack(side=tk.LEFT)
+        self.trace_combo = ttk.Combobox(
+            self.trace_frame,
+            textvariable=self.trace_var,
+            values=[label for label, _ in self.TRACE_CHOICES],
+            state="disabled",
+            width=14,
+        )
+        self.trace_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self.trace_combo.bind("<<ComboboxSelected>>", self._on_trace_selected)
+        _bind_tooltip(
+            self.trace_combo,
+            "EyeLink only: switch between screen gaze and eye-in-head elevation.\n"
+            "Segments refit on the selected trace.",
+        )
+
         ttk.Button(nav_row, text="Help", command=self._show_help).pack(
             side=tk.RIGHT, padx=4
         )
@@ -2778,6 +2863,15 @@ class AnnotatorApp:
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        self.hover_var = tk.StringVar(value="")
+        ttk.Label(
+            self.plot_frame,
+            textvariable=self.hover_var,
+            padding=(0, 4),
+            foreground="gray",
+            anchor=tk.W,
+        ).pack(side=tk.BOTTOM, fill=tk.X)
+
         self.condition_var = tk.StringVar(value="")
         ttk.Label(
             self.plot_frame,
@@ -2788,14 +2882,32 @@ class AnnotatorApp:
             wraplength=900,
         ).pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.hover_var = tk.StringVar(value="")
-        ttk.Label(
-            self.plot_frame,
-            textvariable=self.hover_var,
-            padding=(0, 4),
-            foreground="gray",
-            anchor=tk.W,
-        ).pack(side=tk.BOTTOM, fill=tk.X)
+        self.blink_controls = ttk.Frame(self.plot_frame, padding=(0, 4))
+        self.mask_blinks_chk = ttk.Checkbutton(
+            self.blink_controls,
+            text="Mask blinks",
+            variable=self.mask_blinks_var,
+            command=self._on_mask_blinks_toggled,
+        )
+        self.mask_blinks_chk.pack(side=tk.LEFT)
+        ttk.Label(self.blink_controls, text="Pad (ms):").pack(side=tk.LEFT, padx=(12, 4))
+        self.blink_pad_entry = ttk.Entry(
+            self.blink_controls,
+            textvariable=self.blink_pad_ms_var,
+            width=6,
+        )
+        self.blink_pad_entry.pack(side=tk.LEFT)
+        self.blink_pad_entry.bind("<Return>", self._on_blink_pad_changed)
+        self.blink_pad_entry.bind("<FocusOut>", self._on_blink_pad_changed)
+        _bind_tooltip(
+            self.mask_blinks_chk,
+            "EyeLink only: hide gaze and HPOSE samples during SBLINK/EBLINK intervals.",
+        )
+        _bind_tooltip(
+            self.blink_pad_entry,
+            "Extra time masked before/after each blink interval (milliseconds).\n"
+            "Also applies to the Head pose tab.",
+        )
 
         self.canvas.mpl_connect("button_press_event", self._on_click)
 
@@ -3772,6 +3884,7 @@ class AnnotatorApp:
             software_version=__version__,
             signal_mode=self._signal_mode(),
             eye_mode=self._eye_mode(),
+            trace_mode=self._trace_mode(),
         )
         n = len(self.segments)
         messagebox.showinfo("Segments saved", f"Saved {n} segment(s) to:\n{path}")
@@ -3898,6 +4011,22 @@ class AnnotatorApp:
             self.signal_var.set(self._signal_label_map[signal_mode])
         else:
             self.signal_var.set(self._signal_label_map[self.SIGNAL_ELEVATION])
+        trace_mode = data.get("trace_mode", self.TRACE_SCREEN)
+        if (
+            isinstance(trace_mode, str)
+            and trace_mode in self._trace_label_map
+            and (
+                trace_mode == self.TRACE_SCREEN
+                or (
+                    self.trial is not None
+                    and self.trial.has_eye_in_head()
+                )
+            )
+        ):
+            self.trace_var.set(self._trace_label_map[trace_mode])
+        else:
+            self.trace_var.set(self._trace_label_map[self.TRACE_SCREEN])
+        self._update_trace_combo_state()
         # Restore eye mode for Tobii per-eye traces.
         eye_mode = data.get("eye_mode")
         if (
@@ -4089,7 +4218,9 @@ class AnnotatorApp:
             self._refresh_net_disp_results()
             self._refresh_sensor_qc()
             self._refresh_heading_wiggle()
-            self._refresh_eye_in_head()
+            self._update_trace_combo_state()
+            self._update_blink_mask_controls()
+            self._update_eye_combo_state()
             self._update_files_label()
             self._redraw()
             duration = t1 - t0
@@ -4120,8 +4251,11 @@ class AnnotatorApp:
                     else "heading/wiggle"
                 )
                 status += f"; {source} loaded"
+            if self.trial.has_blink_intervals():
+                n_blinks = len(self.trial.blink_intervals_sec or [])
+                status += f"; {n_blinks} blink interval(s) — Mask blinks below plot"
             if self.trial.has_eye_in_head():
-                status += "; eye-in-head loaded"
+                status += "; eye-in-head (Trace dropdown on Annotate)"
             if self.okr_log is not None:
                 status += (
                     f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
@@ -4289,6 +4423,9 @@ class AnnotatorApp:
             return np.array([], dtype=bool)
         return self._analysis_mask() & ~np.isnan(self._active_values())
 
+    def _valid_plot_mask(self) -> np.ndarray:
+        return self._valid_click_mask()
+
     def _update_signal_ylim(self) -> None:
         """Compute full-trial signal range, then apply the selected Y span."""
         if self.trial is None:
@@ -4297,11 +4434,11 @@ class AnnotatorApp:
             self.view_ycenter = None
             return
         valid = self._valid_click_mask()
+        values = self._active_values()
         if not np.any(valid):
             self.signal_ylim_full = None
             self.signal_ylim = None
             return
-        values = self._active_values()
         pad = 0.5
         ymin = float(np.nanmin(values[valid])) - pad
         ymax = float(np.nanmax(values[valid])) + pad
@@ -4331,11 +4468,7 @@ class AnnotatorApp:
         vx1 = self.view_xmax if self.view_xmax is not None else self.analysis_t1
         times = self._active_times()
         values = self._active_values()
-        mask = (
-            self._valid_click_mask()
-            & (times >= vx0)
-            & (times <= vx1)
-        )
+        mask = self._valid_click_mask() & (times >= vx0) & (times <= vx1)
         if np.any(mask):
             lo = float(np.nanmin(values[mask]))
             hi = float(np.nanmax(values[mask]))

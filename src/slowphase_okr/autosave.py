@@ -60,6 +60,7 @@ def save_autosave(
     software_version: str,
     signal_mode: str = "elevation",
     eye_mode: str = "binocular",
+    trace_mode: str = "screen",
 ) -> Path:
     """Write annotation state to JSON."""
     path = Path(path)
@@ -70,6 +71,7 @@ def save_autosave(
         "stimulus_velocity": stimulus_velocity,
         "signal_mode": signal_mode,
         "eye_mode": eye_mode,
+        "trace_mode": trace_mode,
         "software_version": software_version,
         "segments": [segment_to_dict(s) for s in segments],
     }
