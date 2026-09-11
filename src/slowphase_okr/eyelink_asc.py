@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -24,6 +26,85 @@ _VALIDATE_RE = re.compile(
 _DISPLAY_COORDS_RE = re.compile(
     r"(?:DISPLAY_COORDS|GAZE_COORDS)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)"
 )
+
+# Optional load-time decimation. Annotator keeps native rate by default and only
+# thins what is drawn, so marking/fitting stay on full-resolution samples.
+DEFAULT_EYELINK_TARGET_HZ = 0.0
+
+# Typical 27" 16:9 lab monitor at ~1 m (matches Bassoon getPixPerDeg geometry).
+DEFAULT_MONITOR_WIDTH_CM = 60.0
+DEFAULT_MONITOR_HEIGHT_CM = 33.5
+DEFAULT_VIEWING_DISTANCE_CM = 100.0
+
+DegreeScaleMode = Literal["geometry", "validation"]
+
+
+@dataclass(frozen=True)
+class MonitorGeometry:
+    """Physical display size and eye-to-screen distance for px → deg."""
+
+    width_cm: float
+    height_cm: float
+    distance_cm: float
+    width_px: float | None = None
+    height_px: float | None = None
+
+
+def display_size_px(
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+) -> tuple[float, float]:
+    """Pixel width/height from EyeLink DISPLAY_COORDS (inclusive extremes)."""
+    width = abs(right - left)
+    height = abs(bottom - top)
+    # e.g. 0 0 1919 1079 → 1920 × 1080
+    if abs(width - round(width)) < 1e-6 and abs(height - round(height)) < 1e-6:
+        width = float(round(width) + 1)
+        height = float(round(height) + 1)
+    return max(width, 1.0), max(height, 1.0)
+
+
+def px_per_deg_from_geometry(
+    *,
+    width_cm: float,
+    height_cm: float,
+    distance_cm: float,
+    width_px: float,
+    height_px: float,
+) -> tuple[float, float]:
+    """Pixels per degree from monitor size and viewing distance (Bassoon-style)."""
+    if width_cm <= 0 or height_cm <= 0 or distance_cm <= 0:
+        raise ValueError("Monitor width, height, and viewing distance must be > 0.")
+    if width_px <= 0 or height_px <= 0:
+        raise ValueError("Display resolution (pixels) must be > 0.")
+    half_w = math.degrees(math.atan((width_cm / 2.0) / distance_cm))
+    half_h = math.degrees(math.atan((height_cm / 2.0) / distance_cm))
+    total_w = 2.0 * half_w
+    total_h = 2.0 * half_h
+    if total_w <= 0 or total_h <= 0:
+        raise ValueError("Computed visual angle must be > 0.")
+    return width_px / total_w, height_px / total_h
+
+
+def _decimate_stride(times: np.ndarray, target_hz: float) -> int:
+    """Return stride so samples are about ``target_hz`` (1 = no change)."""
+    if target_hz <= 0 or len(times) < 3:
+        return 1
+    dt = float(np.median(np.diff(times)))
+    if not np.isfinite(dt) or dt <= 0:
+        return 1
+    native_hz = 1.0 / dt
+    if native_hz <= target_hz * 1.2:
+        return 1
+    return max(1, int(round(native_hz / target_hz)))
+
+
+def _decimate(arr: np.ndarray | None, stride: int) -> np.ndarray | None:
+    if arr is None or stride <= 1:
+        return arr
+    return arr[::stride]
 
 
 @dataclass(frozen=True)
@@ -112,6 +193,25 @@ def is_eyelink_asc(path: str | Path) -> bool:
     return False
 
 
+def peek_display_size_px(path: str | Path) -> tuple[float, float] | None:
+    """Return (width_px, height_px) from the first DISPLAY_COORDS in an ASC."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _ in range(400):
+                line = handle.readline()
+                if not line:
+                    break
+                m = _DISPLAY_COORDS_RE.search(line)
+                if m:
+                    left, top, right, bottom = (float(m.group(i)) for i in range(1, 5))
+                    return display_size_px(left, top, right, bottom)
+    except OSError:
+        return None
+    return None
+
 def _parse_float_token(token: str) -> float | None:
     token = token.strip()
     if not token or token == "." or set(token) <= {"."}:
@@ -131,7 +231,12 @@ def _parse_sample_floats(parts: list[str]) -> list[float | None]:
     return floats
 
 
-def _parse_meta(lines: list[str]) -> _AscMeta:
+def _parse_meta(
+    lines: list[str],
+    *,
+    degree_scale: DegreeScaleMode = "geometry",
+    geometry: MonitorGeometry | None = None,
+) -> _AscMeta:
     left = top = 0.0
     right = bottom = 1919.0
     px_x: list[float] = []
@@ -180,8 +285,28 @@ def _parse_meta(lines: list[str]) -> _AscMeta:
 
     center_x = 0.5 * (left + right)
     center_y = 0.5 * (top + bottom)
-    px_per_deg_x = float(np.median(px_x)) if px_x else 40.0
-    px_per_deg_y = float(np.median(px_y)) if px_y else 40.0
+    width_px, height_px = display_size_px(left, top, right, bottom)
+
+    if degree_scale == "geometry":
+        geom = geometry or MonitorGeometry(
+            width_cm=DEFAULT_MONITOR_WIDTH_CM,
+            height_cm=DEFAULT_MONITOR_HEIGHT_CM,
+            distance_cm=DEFAULT_VIEWING_DISTANCE_CM,
+        )
+        use_w = float(geom.width_px) if geom.width_px is not None else width_px
+        use_h = float(geom.height_px) if geom.height_px is not None else height_px
+        px_per_deg_x, px_per_deg_y = px_per_deg_from_geometry(
+            width_cm=geom.width_cm,
+            height_cm=geom.height_cm,
+            distance_cm=geom.distance_cm,
+            width_px=use_w,
+            height_px=use_h,
+        )
+    else:
+        # Legacy: median |pix|/deg from VALIDATE lines (fallback 40).
+        px_per_deg_x = float(np.median(px_x)) if px_x else 40.0
+        px_per_deg_y = float(np.median(px_y)) if px_y else 40.0
+
     return _AscMeta(
         display_left=left,
         display_top=top,
@@ -258,31 +383,71 @@ def _nan_array_like(rows: list[tuple[int, list[float | None]]]) -> np.ndarray:
 def load_eyelink_asc_trial(
     gaze_path: str | Path,
     trial_id: str = "",
+    *,
+    target_hz: float = DEFAULT_EYELINK_TARGET_HZ,
+    degree_scale: DegreeScaleMode = "geometry",
+    monitor_geometry: MonitorGeometry | None = None,
 ) -> GazeTrial:
-    """Load EyeLink ASC samples (binocular or monocular) as elevation/azimuth deg."""
+    """Load EyeLink ASC samples (binocular or monocular) as elevation/azimuth deg.
+
+    Loads every ``START``/``END`` sample block in the file (Bassoon/EyeLink runs
+    often write a short pre-experiment block, then the full recording). Trial
+    markers such as ``SYNCTIME`` / ``TRIAL_RESULT`` are parsed for metadata but
+    do not trim the loaded trace — the whole session is kept.
+
+    Screen pixels are converted to degrees with monitor geometry by default
+    (width/height cm + viewing distance; resolution from ``DISPLAY_COORDS``).
+    Pass ``degree_scale="validation"`` for the legacy VALIDATE-derived scale.
+
+    Samples are kept at the tracker rate by default (``target_hz=0``). Pass a
+    positive ``target_hz`` (e.g. 100) only if you want load-time decimation.
+    The annotator thins the *display* separately so the UI stays responsive.
+    """
     gaze_path = Path(gaze_path)
     if not gaze_path.is_file():
         raise FileNotFoundError(gaze_path)
 
     text = gaze_path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    meta = _parse_meta(lines)
+    meta = _parse_meta(
+        lines,
+        degree_scale=degree_scale,
+        geometry=monitor_geometry,
+    )
     cols = meta.column_map
 
     in_samples = False
+    keep_every = 1
+    sample_i = 0
     raw_rows: list[tuple[int, list[float | None]]] = []
     for line in lines:
         if line.startswith("SAMPLES\t"):
             in_samples = True
+            sample_i = 0
+            keep_every = 1
+            if target_hz > 0:
+                tokens = [t.strip().upper() for t in line.split("\t")]
+                try:
+                    rate_idx = tokens.index("RATE")
+                    rate = float(tokens[rate_idx + 1])
+                    if rate > target_hz * 1.2:
+                        keep_every = max(1, int(round(rate / target_hz)))
+                except (ValueError, IndexError):
+                    keep_every = 1
             continue
         if line.startswith("END\t"):
-            break
+            # Bassoon ASC files can contain multiple recording blocks; keep going.
+            in_samples = False
+            continue
         if not in_samples:
             continue
         if not line or line[0].isalpha():
             continue
         parts = line.rstrip("\n").split("\t")
         if not parts[0].strip().isdigit():
+            continue
+        sample_i += 1
+        if keep_every > 1 and (sample_i % keep_every) != 1:
             continue
         ts = int(parts[0])
         floats = _parse_sample_floats(parts)
@@ -293,20 +458,9 @@ def load_eyelink_asc_trial(
     if not raw_rows:
         raise ValueError(f"No gaze samples found in {gaze_path.name}")
 
-    t_start = meta.trim_start_ms
-    t_end = meta.trim_end_ms
-    if t_start is not None:
-        raw_rows = [(t, f) for t, f in raw_rows if t >= t_start]
-    if t_end is not None:
-        raw_rows = [(t, f) for t, f in raw_rows if t <= t_end]
-    if not raw_rows:
-        raise ValueError(
-            f"No gaze samples remain after trial trim in {gaze_path.name} "
-            f"(SYNCTIME={t_start}, TRIAL_RESULT={t_end})."
-        )
-
     t0_ms = raw_rows[0][0]
     times = np.array([(t - t0_ms) / 1000.0 for t, _ in raw_rows], dtype=float)
+    t_end = meta.trim_end_ms
 
     lx = _col(raw_rows, cols.gaze_lx)
     ly = _col(raw_rows, cols.gaze_ly)
@@ -369,6 +523,7 @@ def load_eyelink_asc_trial(
             _col(raw_rows, cols.hpose_yaw),
         )
 
+    eih_elev_l = eih_elev_r = eih_elev_b = None
     if cols.eih_ly is not None and n_cols > cols.eih_ly:
         eih_ly = _col(raw_rows, cols.eih_ly)
         bad_l = ~np.isfinite(eih_ly) | (eih_ly < y_min) | (eih_ly > y_max)
@@ -385,6 +540,30 @@ def load_eyelink_asc_trial(
         else:
             eih_elev_r = _nan_array_like(raw_rows)
             eih_elev_b = eih_elev_l.copy()
+
+    stride = _decimate_stride(times, target_hz)
+    # Keep short / unit-test traces at native rate; only thin long sessions.
+    if len(times) < 50_000:
+        stride = 1
+    if stride > 1:
+        times = times[::stride]
+        elev_b = elev_b[::stride]
+        az_b = az_b[::stride]
+        elev_l = elev_l[::stride]
+        az_l = az_l[::stride]
+        if cols.binocular:
+            elev_r = elev_r[::stride]
+            az_r = az_r[::stride]
+        if roll is not None and pitch is not None and yaw is not None:
+            roll = roll[::stride]
+            pitch = pitch[::stride]
+            yaw = yaw[::stride]
+        if eih_elev_l is not None:
+            eih_elev_l = eih_elev_l[::stride]
+            eih_elev_r = eih_elev_r[::stride]  # type: ignore[index]
+            eih_elev_b = eih_elev_b[::stride]  # type: ignore[index]
+
+    if eih_elev_l is not None and eih_elev_r is not None and eih_elev_b is not None:
         eye_in_head = EyeInHeadTrace(
             times=times,
             elevation_left_deg=eih_elev_l.astype(float),

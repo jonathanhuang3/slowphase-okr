@@ -37,7 +37,12 @@ from slowphase_okr.net_displacement import (
     net_disp_contrast_plot_x_label,
     sort_net_displacements_for_contrast_plot,
 )
-from slowphase_okr.prefs import get_annotations_dir, set_annotations_dir
+from slowphase_okr.prefs import (
+    get_annotations_dir,
+    get_monitor_geometry_prefs,
+    set_annotations_dir,
+    set_monitor_geometry_prefs,
+)
 from slowphase_okr.detect import DetectParams, detect_slow_phases
 from slowphase_okr.export import export_to_excel
 from slowphase_okr.fit import (
@@ -49,7 +54,12 @@ from slowphase_okr.fit import (
     summarize_gains_by_block,
     trial_summary_gain,
 )
-from slowphase_okr.eyelink_asc import is_eyelink_asc
+from slowphase_okr.eyelink_asc import (
+    MonitorGeometry,
+    is_eyelink_asc,
+    peek_display_size_px,
+    px_per_deg_from_geometry,
+)
 from slowphase_okr.gaze import (
     GazeOriginTrace,
     GazeTrial,
@@ -122,6 +132,8 @@ Notes
   • R² and RMSE (deg) are logged and exported but segments are not auto-rejected.
     Low RMSE means the slow phase stays close to a straight line.
   • On Load trial: choose a personal annotations folder (not shared Box data), then files + velocity.
+    For EyeLink ASC, set monitor width/height (cm) and viewing distance (cm) so pixels map to
+    degrees for slopes/gains (same geometry idea as Bassoon). Validation remains QC only.
     Press Save segments to write JSON; use Load markings… to reopen a prior file.
   • If that JSON name already exists, you will be asked whether to overwrite or save under a new name.
   • Trial ID is set from the gaze file’s parent folder name.
@@ -286,6 +298,10 @@ class AnnotatorApp:
     )
 
     DEFAULT_VIEW_DURATION = 2.0
+    # Cap drawn samples so EyeLink 1000 Hz full-session traces stay responsive.
+    # Full-resolution data is kept for click-snapping / fits; only the plot is thinned.
+    MAX_DISPLAY_POINTS = 8000
+    MAX_HEADING_DISPLAY_POINTS = 6000
     VIEW_PRESET_LABELS = ("1 s", "2 s", "5 s", "10 s", "Full trial")
     VIEW_PRESET_SECONDS = {
         "1 s": 1.0,
@@ -330,6 +346,9 @@ class AnnotatorApp:
         self._hover_boundary: str | None = None
         self._hover_proposed_key: tuple[str, int] | None = None
         self._applied_stimulus_velocity: float = float("nan")
+        self._plot_values_cache: np.ndarray | None = None
+        self._plot_values_cache_key: tuple | None = None
+        self._redraw_job: str | None = None
 
         self.analysis_t0: float = 0.0
         self.analysis_t1: float = 0.0
@@ -522,6 +541,7 @@ class AnnotatorApp:
         )
 
     def _on_mask_blinks_toggled(self) -> None:
+        self._invalidate_plot_cache()
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
             self._set_status("Cleared pending segment after blink-mask change.")
@@ -573,6 +593,31 @@ class AnnotatorApp:
         else:
             frame.pack_forget()
 
+    def _invalidate_plot_cache(self) -> None:
+        self._plot_values_cache = None
+        self._plot_values_cache_key = None
+
+    def _plot_cache_key(self) -> tuple | None:
+        if self.trial is None:
+            return None
+        zero = bool(
+            getattr(self, "zero_elevation_var", None)
+            and self.zero_elevation_var.get()
+        )
+        blink = bool(
+            getattr(self, "mask_blinks_var", None) and self.mask_blinks_var.get()
+        )
+        pad = self._blink_pad_sec() if blink else 0.0
+        return (
+            id(self.trial),
+            self._trace_mode(),
+            self._signal_mode(),
+            self._eye_mode(),
+            blink,
+            round(pad, 4),
+            zero,
+        )
+
     def _plot_raw_values(self) -> np.ndarray:
         if self._is_eye_in_head_trace():
             if self.trial is None or not self.trial.has_eye_in_head():
@@ -581,7 +626,48 @@ class AnnotatorApp:
         return self._raw_signal_values()
 
     def _active_values(self) -> np.ndarray:
-        return self._plot_raw_values() - self._plot_zero_offset()
+        key = self._plot_cache_key()
+        if (
+            key is not None
+            and key == self._plot_values_cache_key
+            and self._plot_values_cache is not None
+        ):
+            return self._plot_values_cache
+        raw = self._plot_raw_values()
+        offset = 0.0
+        if (
+            getattr(self, "zero_elevation_var", None)
+            and self.zero_elevation_var.get()
+            and raw.size
+        ):
+            finite = raw[np.isfinite(raw)]
+            if finite.size:
+                offset = float(finite[0])
+        values = raw - offset if offset else raw
+        if key is not None:
+            self._plot_values_cache = values
+            self._plot_values_cache_key = key
+        return values
+
+    def _request_redraw(self, *, immediate: bool = False) -> None:
+        """Coalesce hover-driven redraws; use immediate=True after edits."""
+        if immediate:
+            job = getattr(self, "_redraw_job", None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+                self._redraw_job = None
+            self._redraw()
+            return
+        if getattr(self, "_redraw_job", None) is not None:
+            return
+        self._redraw_job = self.root.after(20, self._flush_redraw)
+
+    def _flush_redraw(self) -> None:
+        self._redraw_job = None
+        self._redraw()
 
     def _plot_zero_offset(self) -> float:
         if not getattr(self, "zero_elevation_var", None) or not self.zero_elevation_var.get():
@@ -662,6 +748,7 @@ class AnnotatorApp:
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
             self._set_status("Cleared pending segment after signal change.")
+        self._invalidate_plot_cache()
         self._refit_all_segments()
         self._update_signal_ylim()
         self._redraw()
@@ -676,6 +763,7 @@ class AnnotatorApp:
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
             self._set_status("Cleared pending segment after trace change.")
+        self._invalidate_plot_cache()
         self._refit_all_segments()
         self._update_signal_ylim()
         self._redraw()
@@ -735,6 +823,7 @@ class AnnotatorApp:
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
             self._set_status("Cleared pending segment after eye change.")
+        self._invalidate_plot_cache()
         self._refit_all_segments()
         self._update_signal_ylim()
         self._redraw()
@@ -761,6 +850,7 @@ class AnnotatorApp:
             self.eye_combo.configure(state="disabled")
 
     def _on_zero_elevation_toggled(self) -> None:
+        self._invalidate_plot_cache()
         if self.pending_start_idx is not None or self.pending_fit is not None:
             self._clear_pending(redraw=False)
         self._refit_all_segments()
@@ -950,11 +1040,69 @@ class AnnotatorApp:
         )
         self.trial_id_var.trace_add("write", self._on_trial_id_changed)
 
-        # ── 3. Stimulus velocity ─────────────────────────────────────
-        step3 = ttk.LabelFrame(top, text="3. Stimulus velocity", padding=8)
+        # ── 3. EyeLink degree scale ──────────────────────────────────
+        step3 = ttk.LabelFrame(
+            top,
+            text="3. EyeLink degree scale (monitor geometry)",
+            padding=8,
+        )
         step3.grid(row=3, column=0, sticky=tk.EW, pady=(0, 8))
 
-        vel_row = ttk.Frame(step3)
+        geom = get_monitor_geometry_prefs()
+        geom_row = ttk.Frame(step3)
+        geom_row.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(geom_row, text="Width (cm):").pack(side=tk.LEFT)
+        self.monitor_width_var = tk.StringVar(value=f"{geom['width_cm']:g}")
+        self.monitor_width_entry = ttk.Entry(
+            geom_row, textvariable=self.monitor_width_var, width=8
+        )
+        self.monitor_width_entry.pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(geom_row, text="Height (cm):").pack(side=tk.LEFT)
+        self.monitor_height_var = tk.StringVar(value=f"{geom['height_cm']:g}")
+        self.monitor_height_entry = ttk.Entry(
+            geom_row, textvariable=self.monitor_height_var, width=8
+        )
+        self.monitor_height_entry.pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(geom_row, text="Viewing distance (cm):").pack(side=tk.LEFT)
+        self.viewing_distance_var = tk.StringVar(value=f"{geom['distance_cm']:g}")
+        self.viewing_distance_entry = ttk.Entry(
+            geom_row, textvariable=self.viewing_distance_var, width=8
+        )
+        self.viewing_distance_entry.pack(side=tk.LEFT, padx=(4, 12))
+
+        self.eyelink_scale_var = tk.StringVar(value="")
+        ttk.Label(
+            geom_row,
+            textvariable=self.eyelink_scale_var,
+            foreground="#333333",
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        for var in (
+            self.monitor_width_var,
+            self.monitor_height_var,
+            self.viewing_distance_var,
+        ):
+            var.trace_add("write", self._on_monitor_geometry_edited)
+
+        ttk.Label(
+            step3,
+            text="Used when loading EyeLink .asc (ignored for Vive/Tobii). "
+            "Converts screen-pixel gaze to degrees for slopes and gain. "
+            "Calibration/validation still QC tracking accuracy; they do not set this scale. "
+            "Typical 27″ ≈ 60 × 33.5 cm; measure your screen and eye-to-screen distance.",
+            foreground="#666666",
+            wraplength=900,
+        ).pack(side=tk.TOP, anchor=tk.W, pady=(6, 0))
+        self._update_eyelink_scale_label()
+
+        # ── 4. Stimulus velocity ─────────────────────────────────────
+        step4 = ttk.LabelFrame(top, text="4. Stimulus velocity", padding=8)
+        step4.grid(row=4, column=0, sticky=tk.EW, pady=(0, 8))
+
+        vel_row = ttk.Frame(step4)
         vel_row.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(vel_row, text="Speed (deg/s):").pack(side=tk.LEFT)
         self.stim_vel_var = tk.StringVar(value="")
@@ -975,32 +1123,32 @@ class AnnotatorApp:
         self._applied_stimulus_velocity = float("nan")
 
         ttk.Label(
-            step3,
+            step4,
             text="Enter this trial’s stimulus speed (e.g. 10, 20, or 30). "
-            "Gain = slope ÷ velocity.",
+            "Gain = slope ÷ velocity. Use the same degree convention as Bassoon’s monitor.",
             foreground="#666666",
             wraplength=900,
         ).pack(side=tk.TOP, anchor=tk.W, pady=(6, 0))
 
-        # ── 4. Optional OKR log ──────────────────────────────────────
-        step4 = ttk.LabelFrame(
-            top, text="4. OKR log (optional — block / fixation markers)", padding=8
+        # ── 5. Optional OKR log ──────────────────────────────────────
+        step5 = ttk.LabelFrame(
+            top, text="5. OKR log (optional — block / fixation markers)", padding=8
         )
-        step4.grid(row=4, column=0, sticky=tk.EW, pady=(0, 8))
-        step4.columnconfigure(1, weight=1)
+        step5.grid(row=5, column=0, sticky=tk.EW, pady=(0, 8))
+        step5.columnconfigure(1, weight=1)
 
-        ttk.Button(step4, text="OKR log…", command=self._browse_okr_log).grid(
+        ttk.Button(step5, text="OKR log…", command=self._browse_okr_log).grid(
             row=0, column=0, sticky=tk.W, padx=(0, 10)
         )
-        self.okr_log_file_label = ttk.Label(step4, text="None (optional)")
+        self.okr_log_file_label = ttk.Label(step5, text="None (optional)")
         self.okr_log_file_label.grid(row=0, column=1, sticky=tk.W)
-        ttk.Button(step4, text="Clear OKR log", command=self._clear_okr_log).grid(
+        ttk.Button(step5, text="Clear OKR log", command=self._clear_okr_log).grid(
             row=0, column=2, sticky=tk.E, padx=(10, 0)
         )
 
         # ── Load ─────────────────────────────────────────────────────
         load_row = ttk.Frame(top)
-        load_row.grid(row=5, column=0, sticky=tk.EW, pady=(4, 12))
+        load_row.grid(row=6, column=0, sticky=tk.EW, pady=(4, 12))
         ttk.Button(
             load_row,
             text="Load trial",
@@ -1016,7 +1164,7 @@ class AnnotatorApp:
         reopen = ttk.LabelFrame(
             top, text="Already annotated this trial?", padding=8
         )
-        reopen.grid(row=6, column=0, sticky=tk.EW)
+        reopen.grid(row=7, column=0, sticky=tk.EW)
         ttk.Button(
             reopen,
             text="Load markings…",
@@ -1029,7 +1177,6 @@ class AnnotatorApp:
             foreground="#666666",
             wraplength=780,
         ).pack(side=tk.LEFT, padx=(12, 0))
-
     def _build_conservative_tab(self) -> None:
         top = self.conservative_tab
         top.columnconfigure(0, weight=1)
@@ -1801,6 +1948,22 @@ class AnnotatorApp:
         step = max(1, int(np.ceil(n / max_points)))
         return np.arange(0, n, step)
 
+    def _thin_xy_for_display(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        *,
+        max_points: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Uniformly thin plotted points; analysis arrays stay full length."""
+        if max_points is None:
+            max_points = self.MAX_DISPLAY_POINTS
+        n = len(x)
+        if n <= max_points:
+            return x, y
+        idx = self._subsample_indices(n, max_points)
+        return x[idx], y[idx]
+
     @staticmethod
     def _origin_qc_note(delta_y: float, delta_z: float, ipd_mm: float) -> str:
         if not (
@@ -2339,7 +2502,12 @@ class AnnotatorApp:
         for ax, values, label, color in series:
             valid = np.isfinite(t) & np.isfinite(values)
             if np.any(valid):
-                ax.plot(t[valid], values[valid], color=color, lw=0.9)
+                t_vis, v_vis = self._thin_xy_for_display(
+                    t[valid],
+                    values[valid],
+                    max_points=self.MAX_HEADING_DISPLAY_POINTS,
+                )
+                ax.plot(t_vis, v_vis, color=color, lw=0.9)
             ax.axhline(0.0, color="#cccccc", lw=0.8)
             ax.set_ylabel(f"{label} (°)")
             ax.grid(True, alpha=0.25)
@@ -2971,6 +3139,16 @@ class AnnotatorApp:
 
         times = np.asarray(self._active_times(), dtype=float)
         values = np.asarray(self._active_values(), dtype=float)
+        # Only differentiate the visible window (full-session diffs are too costly).
+        in_view = np.flatnonzero((times >= vx0) & (times <= vx1))
+        if in_view.size < 2:
+            ax.set_ylabel("Velocity\n(deg/s)")
+            ax.set_xlim(vx0, vx1)
+            return
+        i0 = max(0, int(in_view[0]) - 1)
+        i1 = int(in_view[-1])
+        times = times[i0 : i1 + 1]
+        values = values[i0 : i1 + 1]
         dt = np.diff(times)
         with np.errstate(divide="ignore", invalid="ignore"):
             velocity = np.diff(values) / dt
@@ -3008,36 +3186,46 @@ class AnnotatorApp:
             alpha=0.8,
             zorder=0,
         )
-        velocity_line = velocity.copy()
-        velocity_line[~visible] = np.nan
-        ax.plot(
-            velocity_times,
-            velocity_line,
-            color="0.55",
-            linewidth=0.6,
-            alpha=0.65,
-            zorder=1,
-        )
-        ax.plot(
-            velocity_times[slow],
-            velocity[slow],
-            linestyle="none",
-            marker=".",
-            markersize=3,
-            color="#355c7d",
-            label="Within threshold",
-            zorder=2,
-        )
-        ax.plot(
-            velocity_times[saccade],
-            velocity[saccade],
-            linestyle="none",
-            marker=".",
-            markersize=5,
-            color="#d32f2f",
-            label="Beyond threshold",
-            zorder=3,
-        )
+        if np.any(visible):
+            line_t, line_v = self._thin_xy_for_display(
+                velocity_times[visible], velocity[visible]
+            )
+            ax.plot(
+                line_t,
+                line_v,
+                color="0.55",
+                linewidth=0.6,
+                alpha=0.65,
+                zorder=1,
+            )
+        if np.any(slow):
+            t_slow, v_slow = self._thin_xy_for_display(
+                velocity_times[slow], velocity[slow]
+            )
+            ax.plot(
+                t_slow,
+                v_slow,
+                linestyle="none",
+                marker=".",
+                markersize=3,
+                color="#355c7d",
+                label="Within threshold",
+                zorder=2,
+            )
+        if np.any(saccade):
+            t_sac, v_sac = self._thin_xy_for_display(
+                velocity_times[saccade], velocity[saccade]
+            )
+            ax.plot(
+                t_sac,
+                v_sac,
+                linestyle="none",
+                marker=".",
+                markersize=5,
+                color="#d32f2f",
+                label="Beyond threshold",
+                zorder=3,
+            )
         ax.set_ylabel("Velocity\n(deg/s)")
         ax.set_xlim(vx0, vx1)
         ax.text(
@@ -3269,13 +3457,13 @@ class AnnotatorApp:
         if boundary == self._hover_boundary:
             return
         self._hover_boundary = boundary
-        self._redraw()
+        self._request_redraw(immediate=False)
 
     def _set_proposed_hover(self, key: tuple[str, int] | None) -> None:
         if key == self._hover_proposed_key:
             return
         self._hover_proposed_key = key
-        self._redraw()
+        self._request_redraw(immediate=False)
 
     def _proposed_at_time(self, t: float) -> SegmentFit | None:
         matches = [
@@ -3549,6 +3737,7 @@ class AnnotatorApp:
             if self._gaze_embeds_timestamps():
                 self.time_path = self.gaze_path
             self._update_files_label()
+            self._update_eyelink_scale_label()
             self.trial_id_var.set(markings_id_from_gaze_path(self.gaze_path))
 
     def _browse_time(self) -> None:
@@ -3723,6 +3912,60 @@ class AnnotatorApp:
                 f"Press Enter to apply ({vel:g} deg/s)", kind="pending"
             )
 
+    def _on_monitor_geometry_edited(self, *_args) -> None:
+        self._update_eyelink_scale_label()
+
+    def _monitor_geometry_from_ui(self) -> MonitorGeometry:
+        try:
+            width_cm = float(self.monitor_width_var.get().strip())
+            height_cm = float(self.monitor_height_var.get().strip())
+            distance_cm = float(self.viewing_distance_var.get().strip())
+        except ValueError as exc:
+            raise ValueError(
+                "EyeLink monitor width, height, and viewing distance must be numbers."
+            ) from exc
+        if width_cm <= 0 or height_cm <= 0 or distance_cm <= 0:
+            raise ValueError(
+                "EyeLink monitor width, height, and viewing distance must be > 0."
+            )
+        return MonitorGeometry(
+            width_cm=width_cm,
+            height_cm=height_cm,
+            distance_cm=distance_cm,
+        )
+
+    def _update_eyelink_scale_label(self) -> None:
+        if not hasattr(self, "eyelink_scale_var"):
+            return
+        try:
+            geom = self._monitor_geometry_from_ui()
+        except ValueError:
+            self.eyelink_scale_var.set("Enter positive width / height / distance")
+            return
+        width_px = height_px = None
+        if self.gaze_path is not None and self._is_eyelink_gaze():
+            peeked = peek_display_size_px(self.gaze_path)
+            if peeked is not None:
+                width_px, height_px = peeked
+        if width_px is None or height_px is None:
+            width_px, height_px = 1920.0, 1080.0
+            res_note = "assuming 1920×1080"
+        else:
+            res_note = f"ASC {width_px:.0f}×{height_px:.0f}"
+        try:
+            px_x, px_y = px_per_deg_from_geometry(
+                width_cm=geom.width_cm,
+                height_cm=geom.height_cm,
+                distance_cm=geom.distance_cm,
+                width_px=width_px,
+                height_px=height_px,
+            )
+        except ValueError:
+            self.eyelink_scale_var.set("Invalid geometry")
+            return
+        self.eyelink_scale_var.set(
+            f"≈ {px_x:.1f} px/deg (H), {px_y:.1f} px/deg (V) · {res_note}"
+        )
     def _apply_stimulus_velocity_on_blur(self, _event=None) -> str | None:
         try:
             vel = self._stimulus_velocity()
@@ -4126,7 +4369,7 @@ class AnnotatorApp:
             messagebox.showwarning(
                 "Stimulus velocity required",
                 "Enter the stimulus velocity for this trial "
-                "(e.g. 10, 20, or 30 deg/s) in section 3.",
+                "(e.g. 10, 20, or 30 deg/s) in section 4.",
             )
             self.stim_vel_entry.focus_set()
             return
@@ -4142,6 +4385,14 @@ class AnnotatorApp:
             )
             self.stim_vel_entry.focus_set()
             return
+        eyelink_geometry = None
+        if self._is_eyelink_gaze():
+            try:
+                eyelink_geometry = self._monitor_geometry_from_ui()
+            except ValueError as exc:
+                messagebox.showwarning("Invalid EyeLink geometry", str(exc))
+                self.monitor_width_entry.focus_set()
+                return
         if not messagebox.askyesno(
             "Confirm stimulus velocity",
             f"Load this trial using {vel:g} deg/s?\n\n"
@@ -4153,14 +4404,28 @@ class AnnotatorApp:
         if not self._confirm_discard_work("Load this trial anyway"):
             return
         self._apply_stimulus_velocity()
+        self._set_status("Loading trial…")
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
         try:
             trial_id = self._default_markings_id()
             self.trial_id_var.set(trial_id)
+            load_kwargs = {}
+            if eyelink_geometry is not None:
+                load_kwargs["eyelink_degree_scale"] = "geometry"
+                load_kwargs["eyelink_monitor_geometry"] = eyelink_geometry
+                set_monitor_geometry_prefs(
+                    width_cm=eyelink_geometry.width_cm,
+                    height_cm=eyelink_geometry.height_cm,
+                    distance_cm=eyelink_geometry.distance_cm,
+                )
             self.trial = load_gaze_trial(
                 self.gaze_path,
                 None if self._gaze_embeds_timestamps() else self.time_path,
                 trial_id=trial_id,
+                **load_kwargs,
             )
+            self._invalidate_plot_cache()
             if self.gaze_path is not None and not self._gaze_embeds_timestamps():
                 attach_eye_openness(self.trial, self.gaze_path.parent)
                 attach_sranipal_gaze_origins(self.trial, self.gaze_path.parent)
@@ -4216,18 +4481,52 @@ class AnnotatorApp:
                 self.detect_blocks_var.set(True)
             self._refresh_conservative_results()
             self._refresh_net_disp_results()
-            self._refresh_sensor_qc()
-            self._refresh_heading_wiggle()
+            # Defer Eye seating / Head pose plots until those tabs are opened
+            # (full-session EyeLink heading redraws are expensive).
             self._update_trace_combo_state()
             self._update_blink_mask_controls()
             self._update_eye_combo_state()
             self._update_files_label()
             self._redraw()
             duration = t1 - t0
+            n_samples = len(self.trial.times)
             status = (
-                f"Loaded {trial_id}: {len(self.trial.times)} gaze samples, "
+                f"Loaded {trial_id}: {n_samples} gaze samples, "
                 f"analysis {t0:.2f}–{t1:.2f} s ({duration:.1f} s)"
             )
+            if (
+                self.trial.source_format == "eyelink_asc"
+                and duration > 1.0
+                and n_samples > 0
+            ):
+                approx_hz = n_samples / duration
+                status += (
+                    f"; ~{approx_hz:.0f} Hz native "
+                    f"(plot thinned to ≤{self.MAX_DISPLAY_POINTS} pts)"
+                )
+            if eyelink_geometry is not None:
+                peeked = (
+                    peek_display_size_px(self.gaze_path)
+                    if self.gaze_path is not None
+                    else None
+                )
+                width_px, height_px = peeked or (1920.0, 1080.0)
+                try:
+                    px_x, px_y = px_per_deg_from_geometry(
+                        width_cm=eyelink_geometry.width_cm,
+                        height_cm=eyelink_geometry.height_cm,
+                        distance_cm=eyelink_geometry.distance_cm,
+                        width_px=width_px,
+                        height_px=height_px,
+                    )
+                    status += (
+                        f"; geometry {eyelink_geometry.width_cm:g}×"
+                        f"{eyelink_geometry.height_cm:g} cm @ "
+                        f"{eyelink_geometry.distance_cm:g} cm → "
+                        f"{px_x:.1f}/{px_y:.1f} px/deg"
+                    )
+                except ValueError:
+                    pass
             if self.trial.has_per_eye_gaze():
                 status += "; Eye: Binocular/Left/Right available"
             if self.trial.has_eye_openness():
@@ -4276,6 +4575,8 @@ class AnnotatorApp:
             self.root.after_idle(self.canvas.draw_idle)
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
+        finally:
+            self.root.config(cursor="")
 
     def _preset_duration_sec(self, label: str | None = None) -> float:
         label = label if label is not None else self.view_var.get()
@@ -5300,28 +5601,36 @@ class AnnotatorApp:
             & (times <= vx1)
         )
         if self.connect_points_var.get():
-            # Keep NaNs so the polyline breaks across missing/out-of-window samples.
-            line_vals = np.asarray(values, dtype=float).copy()
-            line_vals[~plot_mask] = np.nan
-            self.ax.plot(
-                times,
-                line_vals,
-                linestyle="-",
-                linewidth=0.9,
-                color="0.35",
-                alpha=0.85,
-                zorder=1,
+            # Only draw the visible window (full-session arrays are too large for mpl).
+            in_view = (times >= vx0) & (times <= vx1)
+            if np.any(in_view):
+                line_t = times[in_view]
+                line_vals = np.asarray(values[in_view], dtype=float).copy()
+                line_vals[~plot_mask[in_view]] = np.nan
+                line_t, line_vals = self._thin_xy_for_display(line_t, line_vals)
+                self.ax.plot(
+                    line_t,
+                    line_vals,
+                    linestyle="-",
+                    linewidth=0.9,
+                    color="0.35",
+                    alpha=0.85,
+                    zorder=1,
+                )
+        if np.any(plot_mask):
+            t_vis, v_vis = self._thin_xy_for_display(
+                times[plot_mask], values[plot_mask]
             )
-        self.ax.plot(
-            times[plot_mask],
-            values[plot_mask],
-            linestyle="none",
-            marker=".",
-            markersize=4,
-            color="0.25",
-            label=self._signal_plot_label(),
-            zorder=2,
-        )
+            self.ax.plot(
+                t_vis,
+                v_vis,
+                linestyle="none",
+                marker=".",
+                markersize=4,
+                color="0.25",
+                label=self._signal_plot_label(),
+                zorder=2,
+            )
 
         self.ax.axvspan(t0, t1, color="steelblue", alpha=0.04)
         self.ax.axvline(t0, color="steelblue", linestyle="--", alpha=0.35, linewidth=0.8)

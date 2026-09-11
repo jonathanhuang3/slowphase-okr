@@ -741,6 +741,9 @@ def load_gaze_trial(
     time_path: str | Path | None = None,
     trial_id: str = "",
     padding_frames: int = 0,
+    *,
+    eyelink_degree_scale: str = "geometry",
+    eyelink_monitor_geometry=None,
 ) -> GazeTrial:
     """Load Unity gaze+time, Tobii Glasses 3 JSON, or EyeLink ASC."""
     gaze_path = Path(gaze_path)
@@ -749,7 +752,12 @@ def load_gaze_trial(
     from slowphase_okr.eyelink_asc import is_eyelink_asc, load_eyelink_asc_trial
 
     if is_eyelink_asc(gaze_path):
-        return load_eyelink_asc_trial(gaze_path, trial_id=trial_id)
+        return load_eyelink_asc_trial(
+            gaze_path,
+            trial_id=trial_id,
+            degree_scale=eyelink_degree_scale,  # type: ignore[arg-type]
+            monitor_geometry=eyelink_monitor_geometry,
+        )
     if time_path is None:
         raise ValueError(
             "Time file is required for Unity/Vive gaze exports "

@@ -8,6 +8,11 @@ from typing import Any
 
 PREFS_FILENAME = ".slowphase_okr_prefs.json"
 
+# Defaults match a typical 27" 16:9 at ~1 m (same as eyelink_asc defaults).
+DEFAULT_MONITOR_WIDTH_CM = 60.0
+DEFAULT_MONITOR_HEIGHT_CM = 33.5
+DEFAULT_VIEWING_DISTANCE_CM = 100.0
+
 
 def prefs_path() -> Path:
     return Path.home() / PREFS_FILENAME
@@ -43,3 +48,39 @@ def set_annotations_dir(directory: str | Path) -> Path:
     prefs["annotations_dir"] = str(path)
     save_prefs(prefs)
     return path
+
+
+def get_monitor_geometry_prefs(
+    prefs: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Return monitor width/height/distance (cm) from prefs or lab defaults."""
+    data = prefs if prefs is not None else load_prefs()
+
+    def _float(key: str, default: float) -> float:
+        raw = data.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    return {
+        "width_cm": _float("monitor_width_cm", DEFAULT_MONITOR_WIDTH_CM),
+        "height_cm": _float("monitor_height_cm", DEFAULT_MONITOR_HEIGHT_CM),
+        "distance_cm": _float("viewing_distance_cm", DEFAULT_VIEWING_DISTANCE_CM),
+    }
+
+
+def set_monitor_geometry_prefs(
+    *,
+    width_cm: float,
+    height_cm: float,
+    distance_cm: float,
+) -> None:
+    if width_cm <= 0 or height_cm <= 0 or distance_cm <= 0:
+        raise ValueError("Monitor width, height, and distance must be > 0.")
+    prefs = load_prefs()
+    prefs["monitor_width_cm"] = float(width_cm)
+    prefs["monitor_height_cm"] = float(height_cm)
+    prefs["viewing_distance_cm"] = float(distance_cm)
+    save_prefs(prefs)

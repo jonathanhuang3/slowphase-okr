@@ -261,7 +261,9 @@ def test_eyelink_asc_loader(tmp_path: Path):
 
     path = _minimal_eyelink_asc(tmp_path)
     assert is_eyelink_asc(path)
-    trial = load_eyelink_asc_trial(path, trial_id="el")
+    trial = load_eyelink_asc_trial(
+        path, trial_id="el", target_hz=0, degree_scale="validation"
+    )
     assert trial.source_format == "eyelink_asc"
     assert trial.trial_id == "el"
     assert len(trial.times) == 3
@@ -278,12 +280,95 @@ def test_eyelink_asc_loader(tmp_path: Path):
     assert via.source_format == "eyelink_asc"
 
 
+def test_eyelink_px_per_deg_from_geometry():
+    from slowphase_okr.eyelink_asc import (
+        display_size_px,
+        px_per_deg_from_geometry,
+    )
+
+    assert display_size_px(0, 0, 1919, 1079) == (1920.0, 1080.0)
+    px_x, px_y = px_per_deg_from_geometry(
+        width_cm=60.0,
+        height_cm=33.5,
+        distance_cm=100.0,
+        width_px=1920.0,
+        height_px=1080.0,
+    )
+    # Bassoon-style: 2*atan((w/2)/d) visual span
+    assert px_x == pytest.approx(57.49, abs=0.2)
+    assert px_y == pytest.approx(56.81, abs=0.2)
+
+
+def test_eyelink_asc_loader_uses_monitor_geometry(tmp_path: Path):
+    from slowphase_okr.eyelink_asc import (
+        MonitorGeometry,
+        load_eyelink_asc_trial,
+        px_per_deg_from_geometry,
+    )
+
+    path = _minimal_eyelink_asc(tmp_path)
+    geom = MonitorGeometry(width_cm=60.0, height_cm=33.5, distance_cm=100.0)
+    trial = load_eyelink_asc_trial(
+        path,
+        trial_id="geom",
+        target_hz=0,
+        degree_scale="geometry",
+        monitor_geometry=geom,
+    )
+    _, px_y = px_per_deg_from_geometry(
+        width_cm=60.0,
+        height_cm=33.5,
+        distance_cm=100.0,
+        width_px=1920.0,
+        height_px=1080.0,
+    )
+    # DISPLAY_COORDS 0..1079 → center_y = 539.5; samples at 540, 530, 520
+    center_y = 539.5
+    expected = [(center_y - y) / px_y for y in (540.0, 530.0, 520.0)]
+    assert trial.elevation_deg[0] == pytest.approx(expected[0], abs=1e-6)
+    assert trial.elevation_deg[1] == pytest.approx(expected[1], abs=1e-6)
+    assert trial.elevation_deg[-1] == pytest.approx(expected[2], abs=1e-6)
+    # Geometry scale differs from the VALIDATE-derived 40 px/deg (~0.5°)
+    assert trial.elevation_deg[-1] != pytest.approx(0.5, abs=0.05)
+
 def test_eyelink_asc_rejects_non_eyelink(tmp_path: Path):
     from slowphase_okr.eyelink_asc import is_eyelink_asc
 
     path = tmp_path / "notes.asc"
     path.write_text("random text\n")
     assert not is_eyelink_asc(path)
+
+
+def test_eyelink_asc_loads_all_recording_blocks(tmp_path: Path):
+    """Bassoon ASC files often have a short pre-block then the full recording."""
+    from slowphase_okr.eyelink_asc import load_eyelink_asc_trial
+
+    path = tmp_path / "multi.asc"
+    lines = [
+        "** VERSION: EYELINK 3",
+        "MSG\t500 DISPLAY_COORDS 0 0 1919 1079",
+        "MSG\t600 VALIDATE LR POINT 0  LEFT  at 960,540  OFFSET 1.00 deg.  0.0,-40.0 pix.",
+        "START\t900 \tLEFT\tRIGHT\tSAMPLES\tEVENTS",
+        "SAMPLES\tGAZE\tLEFT\tRIGHT\tRATE\t1000.00\tTRACKING\tCR\tFILTER\t2",
+        "900\t960.0\t540.0\t59.0\t960.0\t540.0\t......",
+        "END\t901 \tSAMPLES\tEVENTS",
+        "START\t1000 \tLEFT\tRIGHT\tSAMPLES\tEVENTS",
+        "SAMPLES\tGAZE\tLEFT\tRIGHT\tRATE\t1000.00\tTRACKING\tCR\tFILTER\t2",
+        "MSG\t1000 SYNCTIME",
+        "1000\t960.0\t530.0\t59.0\t960.0\t530.0\t......",
+        "1001\t960.0\t520.0\t59.0\t960.0\t520.0\t......",
+        "MSG\t2000 TRIAL_RESULT 0",
+        "END\t2001 \tSAMPLES\tEVENTS",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+    trial = load_eyelink_asc_trial(
+        path, trial_id="multi", target_hz=0, degree_scale="validation"
+    )
+    # Whole file: short pre-block sample + both experiment samples.
+    assert len(trial.times) == 3
+    assert trial.times[0] == pytest.approx(0.0)
+    assert trial.times[-1] == pytest.approx(0.101)
 
 
 def test_eyelink_asc_hpose_and_eye_in_head(tmp_path: Path):
@@ -311,7 +396,7 @@ def test_eyelink_asc_hpose_and_eye_in_head(tmp_path: Path):
     lines.append("END\t2001 \tSAMPLES\tEVENTS")
     path.write_text("\n".join(lines) + "\n")
 
-    trial = load_eyelink_asc_trial(path)
+    trial = load_eyelink_asc_trial(path, target_hz=0, degree_scale="validation")
     assert trial.has_heading()
     assert trial.heading is not None
     assert trial.heading.roll_deg[0] == pytest.approx(0.0, abs=1e-6)
@@ -342,7 +427,9 @@ def test_eyelink_asc_monocular_loader(tmp_path: Path):
     ]
     path.write_text("\n".join(lines) + "\n")
 
-    trial = load_eyelink_asc_trial(path, trial_id="mono")
+    trial = load_eyelink_asc_trial(
+        path, trial_id="mono", target_hz=0, degree_scale="validation"
+    )
     assert trial.source_format == "eyelink_asc"
     assert not trial.has_per_eye_gaze()
     assert trial.elevation_right_deg is None
@@ -379,7 +466,7 @@ def test_eyelink_blink_intervals(tmp_path: Path):
     ]
     path.write_text("\n".join(lines) + "\n")
 
-    trial = load_eyelink_asc_trial(path)
+    trial = load_eyelink_asc_trial(path, target_hz=0, degree_scale="validation")
     assert trial.has_blink_intervals()
     assert trial.blink_intervals_sec is not None
     assert len(trial.blink_intervals_sec) == 1
