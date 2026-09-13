@@ -589,6 +589,16 @@ def load_eyelink_asc_trial(
         t0_ms=t0_ms,
         t_end_ms=t_end,
     )
+    from slowphase_okr.fixation_precision import custom_fixation_points_from_asc
+
+    custom_fixation_points = custom_fixation_points_from_asc(
+        lines,
+        t0_ms=t0_ms,
+        center_x=meta.center_x,
+        center_y=meta.center_y,
+        px_per_deg_x=meta.px_per_deg_x,
+        px_per_deg_y=meta.px_per_deg_y,
+    )
     return GazeTrial(
         times=times,
         elevation_deg=elev_b,
@@ -604,4 +614,5 @@ def load_eyelink_asc_trial(
         heading=heading,
         eye_in_head=eye_in_head,
         blink_intervals_sec=blink_intervals_sec or None,
+        custom_fixation_points=custom_fixation_points or None,
     )

@@ -281,6 +281,8 @@ class GazeTrial:
     heading: HeadingTrace | None = None
     eye_in_head: EyeInHeadTrace | None = None
     blink_intervals_sec: list[tuple[float, float]] | None = None
+    # EyeLink CustomValidation HV9 targets (ASC CUSTOM_VAL POINT_*).
+    custom_fixation_points: list | None = None
 
     def has_per_eye_gaze(self) -> bool:
         return (
@@ -305,6 +307,9 @@ class GazeTrial:
 
     def has_blink_intervals(self) -> bool:
         return bool(self.blink_intervals_sec)
+
+    def has_custom_fixation_points(self) -> bool:
+        return bool(self.custom_fixation_points)
 
 
 BLINK_MASK_PAD_SEC = 0.05

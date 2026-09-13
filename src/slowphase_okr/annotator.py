@@ -60,6 +60,11 @@ from slowphase_okr.eyelink_asc import (
     peek_display_size_px,
     px_per_deg_from_geometry,
 )
+from slowphase_okr.fixation_precision import (
+    compute_precision_from_asc_windows,
+    compute_precision_from_segments,
+    summarize_precision_results,
+)
 from slowphase_okr.gaze import (
     GazeOriginTrace,
     GazeTrial,
@@ -145,6 +150,10 @@ Notes
     (panel + Excel ``by_block`` sheet). Use Show: Median/Mean to switch the panel display.
   • Optional Min R² filter recalculates trial/block OKR summaries using only accepted
     segments at or above that R² (blank = include all). Segments themselves are not deleted.
+  • EyeLink Fixation precision tab: after marking stable gaze on Annotate for each
+    CustomValidation target, view azimuth×elevation samples vs true dots plus SD,
+    RMS-S2S, and signed/unsigned error (binocular average). ASC POINT windows can
+    also fill all 9 targets automatically (with settle trim).
   • Auto-detect proposes segments (blue); review, nudge, accept (A), or delete.
 
 Auto-detect review
@@ -378,12 +387,14 @@ class AnnotatorApp:
         self.net_disp_tab = ttk.Frame(self.notebook, padding=8)
         self.sensor_qc_tab = ttk.Frame(self.notebook, padding=8)
         self.heading_tab = ttk.Frame(self.notebook, padding=8)
+        self.fixation_precision_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(self.setup_tab, text="1. Load trial")
         self.notebook.add(self.annotate_tab, text="2. Annotate")
         self.notebook.add(self.conservative_tab, text="3. Conservative gain")
         self.notebook.add(self.net_disp_tab, text="4. Net displacement")
         self.notebook.add(self.sensor_qc_tab, text="5. Eye seating")
         self.notebook.add(self.heading_tab, text="6. Head pose")
+        self.notebook.add(self.fixation_precision_tab, text="7. Fixation precision")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         self._build_setup_tab()
@@ -392,6 +403,7 @@ class AnnotatorApp:
         self._build_net_disp_tab()
         self._build_sensor_qc_tab()
         self._build_heading_tab()
+        self._build_fixation_precision_tab()
         self._build_plot()
         self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -414,6 +426,8 @@ class AnnotatorApp:
                 self._refresh_sensor_qc()
             elif selected == str(self.heading_tab):
                 self._refresh_heading_wiggle()
+            elif selected == str(self.fixation_precision_tab):
+                self._refresh_fixation_precision()
         except tk.TclError:
             pass
 
@@ -2433,6 +2447,392 @@ class AnnotatorApp:
             )
         self.heading_tree.grid(row=0, column=0, sticky=tk.EW)
         self._refresh_heading_wiggle()
+
+    def _build_fixation_precision_tab(self) -> None:
+        top = self.fixation_precision_tab
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(3, weight=1)
+
+        nav = ttk.Frame(top)
+        nav.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Button(
+            nav,
+            text="← Annotate",
+            command=lambda: self.notebook.select(self.annotate_tab),
+        ).pack(side=tk.LEFT)
+        self.fixation_precision_summary_var = tk.StringVar(
+            value=(
+                "Load an EyeLink CustomValidation ASC, mark stable fixations on "
+                "Annotate, then refresh here."
+            )
+        )
+        ttk.Label(
+            nav,
+            textvariable=self.fixation_precision_summary_var,
+            foreground="#333333",
+            wraplength=820,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        ttk.Label(
+            top,
+            text=(
+                "Binocular screen gaze (left/right average). Mark one stable segment "
+                "per target on Annotate (or use ASC POINT windows). Plot: true target "
+                "(black) and colored marked-gaze samples per point. Table: SD, RMS-S2S, "
+                "signed/unsigned error, OVERALL mean, and homogeneity. "
+                "Settle trim drops the start of each window (useful for ASC mode)."
+            ),
+            foreground="#555555",
+            wraplength=1000,
+        ).grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
+
+        controls = ttk.Frame(top)
+        controls.grid(row=2, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Label(controls, text="Windows:").pack(side=tk.LEFT)
+        self.fixation_precision_mode_var = tk.StringVar(value="Marked segments")
+        self.fixation_precision_mode = ttk.Combobox(
+            controls,
+            textvariable=self.fixation_precision_mode_var,
+            values=("Marked segments", "ASC POINT windows"),
+            state="readonly",
+            width=20,
+        )
+        self.fixation_precision_mode.pack(side=tk.LEFT, padx=(6, 14))
+        self.fixation_precision_mode.bind(
+            "<<ComboboxSelected>>", self._on_fixation_precision_mode_changed
+        )
+        ttk.Label(controls, text="Settle trim (s):").pack(side=tk.LEFT)
+        self.fixation_settle_var = tk.StringVar(value="0")
+        settle_entry = ttk.Entry(
+            controls, textvariable=self.fixation_settle_var, width=6
+        )
+        settle_entry.pack(side=tk.LEFT, padx=(6, 14))
+        settle_entry.bind("<Return>", lambda _e: self._refresh_fixation_precision())
+        settle_entry.bind("<FocusOut>", lambda _e: self._refresh_fixation_precision())
+        ttk.Button(
+            controls,
+            text="Refresh",
+            command=self._refresh_fixation_precision,
+        ).pack(side=tk.LEFT)
+
+        body = ttk.Frame(top)
+        body.grid(row=3, column=0, sticky=tk.NSEW)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=3)
+        body.rowconfigure(1, weight=2)
+
+        plot_frame = ttk.Frame(body)
+        plot_frame.grid(row=0, column=0, sticky=tk.NSEW)
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        self.fixation_precision_fig, self.fixation_precision_ax = plt.subplots(
+            1, 1, figsize=(9.5, 4.8), constrained_layout=True
+        )
+        self.fixation_precision_canvas = FigureCanvasTkAgg(
+            self.fixation_precision_fig, master=plot_frame
+        )
+        self.fixation_precision_canvas.get_tk_widget().grid(
+            row=0, column=0, sticky=tk.NSEW
+        )
+
+        stats_frame = ttk.Frame(body)
+        stats_frame.grid(row=1, column=0, sticky=tk.NSEW, pady=(8, 0))
+        stats_frame.columnconfigure(0, weight=1)
+        stats_frame.rowconfigure(0, weight=1)
+        columns = (
+            "point",
+            "label",
+            "seg",
+            "n",
+            "sd_2d",
+            "rms",
+            "signed_az",
+            "signed_el",
+            "unsigned",
+            "mean_az",
+            "mean_el",
+        )
+        self.fixation_precision_tree = ttk.Treeview(
+            stats_frame,
+            columns=columns,
+            show="headings",
+            height=10,
+            selectmode="browse",
+        )
+        headings = {
+            "point": "Pt",
+            "label": "Label",
+            "seg": "Seg",
+            "n": "N",
+            "sd_2d": "SD 2D (°)",
+            "rms": "RMS-S2S (°)",
+            "signed_az": "Signed Δaz (°)",
+            "signed_el": "Signed Δel (°)",
+            "unsigned": "Unsigned (°)",
+            "mean_az": "Mean az (°)",
+            "mean_el": "Mean el (°)",
+        }
+        widths = {
+            "point": 40,
+            "label": 100,
+            "seg": 50,
+            "n": 55,
+            "sd_2d": 90,
+            "rms": 100,
+            "signed_az": 110,
+            "signed_el": 110,
+            "unsigned": 95,
+            "mean_az": 95,
+            "mean_el": 95,
+        }
+        for column in columns:
+            self.fixation_precision_tree.heading(column, text=headings[column])
+            self.fixation_precision_tree.column(
+                column,
+                width=widths[column],
+                minwidth=40,
+                anchor=tk.CENTER if column != "label" else tk.W,
+            )
+        scroll = ttk.Scrollbar(
+            stats_frame,
+            orient=tk.VERTICAL,
+            command=self.fixation_precision_tree.yview,
+        )
+        self.fixation_precision_tree.configure(yscrollcommand=scroll.set)
+        self.fixation_precision_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        scroll.grid(row=0, column=1, sticky=tk.NS)
+        self._fixation_precision_results = []
+        self._refresh_fixation_precision()
+
+    def _on_fixation_precision_mode_changed(self, _event=None) -> None:
+        mode = self.fixation_precision_mode_var.get()
+        if mode == "ASC POINT windows":
+            # Drop saccade-to-target unless the user already set a trim.
+            try:
+                current = float(self.fixation_settle_var.get().strip() or "0")
+            except ValueError:
+                current = 0.0
+            if current <= 0:
+                self.fixation_settle_var.set("0.5")
+        self._refresh_fixation_precision()
+
+    def _fixation_settle_sec(self) -> float:
+        raw = self.fixation_settle_var.get().strip()
+        if not raw:
+            return 0.0
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError("Settle trim must be a number (seconds).") from exc
+        if value < 0:
+            raise ValueError("Settle trim cannot be negative.")
+        return value
+
+    def _refresh_fixation_precision(self) -> None:
+        if not hasattr(self, "fixation_precision_ax"):
+            return
+        ax = self.fixation_precision_ax
+        ax.clear()
+        for item in self.fixation_precision_tree.get_children():
+            self.fixation_precision_tree.delete(item)
+        self._fixation_precision_results = []
+
+        if self.trial is None:
+            self.fixation_precision_summary_var.set("Load a trial first.")
+            ax.set_title("No trial loaded")
+            ax.set_xlabel("Azimuth (°)")
+            ax.set_ylabel("Elevation (°)")
+            self.fixation_precision_canvas.draw_idle()
+            return
+        if self.trial.azimuth_deg is None:
+            self.fixation_precision_summary_var.set(
+                "This trial has no azimuth — EyeLink ASC required."
+            )
+            ax.set_title("No azimuth data")
+            self.fixation_precision_canvas.draw_idle()
+            return
+
+        points = list(self.trial.custom_fixation_points or [])
+        if not points:
+            self.fixation_precision_summary_var.set(
+                "No CUSTOM_VAL POINT targets in this ASC "
+                "(Bassoon CustomValidation writes them)."
+            )
+            ax.set_title("No CustomValidation targets")
+            ax.set_xlabel("Azimuth (°)")
+            ax.set_ylabel("Elevation (°)")
+            self.fixation_precision_canvas.draw_idle()
+            return
+
+        try:
+            settle = self._fixation_settle_sec()
+        except ValueError as exc:
+            self.fixation_precision_summary_var.set(str(exc))
+            self.fixation_precision_canvas.draw_idle()
+            return
+
+        mode = self.fixation_precision_mode_var.get()
+        times = self.trial.times
+        # Always binocular average (primary elevation/azimuth), not eye menu.
+        azimuth = self.trial.azimuth_deg
+        elevation = self.trial.elevation_deg
+        if mode == "ASC POINT windows":
+            results = compute_precision_from_asc_windows(
+                times,
+                azimuth,
+                elevation,
+                points,
+                settle_sec=settle,
+            )
+        else:
+            if not self.segments:
+                self.fixation_precision_summary_var.set(
+                    f"{len(points)} CustomValidation target(s) found. "
+                    "Mark stable segments on Annotate (one per point), or switch "
+                    "Windows to ASC POINT windows."
+                )
+                # Still draw true targets for reference.
+                for pt in points:
+                    ax.scatter(
+                        [pt.target_azimuth_deg],
+                        [pt.target_elevation_deg],
+                        marker="o",
+                        s=18,
+                        c="#222222",
+                        edgecolors="none",
+                        zorder=5,
+                    )
+                ax.set_xlabel("Azimuth (°)")
+                ax.set_ylabel("Elevation (°)")
+                ax.set_title("True targets (no marked segments yet)")
+                ax.set_aspect("equal", adjustable="datalim")
+                ax.grid(True, alpha=0.3)
+                self.fixation_precision_canvas.draw_idle()
+                return
+            # Marked windows are already stable; settle defaults to 0 unless set.
+            results = compute_precision_from_segments(
+                times,
+                azimuth,
+                elevation,
+                self.segments,
+                points,
+                settle_sec=settle if settle > 0 else 0.0,
+            )
+
+        self._fixation_precision_results = results
+        if not results:
+            self.fixation_precision_summary_var.set(
+                "No usable samples in the selected windows "
+                "(try shorter settle trim or longer marks)."
+            )
+            ax.set_title("No samples in windows")
+            self.fixation_precision_canvas.draw_idle()
+            return
+
+        cmap = plt.get_cmap("tab10")
+        for i, result in enumerate(results):
+            color = cmap(i % 10)
+            az_s = result.azimuth_samples_deg
+            el_s = result.elevation_samples_deg
+            # Thin dense 1000 Hz marks for display only.
+            if len(az_s) > 2000:
+                step = max(1, len(az_s) // 2000)
+                az_plot = az_s[::step]
+                el_plot = el_s[::step]
+            else:
+                az_plot, el_plot = az_s, el_s
+            ax.scatter(
+                az_plot,
+                el_plot,
+                s=8,
+                alpha=0.35,
+                color=color,
+                linewidths=0,
+                label=result.label,
+                zorder=2,
+            )
+            ax.scatter(
+                [result.target_azimuth_deg],
+                [result.target_elevation_deg],
+                marker="o",
+                s=28,
+                color="#111111",
+                edgecolors="none",
+                zorder=6,
+            )
+            self.fixation_precision_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    result.point_index,
+                    result.label,
+                    result.segment_id if result.segment_id is not None else "—",
+                    result.n_samples,
+                    f"{result.sd_2d_deg:.3f}",
+                    f"{result.rms_s2s_deg:.3f}",
+                    f"{result.signed_error_azimuth_deg:.3f}",
+                    f"{result.signed_error_elevation_deg:.3f}",
+                    f"{result.unsigned_error_deg:.3f}",
+                    f"{result.mean_azimuth_deg:.3f}",
+                    f"{result.mean_elevation_deg:.3f}",
+                ),
+            )
+
+        overall = summarize_precision_results(results)
+        self.fixation_precision_tree.insert(
+            "",
+            tk.END,
+            values=(
+                "—",
+                "OVERALL (mean)",
+                "—",
+                int(overall["n_points"]),
+                f"{overall['mean_sd_2d_deg']:.3f}",
+                f"{overall['mean_rms_s2s_deg']:.3f}",
+                f"{overall['mean_signed_error_azimuth_deg']:.3f}",
+                f"{overall['mean_signed_error_elevation_deg']:.3f}",
+                f"{overall['mean_unsigned_error_deg']:.3f}",
+                "—",
+                "—",
+            ),
+        )
+        self.fixation_precision_tree.insert(
+            "",
+            tk.END,
+            values=(
+                "—",
+                "HOMOGENEITY (SD)",
+                "—",
+                int(overall["n_points"]),
+                f"{overall['homog_sd2d_sd_deg']:.3f}",
+                f"{overall['homog_rms_sd_deg']:.3f}",
+                "—",
+                "—",
+                f"{overall['homog_unsigned_sd_deg']:.3f}",
+                "—",
+                "—",
+            ),
+        )
+        self.fixation_precision_summary_var.set(
+            f"OVERALL mean across {int(overall['n_points'])} point(s): "
+            f"SD₂D={overall['mean_sd_2d_deg']:.3f}° · "
+            f"RMS-S2S={overall['mean_rms_s2s_deg']:.3f}° · "
+            f"unsigned={overall['mean_unsigned_error_deg']:.3f}° "
+            f"(max {overall['max_unsigned_error_deg']:.3f}°) · "
+            f"signed Δaz={overall['mean_signed_error_azimuth_deg']:.3f}° · "
+            f"signed Δel={overall['mean_signed_error_elevation_deg']:.3f}° · "
+            f"homogeneity SD(unsigned)={overall['homog_unsigned_sd_deg']:.3f}° "
+            f"(range {overall['homog_unsigned_range_deg']:.3f}°) "
+            f"· black=true target, colored=marked gaze samples"
+        )
+        ax.set_xlabel("Azimuth (°)")
+        ax.set_ylabel("Elevation (°)")
+        ax.set_title("Binocular gaze vs true CustomValidation dots")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.grid(True, alpha=0.3)
+        if len(results) <= 12:
+            ax.legend(loc="best", fontsize=8, markerscale=1.5, framealpha=0.9)
+        self.fixation_precision_canvas.draw_idle()
 
     @staticmethod
     def _heading_qc_note(stats) -> str:
@@ -4555,6 +4955,9 @@ class AnnotatorApp:
                 status += f"; {n_blinks} blink interval(s) — Mask blinks below plot"
             if self.trial.has_eye_in_head():
                 status += "; eye-in-head (Trace dropdown on Annotate)"
+            if self.trial.has_custom_fixation_points():
+                n_pts = len(self.trial.custom_fixation_points or [])
+                status += f"; {n_pts} CustomValidation target(s) → Fixation precision tab"
             if self.okr_log is not None:
                 status += (
                     f"; OKR log: {len(self.okr_log.block_markers)} blocks, "
@@ -5353,6 +5756,12 @@ class AnnotatorApp:
                 self.seg_tree.selection_set(iid)
                 self.seg_tree.see(iid)
         self._refresh_block_gain_summary()
+        if hasattr(self, "fixation_precision_tree"):
+            try:
+                if str(self.notebook.select()) == str(self.fixation_precision_tab):
+                    self._refresh_fixation_precision()
+            except tk.TclError:
+                pass
 
     def _refresh_block_gain_summary(self) -> None:
         if not hasattr(self, "block_tree"):

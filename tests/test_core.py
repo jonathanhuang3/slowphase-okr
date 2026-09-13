@@ -484,6 +484,203 @@ def test_eyelink_blink_intervals(tmp_path: Path):
     assert np.isnan(masked[1])
 
 
+def test_covariance_ellipse_points():
+    from slowphase_okr.fixation_precision import covariance_ellipse_points
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(1.0, 0.2, size=200)
+    y = rng.normal(-0.5, 0.1, size=200)
+    xs, ys = covariance_ellipse_points(x, y, n_std=1.0)
+    assert xs is not None and ys is not None
+    assert len(xs) == len(ys) >= 16
+    # Ellipse should be centered near the sample mean.
+    assert float(np.mean(xs)) == pytest.approx(1.0, abs=0.05)
+    assert float(np.mean(ys)) == pytest.approx(-0.5, abs=0.05)
+    assert covariance_ellipse_points(x[:2], y[:2]) is None
+
+
+def test_summarize_precision_results():
+    from slowphase_okr.fixation_precision import (
+        FixationPrecisionResult,
+        summarize_precision_results,
+    )
+
+    def _fake(sd, rms, saz, sel, unsigned):
+        return FixationPrecisionResult(
+            point_index=0,
+            label="p",
+            segment_id=1,
+            t_start=0.0,
+            t_end=1.0,
+            n_samples=10,
+            target_azimuth_deg=0.0,
+            target_elevation_deg=0.0,
+            mean_azimuth_deg=0.0,
+            mean_elevation_deg=0.0,
+            sd_azimuth_deg=0.0,
+            sd_elevation_deg=0.0,
+            sd_2d_deg=sd,
+            rms_s2s_deg=rms,
+            signed_error_azimuth_deg=saz,
+            signed_error_elevation_deg=sel,
+            unsigned_error_deg=unsigned,
+            azimuth_samples_deg=np.zeros(3),
+            elevation_samples_deg=np.zeros(3),
+        )
+
+    overall = summarize_precision_results(
+        [_fake(0.2, 0.1, 1.0, -0.5, 1.1), _fake(0.4, 0.3, -1.0, 0.5, 0.9)]
+    )
+    assert overall["n_points"] == 2
+    assert overall["mean_sd_2d_deg"] == pytest.approx(0.3)
+    assert overall["mean_rms_s2s_deg"] == pytest.approx(0.2)
+    assert overall["mean_signed_error_azimuth_deg"] == pytest.approx(0.0)
+    assert overall["mean_unsigned_error_deg"] == pytest.approx(1.0)
+    assert overall["mean_abs_signed_azimuth_deg"] == pytest.approx(1.0)
+    assert overall["max_unsigned_error_deg"] == pytest.approx(1.1)
+    assert overall["min_unsigned_error_deg"] == pytest.approx(0.9)
+    assert overall["homog_unsigned_range_deg"] == pytest.approx(0.2)
+    assert overall["homog_unsigned_sd_deg"] == pytest.approx(
+        float(np.std([1.1, 0.9], ddof=1))
+    )
+    assert overall["homog_sd2d_sd_deg"] == pytest.approx(
+        float(np.std([0.2, 0.4], ddof=1))
+    )
+
+
+def test_fixation_precision_metrics():
+    from slowphase_okr.fixation_precision import (
+        CustomFixationPoint,
+        compute_precision_from_asc_windows,
+        match_segment_to_point,
+        precision_accuracy_for_window,
+        rms_sample_to_sample,
+    )
+
+    x = np.array([0.0, 0.1, 0.0, -0.1, 0.0])
+    y = np.array([0.0, 0.0, 0.1, 0.0, -0.1])
+    assert rms_sample_to_sample(x, y) == pytest.approx(
+        float(np.sqrt(np.mean(np.diff(x) ** 2 + np.diff(y) ** 2))),
+        abs=1e-9,
+    )
+
+    times = np.linspace(0.0, 1.0, 101)
+    az = np.full(101, 1.0)
+    el = np.full(101, -0.5)
+    az = az + np.linspace(-0.05, 0.05, 101)
+    el = el + np.linspace(0.02, -0.02, 101)
+    result = precision_accuracy_for_window(
+        times,
+        az,
+        el,
+        t_start=0.0,
+        t_end=1.0,
+        target_azimuth_deg=0.0,
+        target_elevation_deg=0.0,
+        point_index=0,
+        label="center",
+        settle_sec=0.0,
+    )
+    assert result is not None
+    assert result.n_samples == 101
+    assert result.mean_azimuth_deg == pytest.approx(1.0, abs=1e-6)
+    assert result.mean_elevation_deg == pytest.approx(-0.5, abs=1e-6)
+    assert result.signed_error_azimuth_deg == pytest.approx(1.0, abs=1e-6)
+    assert result.signed_error_elevation_deg == pytest.approx(-0.5, abs=1e-6)
+    assert result.unsigned_error_deg == pytest.approx(np.hypot(1.0, 0.5), abs=1e-6)
+    assert result.sd_2d_deg > 0
+    assert result.rms_s2s_deg > 0
+
+    points = [
+        CustomFixationPoint(
+            point_index=0,
+            label="center",
+            t_start=0.0,
+            t_end=1.0,
+            target_x_px=960.0,
+            target_y_px=540.0,
+            target_azimuth_deg=0.0,
+            target_elevation_deg=0.0,
+        ),
+        CustomFixationPoint(
+            point_index=1,
+            label="top",
+            t_start=2.0,
+            t_end=3.0,
+            target_x_px=960.0,
+            target_y_px=243.0,
+            target_azimuth_deg=0.0,
+            target_elevation_deg=5.0,
+        ),
+    ]
+    matched = match_segment_to_point(0.2, 0.8, points)
+    assert matched is not None
+    assert matched.label == "center"
+    windows = compute_precision_from_asc_windows(
+        times, az, el, points[:1], settle_sec=0.0
+    )
+    assert len(windows) == 1
+
+
+def test_custom_val_points_from_asc_text():
+    from slowphase_okr.fixation_precision import (
+        custom_fixation_points_from_asc,
+        parse_custom_val_points_ms,
+    )
+
+    lines = [
+        "MSG\t1000 CUSTOM_VAL POINT_START 0 center at 960.0,540.0",
+        "MSG\t2000 CUSTOM_VAL POINT_END 0 center at 960.0,540.0",
+        "MSG\t3000 CUSTOM_VAL POINT_START 1 top at 960.0,243.0",
+        "MSG\t4000 CUSTOM_VAL POINT_END 1 top at 960.0,243.0",
+    ]
+    raw = parse_custom_val_points_ms(lines)
+    assert len(raw) == 2
+    assert raw[0]["label"] == "center"
+    points = custom_fixation_points_from_asc(
+        lines,
+        t0_ms=1000,
+        center_x=959.5,
+        center_y=539.5,
+        px_per_deg_x=40.0,
+        px_per_deg_y=40.0,
+    )
+    assert len(points) == 2
+    assert points[0].t_start == pytest.approx(0.0)
+    assert points[0].t_end == pytest.approx(1.0)
+    assert points[1].label == "top"
+    assert points[1].target_elevation_deg == pytest.approx(
+        (539.5 - 243.0) / 40.0, abs=1e-6
+    )
+
+
+def test_eyelink_asc_loads_custom_val_points(tmp_path: Path):
+    from slowphase_okr.eyelink_asc import load_eyelink_asc_trial
+
+    path = tmp_path / "custom.asc"
+    lines = [
+        "** VERSION: EYELINK 3",
+        "MSG\t500 DISPLAY_COORDS 0 0 1919 1079",
+        "START\t900 \tLEFT\tRIGHT\tSAMPLES\tEVENTS",
+        "SAMPLES\tGAZE\tLEFT\tRIGHT\tRATE\t1000.00\tTRACKING\tCR\tFILTER\t2",
+        "MSG\t1000 SYNCTIME",
+        "1000\t960.0\t540.0\t59.0\t960.0\t540.0\t......",
+        "MSG\t1005 CUSTOM_VAL POINT_START 0 center at 960.0,540.0",
+        "1010\t962.0\t541.0\t59.0\t958.0\t539.0\t......",
+        "MSG\t1020 CUSTOM_VAL POINT_END 0 center at 960.0,540.0",
+        "MSG\t2000 TRIAL_RESULT 0",
+        "END\t2001 \tSAMPLES\tEVENTS",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+    trial = load_eyelink_asc_trial(
+        path, trial_id="cv", target_hz=0, degree_scale="validation"
+    )
+    assert trial.has_custom_fixation_points()
+    assert trial.custom_fixation_points is not None
+    assert len(trial.custom_fixation_points) == 1
+    assert trial.custom_fixation_points[0].label == "center"
+
+
 def test_load_okr_log(tmp_path: Path):
     log = tmp_path / "OKR_Log_test.txt"
     log.write_text(
