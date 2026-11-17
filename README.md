@@ -222,7 +222,7 @@ Hover over the plot to see time and elevation at the nearest sample. Press **`?`
 | **Reload guard** | Confirms before discarding accepted or proposed segments |
 | **OKR log markers** | Optional upload marks contrast-block starts (purple) and fixation-cross starts (gray). Clear OKR log removes markers for the next patient. |
 | **Condition readout** | With OKR log loaded, shows contrast, direction, flicker/persistent, and session Increment/Decrement for the hovered (or view-center) time |
-| **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …) with separate median/mean gain in the side panel and Excel `by_block` sheet. Use **Show: Median / Mean** to switch the panel (and plot/status trial summary). Optional **Min R²** (blank = all) recalculates those summaries using only segments at or above that R²; segments are not deleted and Excel still exports all accepted. |
+| **Gain by block** | Accepted segments are grouped by OKR log block (B0, B1, …). The side panel shows median/mean gain for the signal selected in the UI. Excel `by_block` writes median and mean elevation and azimuth gain. Use **Show: Median / Mean** to switch the panel (and plot/status trial summary). Optional **Min R²** (blank = all) recalculates those panel summaries using only segments at or above that R²; segments are not deleted and Excel still exports all accepted. |
 | **Automatic conservative gain** | The third tab calculates gain independently for every OKR-log block from frame-wise gaze velocity. Frames over the adjustable saccade threshold (default 20°/s) are excluded; direction-matched slow velocities are averaged and divided by stimulus speed. It also reports the sample SD of those per-frame gains and plots gain vs contrast (flicker low→high, persistent last). Without an OKR log, the full trial is shown as one upward block. |
 | **Net displacement** | The fourth tab computes the same mlx-style net displacement used in prior glaucoma analyses (`mlx_net_disp` / `mlx_norm_disp`): zero frames with 2D gaze speed above an adjustable threshold (default 40°/s), cumsum primary-axis displacement, median filter + ~500 ms moving mean, cumsum again, then normalize by `(1 − failure fraction)`. |
 | **Eye seating** | The fifth tab shows SRanipal left/right gaze origins in HMD-local mm: front (x–y) and depth (x–z) scatters, plus per-eye x/y and x/z component traces over time for seating drift / asymmetry checks. |
@@ -362,9 +362,9 @@ Block labels use `contrastBlockIndex` and direction when available (`↑↓` for
 
 | Sheet | Contents |
 |-------|----------|
-| `segments` | One row per accepted segment: indices, times, slope, gain, R², RMSE (deg), `direction_upward`, stimulus velocity, plus OKR block/condition columns when a log is loaded |
-| `by_block` | One row per OKR block group: `n_segments`, `median_gain`, `mean_gain`, `median_r2`, `median_rmse_deg`, `mean_rmse_deg`, contrast, direction, flicker/persistent, etc. |
-| `trial_summary` | Overall `median_gain`, `median_rmse_deg`, segment count, source file paths, software version |
+| `segments` | One row per accepted segment: indices, times, `slope_deg_s`, R², RMSE (deg), `direction_upward`, stimulus velocity, plus `elevation_slope_deg_s`, `elevation_gain`, `azimuth_slope_deg_s`, and `azimuth_gain`, plus OKR block/condition columns when a log is loaded. There is no selected-signal `gain` column. A missing axis is blank. |
+| `by_block` | One row per OKR block group: `n_segments`, `median_r2`, `median_rmse_deg`, `mean_rmse_deg`, contrast, direction, flicker/persistent, plus `median_elevation_gain`, `mean_elevation_gain`, `median_azimuth_gain`, and `mean_azimuth_gain` (and the matching median slopes). |
+| `trial_summary` | Segment count, `median_r2`, `median_rmse_deg`, source file paths, software version, plus median/mean elevation and azimuth gain and median slopes. |
 
 Segments are assigned to blocks by midpoint time. Without an OKR log, all segments go into a single `No OKR log` group.
 

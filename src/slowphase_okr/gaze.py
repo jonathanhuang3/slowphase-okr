@@ -312,6 +312,45 @@ class GazeTrial:
         return bool(self.custom_fixation_points)
 
 
+def screen_signal_deg(
+    trial: GazeTrial,
+    signal: str,
+    eye: str = "binocular",
+) -> np.ndarray | None:
+    """Screen-gaze elevation or azimuth for ``eye``, or None if that signal is absent.
+
+    ``signal`` is ``"elevation"`` or ``"azimuth"``. ``eye`` is ``"binocular"``,
+    ``"left"``, or ``"right"``. A missing axis is not replaced with the other
+    axis or with another eye. If the requested eye has no per-eye elevation,
+    this falls back to the binocular trace, matching the annotator.
+    """
+    if signal not in ("elevation", "azimuth"):
+        return None
+    want_azimuth = signal == "azimuth"
+
+    if eye != "binocular":
+        if eye == "left" and trial.elevation_left_deg is not None:
+            if want_azimuth:
+                return trial.azimuth_left_deg
+            return trial.elevation_left_deg
+        if eye == "right" and trial.elevation_right_deg is not None:
+            if want_azimuth:
+                return trial.azimuth_right_deg
+            return trial.elevation_right_deg
+        if trial.has_per_eye_gaze():
+            if want_azimuth:
+                if eye == "left":
+                    return trial.azimuth_left_deg
+                return trial.azimuth_right_deg
+            if eye == "left":
+                return trial.elevation_left_deg
+            return trial.elevation_right_deg
+
+    if want_azimuth:
+        return trial.azimuth_deg
+    return trial.elevation_deg
+
+
 BLINK_MASK_PAD_SEC = 0.05
 
 

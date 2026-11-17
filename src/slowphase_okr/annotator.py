@@ -77,6 +77,7 @@ from slowphase_okr.gaze import (
     is_tobii_glasses3_gazedata,
     load_gaze_trial,
     mask_during_blink_intervals,
+    screen_signal_deg,
     summarize_heading_wiggle,
     BLINK_MASK_PAD_SEC,
 )
@@ -131,6 +132,10 @@ Notes
     EyeLink ASC (.asc, timestamps embedded — no separate time file).
   • Tobii / EyeLink Eye menu: Binocular / Left / Right (per-eye gaze when available).
   • Signal: Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze.
+  • Excel export fits each accepted segment on screen elevation and azimuth
+    (selected eye, blink-masked), including when Trace is eye-in-head.
+    The workbook has elevation_gain and azimuth_gain (and their slopes), not
+    the gain of whichever signal is selected. A missing axis is left blank.
   • Connect points: optional line through successive samples (helps manual marking).
   • Zero at start: subtract angle at the first valid sample so the trace starts at 0°
     (removes headset pose offset; slopes and gains are unchanged).
@@ -146,8 +151,9 @@ Notes
     Use Clear OKR log on the Load trial tab to remove markers for the next patient.
   • With an OKR log loaded, the condition line under the plot shows which eye saw the dots
     (Dots → Left/Right), contrast, direction, flicker/persistent, and Increment/Decrement.
-  • Accepted segments are grouped by OKR log block for separate median/mean gain summaries
-    (panel + Excel ``by_block`` sheet). Use Show: Median/Mean to switch the panel display.
+  • Accepted segments are grouped by OKR log block. The side panel shows median/mean
+    gain for the selected signal. Excel ``by_block`` writes median and mean elevation
+    and azimuth gain. Use Show: Median/Mean to switch the panel display.
   • Optional Min R² filter recalculates trial/block OKR summaries using only accepted
     segments at or above that R² (blank = include all). Segments themselves are not deleted.
   • EyeLink Fixation precision tab: after marking stable gaze on Annotate for each
@@ -468,47 +474,26 @@ class AnnotatorApp:
     def _raw_signal_values(self) -> np.ndarray:
         return self._maybe_mask_blinks(self._unmasked_signal_values())
 
+    def _screen_signal_deg(self, signal_mode: str) -> np.ndarray | None:
+        """Screen-gaze samples for one signal mode, or None if the trial lacks it."""
+        assert self.trial is not None
+        return screen_signal_deg(self.trial, signal_mode, self._eye_mode())
+
+    def _export_signal_deg(self, signal_mode: str) -> np.ndarray | None:
+        """Blink-masked screen trace used for the dual-signal Excel columns."""
+        if self.trial is None:
+            return None
+        values = self._screen_signal_deg(signal_mode)
+        if values is None:
+            return None
+        return self._maybe_mask_blinks(values)
+
     def _unmasked_signal_values(self) -> np.ndarray:
         assert self.trial is not None
-        want_az = self._signal_mode() == self.SIGNAL_AZIMUTH
-        eye = self._eye_mode()
-        if eye != self.EYE_BINOCULAR:
-            if eye == self.EYE_LEFT and self._trial_has_left_eye_gaze():
-                if want_az:
-                    az = self.trial.azimuth_left_deg
-                    if az is None:
-                        return np.full_like(self.trial.elevation_deg, np.nan)
-                    return az
-                return self.trial.elevation_left_deg
-            if eye == self.EYE_RIGHT and self._trial_has_right_eye_gaze():
-                if want_az:
-                    az = self.trial.azimuth_right_deg
-                    if az is None:
-                        return np.full_like(self.trial.elevation_deg, np.nan)
-                    return az
-                assert self.trial.elevation_right_deg is not None
-                return self.trial.elevation_right_deg
-            if self.trial.has_per_eye_gaze():
-                if want_az:
-                    if eye == self.EYE_LEFT:
-                        az = self.trial.azimuth_left_deg
-                    else:
-                        az = self.trial.azimuth_right_deg
-                    if az is None:
-                        return np.full_like(self.trial.elevation_deg, np.nan)
-                    return az
-                if eye == self.EYE_LEFT:
-                    assert self.trial.elevation_left_deg is not None
-                    return self.trial.elevation_left_deg
-                assert self.trial.elevation_right_deg is not None
-                return self.trial.elevation_right_deg
-
-        if want_az:
-            az = self.trial.azimuth_deg
-            if az is None:
-                return np.full_like(self.trial.elevation_deg, np.nan)
-            return az
-        return self.trial.elevation_deg
+        values = self._screen_signal_deg(self._signal_mode())
+        if values is None:
+            return np.full_like(self.trial.elevation_deg, np.nan)
+        return values
 
     def _raw_eye_in_head_elevation_values(self) -> np.ndarray:
         assert self.trial is not None and self.trial.eye_in_head is not None
@@ -3361,7 +3346,8 @@ class AnnotatorApp:
         _bind_tooltip(
             self.gain_summary_combo,
             "Choose median or mean for gain and RMSE in the block table,\n"
-            "and for trial gain in the plot title / status. Excel still exports both.",
+            "and for trial gain in the plot title / status.\n"
+            "Excel writes median and mean elevation and azimuth gain.",
         )
         ttk.Label(summary_row, text="Min R²:").pack(side=tk.LEFT, padx=(10, 0))
         self.min_r2_var = tk.StringVar(value="")
@@ -6326,6 +6312,7 @@ class AnnotatorApp:
         if not path:
             return
         try:
+            times = self.trial.times if self.trial is not None else None
             out = export_to_excel(
                 self.segments,
                 trial_id=trial_id,
@@ -6334,6 +6321,9 @@ class AnnotatorApp:
                 gaze_source=str(self.gaze_path) if self.gaze_path else "",
                 time_source=str(self.time_path) if self.time_path else "",
                 okr_log=self.okr_log,
+                times=times,
+                elevation_deg=self._export_signal_deg(self.SIGNAL_ELEVATION),
+                azimuth_deg=self._export_signal_deg(self.SIGNAL_AZIMUTH),
             )
             n_blocks = len(summarize_gains_by_block(self.segments, self.okr_log))
             messagebox.showinfo(

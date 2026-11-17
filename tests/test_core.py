@@ -847,6 +847,13 @@ def test_segments_meeting_min_r2():
     assert segments_meeting_min_r2(segs, 0.99) == []
 
 
+def _assert_selected_signal_gains_omitted(*frames) -> None:
+    removed = ("gain", "median_gain", "mean_gain", "median_slope_deg_s")
+    for frame in frames:
+        for name in removed:
+            assert name not in frame.columns
+
+
 def test_summarize_gains_by_block(tmp_path: Path):
     from slowphase_okr.export import export_to_excel
     from slowphase_okr.fit import SegmentFit, summarize_gains_by_block
@@ -892,7 +899,8 @@ def test_summarize_gains_by_block(tmp_path: Path):
 
     by_block = pd.read_excel(out, sheet_name="by_block")
     segments = pd.read_excel(out, sheet_name="segments")
-    assert "median_gain" in by_block.columns
+    summary = pd.read_excel(out, sheet_name="trial_summary")
+    _assert_selected_signal_gains_omitted(segments, by_block, summary)
     assert "block_label" in segments.columns
     assert "duration_s" in segments.columns
     assert "velocity_deg_s" in segments.columns
@@ -901,6 +909,169 @@ def test_summarize_gains_by_block(tmp_path: Path):
         segments["slope_deg_s"].tolist()
     )
     assert len(by_block) == 3
+    # No traces were passed, so both axes stay blank.
+    assert "elevation_gain" in segments.columns
+    assert "azimuth_gain" in segments.columns
+    assert "elevation_slope_deg_s" in segments.columns
+    assert "azimuth_slope_deg_s" in segments.columns
+    assert segments["elevation_gain"].isna().all()
+    assert segments["azimuth_gain"].isna().all()
+    assert "median_elevation_gain" in by_block.columns
+    assert "median_azimuth_gain" in by_block.columns
+    assert "mean_elevation_gain" in by_block.columns
+    assert "mean_azimuth_gain" in by_block.columns
+    assert by_block["median_elevation_gain"].isna().all()
+    assert by_block["median_azimuth_gain"].isna().all()
+
+
+def test_export_fits_elevation_and_azimuth(tmp_path: Path):
+    from slowphase_okr.export import export_to_excel
+    from slowphase_okr.fit import SegmentFit
+    from slowphase_okr.gaze import GazeTrial, screen_signal_deg
+
+    times = np.linspace(0.0, 1.0, 11)
+    elevation = 2.0 * times + 1.0
+    azimuth = -4.0 * times + 3.0
+    stimulus = 10.0
+    # Marked on azimuth. Excel keeps that window's slope_deg_s, and writes
+    # elevation and azimuth gain separately.
+    selected = fit_segment(times, azimuth, 2, 8, stimulus, segment_id=1)
+    untouched = SegmentFit(
+        2, 0, 4, float(times[0]), float(times[4]), 5, 2.0, 1.0, 0.2, 1.0, 0.0, True, stimulus
+    )
+    # Index past the trace: that row's dual-signal cells stay blank.
+    out_of_range = SegmentFit(
+        3, 0, 100, 0.0, 1.0, 5, 2.0, 1.0, 0.2, 1.0, 0.0, True, stimulus
+    )
+    # Azimuth samples inside this window are NaN, so only elevation is written.
+    azimuth_gap = azimuth.copy()
+    azimuth_gap[2:9] = np.nan
+    sparse = fit_segment(times, elevation, 2, 8, stimulus, segment_id=4)
+
+    import pandas as pd
+
+    out = export_to_excel(
+        [selected, untouched, out_of_range],
+        trial_id="both",
+        software_version="0.0",
+        output_path=tmp_path / "both.xlsx",
+        times=times,
+        elevation_deg=elevation,
+        azimuth_deg=azimuth,
+    )
+    segments = pd.read_excel(out, sheet_name="segments")
+    summary = pd.read_excel(out, sheet_name="trial_summary")
+    by_block = pd.read_excel(out, sheet_name="by_block")
+    _assert_selected_signal_gains_omitted(segments, by_block, summary)
+
+    assert segments["slope_deg_s"].tolist() == pytest.approx(
+        [selected.slope_deg_s, untouched.slope_deg_s, out_of_range.slope_deg_s]
+    )
+    assert segments.loc[0, "azimuth_slope_deg_s"] == pytest.approx(-4.0)
+    assert segments.loc[0, "azimuth_gain"] == pytest.approx(-0.4)
+    assert segments.loc[0, "elevation_slope_deg_s"] == pytest.approx(2.0)
+    assert segments.loc[0, "elevation_gain"] == pytest.approx(0.2)
+    assert segments.loc[1, "elevation_gain"] == pytest.approx(0.2)
+    assert segments.loc[1, "azimuth_gain"] == pytest.approx(-0.4)
+    assert pd.isna(segments.loc[2, "elevation_gain"])
+    assert pd.isna(segments.loc[2, "azimuth_gain"])
+    assert pd.isna(segments.loc[2, "elevation_slope_deg_s"])
+    assert pd.isna(segments.loc[2, "azimuth_slope_deg_s"])
+    # Finite rows only: the out-of-range segment does not blank the summaries.
+    assert summary.loc[0, "median_elevation_gain"] == pytest.approx(0.2)
+    assert summary.loc[0, "median_azimuth_gain"] == pytest.approx(-0.4)
+    assert summary.loc[0, "median_elevation_slope_deg_s"] == pytest.approx(2.0)
+    assert summary.loc[0, "median_azimuth_slope_deg_s"] == pytest.approx(-4.0)
+    assert summary.loc[0, "mean_elevation_gain"] == pytest.approx(0.2)
+    assert summary.loc[0, "mean_azimuth_gain"] == pytest.approx(-0.4)
+    assert by_block.loc[0, "median_elevation_gain"] == pytest.approx(0.2)
+    assert by_block.loc[0, "median_azimuth_gain"] == pytest.approx(-0.4)
+    assert by_block.loc[0, "mean_elevation_gain"] == pytest.approx(0.2)
+    assert by_block.loc[0, "mean_azimuth_gain"] == pytest.approx(-0.4)
+
+    missing_az = export_to_excel(
+        [selected],
+        trial_id="no-az",
+        software_version="0.0",
+        output_path=tmp_path / "no_az.xlsx",
+        times=times,
+        elevation_deg=elevation,
+        azimuth_deg=None,
+    )
+    no_az = pd.read_excel(missing_az, sheet_name="segments")
+    assert no_az.loc[0, "elevation_gain"] == pytest.approx(0.2)
+    assert no_az.loc[0, "elevation_slope_deg_s"] == pytest.approx(2.0)
+    assert pd.isna(no_az.loc[0, "azimuth_gain"])
+    assert pd.isna(no_az.loc[0, "azimuth_slope_deg_s"])
+    assert "gain" not in no_az.columns
+
+    missing_el = export_to_excel(
+        [selected],
+        trial_id="no-el",
+        software_version="0.0",
+        output_path=tmp_path / "no_el.xlsx",
+        times=times,
+        elevation_deg=None,
+        azimuth_deg=azimuth,
+    )
+    no_el = pd.read_excel(missing_el, sheet_name="segments")
+    assert pd.isna(no_el.loc[0, "elevation_gain"])
+    assert no_el.loc[0, "azimuth_gain"] == pytest.approx(-0.4)
+    assert no_el.loc[0, "azimuth_slope_deg_s"] == pytest.approx(-4.0)
+
+    gapped = export_to_excel(
+        [sparse],
+        trial_id="gap",
+        software_version="0.0",
+        output_path=tmp_path / "gap.xlsx",
+        times=times,
+        elevation_deg=elevation,
+        azimuth_deg=azimuth_gap,
+    )
+    gap_rows = pd.read_excel(gapped, sheet_name="segments")
+    assert gap_rows.loc[0, "elevation_gain"] == pytest.approx(0.2)
+    assert pd.isna(gap_rows.loc[0, "azimuth_gain"])
+    assert pd.isna(gap_rows.loc[0, "azimuth_slope_deg_s"])
+
+    short_az = export_to_excel(
+        [selected],
+        trial_id="short",
+        software_version="0.0",
+        output_path=tmp_path / "short.xlsx",
+        times=times,
+        elevation_deg=elevation,
+        azimuth_deg=azimuth[:3],
+    )
+    short_rows = pd.read_excel(short_az, sheet_name="segments")
+    assert short_rows.loc[0, "elevation_gain"] == pytest.approx(0.2)
+    assert pd.isna(short_rows.loc[0, "azimuth_gain"])
+
+    trial = GazeTrial(
+        times=times,
+        elevation_deg=elevation,
+        azimuth_deg=azimuth,
+        elevation_left_deg=elevation * 3.0,
+        azimuth_left_deg=None,
+        elevation_right_deg=elevation,
+        azimuth_right_deg=azimuth * 2.0,
+    )
+    assert screen_signal_deg(trial, "azimuth", "left") is None
+    assert screen_signal_deg(trial, "elevation", "left") is trial.elevation_left_deg
+    assert screen_signal_deg(trial, "azimuth", "binocular") is trial.azimuth_deg
+    left_only = export_to_excel(
+        [selected],
+        trial_id="left",
+        software_version="0.0",
+        output_path=tmp_path / "left.xlsx",
+        times=trial.times,
+        elevation_deg=screen_signal_deg(trial, "elevation", "left"),
+        azimuth_deg=screen_signal_deg(trial, "azimuth", "left"),
+    )
+    left_rows = pd.read_excel(left_only, sheet_name="segments")
+    assert left_rows.loc[0, "elevation_slope_deg_s"] == pytest.approx(6.0)
+    assert left_rows.loc[0, "elevation_gain"] == pytest.approx(0.6)
+    assert pd.isna(left_rows.loc[0, "azimuth_gain"])
+    assert pd.isna(left_rows.loc[0, "azimuth_slope_deg_s"])
 
 
 def test_detect_upward_slow_phases():
