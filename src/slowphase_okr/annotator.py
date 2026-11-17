@@ -134,8 +134,8 @@ Notes
   • Signal: Elevation (vertical OKR) or Azimuth (left/right OKR) from rotated gaze.
   • Excel export fits each accepted segment on screen elevation and azimuth
     (selected eye, blink-masked), including when Trace is eye-in-head.
-    slope/gain columns stay on the signal and trace selected in the UI.
-    A missing axis is left blank.
+    The workbook has elevation_gain and azimuth_gain (and their slopes), not
+    the gain of whichever signal is selected. A missing axis is left blank.
   • Connect points: optional line through successive samples (helps manual marking).
   • Zero at start: subtract angle at the first valid sample so the trace starts at 0°
     (removes headset pose offset; slopes and gains are unchanged).
@@ -151,8 +151,9 @@ Notes
     Use Clear OKR log on the Load trial tab to remove markers for the next patient.
   • With an OKR log loaded, the condition line under the plot shows which eye saw the dots
     (Dots → Left/Right), contrast, direction, flicker/persistent, and Increment/Decrement.
-  • Accepted segments are grouped by OKR log block for separate median/mean gain summaries
-    (panel + Excel ``by_block`` sheet). Use Show: Median/Mean to switch the panel display.
+  • Accepted segments are grouped by OKR log block. The side panel shows median/mean
+    gain for the selected signal. Excel ``by_block`` writes median and mean elevation
+    and azimuth gain. Use Show: Median/Mean to switch the panel display.
   • Optional Min R² filter recalculates trial/block OKR summaries using only accepted
     segments at or above that R² (blank = include all). Segments themselves are not deleted.
   • EyeLink Fixation precision tab: after marking stable gaze on Annotate for each
@@ -3345,7 +3346,8 @@ class AnnotatorApp:
         _bind_tooltip(
             self.gain_summary_combo,
             "Choose median or mean for gain and RMSE in the block table,\n"
-            "and for trial gain in the plot title / status. Excel still exports both.",
+            "and for trial gain in the plot title / status.\n"
+            "Excel writes median and mean elevation and azimuth gain.",
         )
         ttk.Label(summary_row, text="Min R²:").pack(side=tk.LEFT, padx=(10, 0))
         self.min_r2_var = tk.StringVar(value="")

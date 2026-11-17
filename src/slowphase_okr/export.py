@@ -11,12 +11,10 @@ from slowphase_okr.fit import (
     SegmentFit,
     fit_segment,
     summarize_gains_by_block,
-    trial_summary_median_gain,
 )
 from slowphase_okr.okr_log import OkrLog, segment_condition_fields
 
-# Selected-signal columns (slope_deg_s, gain, …) stay as fitted in the UI.
-# These are an additional fit of the same window on each screen-gaze axis.
+# Per-segment elevation and azimuth fits. The UI-selected gain is not written.
 DUAL_SIGNAL_COLUMNS = (
     "elevation_slope_deg_s",
     "elevation_gain",
@@ -30,6 +28,14 @@ DUAL_BLOCK_COLUMNS = (
     "median_azimuth_slope_deg_s",
     "median_azimuth_gain",
     "mean_azimuth_gain",
+)
+# These repeat whichever signal is selected in the UI. Excel writes the
+# elevation and azimuth fits instead. In-app summaries still use them.
+SELECTED_SIGNAL_GAIN_COLUMNS = (
+    "gain",
+    "median_gain",
+    "mean_gain",
+    "median_slope_deg_s",
 )
 
 
@@ -146,6 +152,13 @@ def _with_id_tail(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[front + tail]
 
 
+def _without_selected_signal_gains(frame: pd.DataFrame) -> pd.DataFrame:
+    drop = [name for name in SELECTED_SIGNAL_GAIN_COLUMNS if name in frame.columns]
+    if not drop:
+        return frame
+    return frame.drop(columns=drop)
+
+
 def export_to_excel(
     segments: list[SegmentFit],
     trial_id: str,
@@ -160,11 +173,11 @@ def export_to_excel(
 ) -> Path:
     """Write segment-level, trial summary, and per-block gain sheets.
 
-    ``slope_deg_s``, ``velocity_deg_s``, ``gain``, and the existing summary
-    gain columns stay on the signal selected in the UI. Each segment is also
-    fit on ``elevation_deg`` and ``azimuth_deg`` when that trace is present.
-    A missing trace, or a segment that cannot be fit on one side, leaves that
-    side blank and does not fail the export.
+    Each segment is fit on ``elevation_deg`` and ``azimuth_deg`` when that
+    trace is present. A missing trace, or a segment that cannot be fit on one
+    side, leaves that side blank and does not fail the export. The workbook
+    does not include the UI-selected ``gain`` or the summary columns that
+    repeat it (``median_gain``, ``mean_gain``, ``median_slope_deg_s``).
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,7 +207,6 @@ def export_to_excel(
                 "slope_deg_s",
                 "velocity_deg_s",
                 "intercept_deg",
-                "gain",
                 "r2",
                 "rmse_deg",
                 "direction_upward",
@@ -225,8 +237,6 @@ def export_to_excel(
         "trial_id": trial_id,
         "software_version": software_version,
         "n_segments": len(segments),
-        "median_gain": trial_summary_median_gain(segments),
-        "mean_gain": float(seg_df["gain"].mean()) if len(segments) else float("nan"),
         "median_elevation_gain": dual_trial["median_elevation_gain"],
         "mean_elevation_gain": dual_trial["mean_elevation_gain"],
         "median_elevation_slope_deg_s": dual_trial["median_elevation_slope_deg_s"],
@@ -240,7 +250,6 @@ def export_to_excel(
     if segments:
         summary["median_r2"] = float(seg_df["r2"].median())
         summary["median_rmse_deg"] = float(seg_df["rmse_deg"].median())
-        summary["median_slope_deg_s"] = float(seg_df["slope_deg_s"].median())
         summary["n_upward"] = int(seg_df["direction_upward"].sum())
         summary["n_not_upward"] = int((~seg_df["direction_upward"]).sum())
 
@@ -269,12 +278,9 @@ def export_to_excel(
                 "viewing_eye",
                 "session_tags",
                 "n_segments",
-                "median_gain",
-                "mean_gain",
                 "median_r2",
                 "median_rmse_deg",
                 "mean_rmse_deg",
-                "median_slope_deg_s",
                 "n_upward",
                 "n_not_upward",
                 *DUAL_BLOCK_COLUMNS,
@@ -294,6 +300,10 @@ def export_to_excel(
                 for label in by_block_df["block_label"]
             ]
         by_block_df = _with_id_tail(by_block_df)
+
+    seg_df = _without_selected_signal_gains(seg_df)
+    by_block_df = _without_selected_signal_gains(by_block_df)
+    summary_df = _without_selected_signal_gains(summary_df)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         seg_df.to_excel(writer, sheet_name="segments", index=False)

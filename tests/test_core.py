@@ -847,6 +847,13 @@ def test_segments_meeting_min_r2():
     assert segments_meeting_min_r2(segs, 0.99) == []
 
 
+def _assert_selected_signal_gains_omitted(*frames) -> None:
+    removed = ("gain", "median_gain", "mean_gain", "median_slope_deg_s")
+    for frame in frames:
+        for name in removed:
+            assert name not in frame.columns
+
+
 def test_summarize_gains_by_block(tmp_path: Path):
     from slowphase_okr.export import export_to_excel
     from slowphase_okr.fit import SegmentFit, summarize_gains_by_block
@@ -892,7 +899,8 @@ def test_summarize_gains_by_block(tmp_path: Path):
 
     by_block = pd.read_excel(out, sheet_name="by_block")
     segments = pd.read_excel(out, sheet_name="segments")
-    assert "median_gain" in by_block.columns
+    summary = pd.read_excel(out, sheet_name="trial_summary")
+    _assert_selected_signal_gains_omitted(segments, by_block, summary)
     assert "block_label" in segments.columns
     assert "duration_s" in segments.columns
     assert "velocity_deg_s" in segments.columns
@@ -901,17 +909,17 @@ def test_summarize_gains_by_block(tmp_path: Path):
         segments["slope_deg_s"].tolist()
     )
     assert len(by_block) == 3
-    # No traces were passed, so both axes stay blank and the selected-signal
-    # gain column is unchanged.
+    # No traces were passed, so both axes stay blank.
     assert "elevation_gain" in segments.columns
     assert "azimuth_gain" in segments.columns
     assert "elevation_slope_deg_s" in segments.columns
     assert "azimuth_slope_deg_s" in segments.columns
     assert segments["elevation_gain"].isna().all()
     assert segments["azimuth_gain"].isna().all()
-    assert segments["gain"].tolist() == pytest.approx([0.80, 0.90, -0.70, 0.50])
     assert "median_elevation_gain" in by_block.columns
     assert "median_azimuth_gain" in by_block.columns
+    assert "mean_elevation_gain" in by_block.columns
+    assert "mean_azimuth_gain" in by_block.columns
     assert by_block["median_elevation_gain"].isna().all()
     assert by_block["median_azimuth_gain"].isna().all()
 
@@ -925,7 +933,8 @@ def test_export_fits_elevation_and_azimuth(tmp_path: Path):
     elevation = 2.0 * times + 1.0
     azimuth = -4.0 * times + 3.0
     stimulus = 10.0
-    # Selected signal is azimuth: existing gain/slope must stay on that fit.
+    # Marked on azimuth. Excel keeps that window's slope_deg_s, and writes
+    # elevation and azimuth gain separately.
     selected = fit_segment(times, azimuth, 2, 8, stimulus, segment_id=1)
     untouched = SegmentFit(
         2, 0, 4, float(times[0]), float(times[4]), 5, 2.0, 1.0, 0.2, 1.0, 0.0, True, stimulus
@@ -953,10 +962,8 @@ def test_export_fits_elevation_and_azimuth(tmp_path: Path):
     segments = pd.read_excel(out, sheet_name="segments")
     summary = pd.read_excel(out, sheet_name="trial_summary")
     by_block = pd.read_excel(out, sheet_name="by_block")
+    _assert_selected_signal_gains_omitted(segments, by_block, summary)
 
-    assert segments["gain"].tolist() == pytest.approx(
-        [selected.gain, untouched.gain, out_of_range.gain]
-    )
     assert segments["slope_deg_s"].tolist() == pytest.approx(
         [selected.slope_deg_s, untouched.slope_deg_s, out_of_range.slope_deg_s]
     )
@@ -975,14 +982,12 @@ def test_export_fits_elevation_and_azimuth(tmp_path: Path):
     assert summary.loc[0, "median_azimuth_gain"] == pytest.approx(-0.4)
     assert summary.loc[0, "median_elevation_slope_deg_s"] == pytest.approx(2.0)
     assert summary.loc[0, "median_azimuth_slope_deg_s"] == pytest.approx(-4.0)
-    assert summary.loc[0, "median_gain"] == pytest.approx(
-        float(np.median([selected.gain, untouched.gain, out_of_range.gain]))
-    )
+    assert summary.loc[0, "mean_elevation_gain"] == pytest.approx(0.2)
+    assert summary.loc[0, "mean_azimuth_gain"] == pytest.approx(-0.4)
     assert by_block.loc[0, "median_elevation_gain"] == pytest.approx(0.2)
     assert by_block.loc[0, "median_azimuth_gain"] == pytest.approx(-0.4)
-    assert by_block.loc[0, "median_gain"] == pytest.approx(
-        float(np.median([selected.gain, untouched.gain, out_of_range.gain]))
-    )
+    assert by_block.loc[0, "mean_elevation_gain"] == pytest.approx(0.2)
+    assert by_block.loc[0, "mean_azimuth_gain"] == pytest.approx(-0.4)
 
     missing_az = export_to_excel(
         [selected],
@@ -998,7 +1003,7 @@ def test_export_fits_elevation_and_azimuth(tmp_path: Path):
     assert no_az.loc[0, "elevation_slope_deg_s"] == pytest.approx(2.0)
     assert pd.isna(no_az.loc[0, "azimuth_gain"])
     assert pd.isna(no_az.loc[0, "azimuth_slope_deg_s"])
-    assert no_az.loc[0, "gain"] == pytest.approx(selected.gain)
+    assert "gain" not in no_az.columns
 
     missing_el = export_to_excel(
         [selected],
