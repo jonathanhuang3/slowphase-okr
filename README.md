@@ -362,9 +362,9 @@ Block labels use `contrastBlockIndex` and direction when available (`↑↓` for
 
 | Sheet | Contents |
 |-------|----------|
-| `segments` | One row per accepted segment: indices, times, slope, gain, R², RMSE (deg), `direction_upward`, stimulus velocity, plus OKR block/condition columns when a log is loaded |
-| `by_block` | One row per OKR block group: `n_segments`, `median_gain`, `mean_gain`, `median_r2`, `median_rmse_deg`, `mean_rmse_deg`, contrast, direction, flicker/persistent, etc. |
-| `trial_summary` | Overall `median_gain`, `median_rmse_deg`, segment count, source file paths, software version |
+| `segments` | One row per accepted segment: indices, times, slope, gain, R², RMSE (deg), `direction_upward`, stimulus velocity, plus `elevation_slope_deg_s`, `elevation_gain`, `azimuth_slope_deg_s`, and `azimuth_gain`, plus OKR block/condition columns when a log is loaded. `slope_deg_s` and `gain` stay on the signal selected in the UI. A missing axis is blank. |
+| `by_block` | One row per OKR block group: `n_segments`, `median_gain`, `mean_gain`, `median_r2`, `median_rmse_deg`, `mean_rmse_deg`, contrast, direction, flicker/persistent, plus median/mean elevation and azimuth gain. `median_gain` / `mean_gain` stay on the UI-selected signal. |
+| `trial_summary` | Overall `median_gain`, `median_rmse_deg`, segment count, source file paths, software version, plus median elevation and azimuth gain and slope. |
 
 Segments are assigned to blocks by midpoint time. Without an OKR log, all segments go into a single `No OKR log` group.
 
